@@ -361,8 +361,9 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
 
     let candidates: Vec<Entry> = index
         .lookup_by_name(name)
-        .into_iter()
+        .iter()
         .filter(|e| kind_ok(uk, e.sym.kind))
+        .cloned()
         .collect();
     if candidates.is_empty() {
         return Vec::new();
@@ -392,11 +393,13 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
         return hits;
     }
 
-    // Wildcard-imported packages.
+    // Wildcard-imported packages, plus Kotlin's implicit default imports (kotlin.*, java.lang.*,
+    // …) so stdlib symbols like `listOf` resolve without an explicit import.
     let star_pkgs: Vec<String> = imports
         .iter()
         .filter(|i| i.wildcard)
         .map(|i| i.package())
+        .chain(DEFAULT_IMPORT_PACKAGES.iter().map(|s| s.to_string()))
         .collect();
     if let Some(hits) = pick(&candidates, |e| star_pkgs.contains(&e.sym.package)) {
         return hits;
@@ -405,6 +408,21 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
     // Not visible from here (different package, not imported): no guess.
     Vec::new()
 }
+
+/// Packages Kotlin imports implicitly into every file (JVM target). Symbols in these resolve
+/// without an explicit `import`.
+const DEFAULT_IMPORT_PACKAGES: &[&str] = &[
+    "kotlin",
+    "kotlin.annotation",
+    "kotlin.collections",
+    "kotlin.comparisons",
+    "kotlin.io",
+    "kotlin.ranges",
+    "kotlin.sequences",
+    "kotlin.text",
+    "kotlin.jvm",
+    "java.lang",
+];
 
 fn pick(candidates: &[Entry], keep: impl Fn(&Entry) -> bool) -> Option<Vec<Def>> {
     let hits: Vec<Def> = candidates.iter().filter(|e| keep(e)).map(to_def).collect();

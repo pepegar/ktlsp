@@ -299,6 +299,17 @@ fn unresolved_stdlib_returns_none() {
 }
 
 #[test]
+fn project_symbol_shadows_default_import_package() {
+    // A same-named symbol in a Kotlin default-import package (simulating a library) must lose to
+    // a same-package project symbol: same-package precedence beats the default-import wildcard.
+    check(
+        "//- Stdlib.kt\npackage kotlin.collections\nfun helper(): Int = 0\n\
+         //- Helper.kt\npackage app\nfun /*def*/helper(): Int = 1\n\
+         //- Main.kt\npackage app\nfun main() { /*^*/helper() }\n",
+    );
+}
+
+#[test]
 fn cursor_on_whitespace_returns_none_without_panic() {
     check("fun main() { /*^*/ }\n");
 }

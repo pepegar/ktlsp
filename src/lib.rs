@@ -4,8 +4,14 @@
 //! `workspace`) that speaks byte offsets and `(row, col)` — no LSP types, no async, unit-testable
 //! in milliseconds — and a thin LSP layer (`lsp`) that is the only place aware of `tower-lsp`.
 
+pub mod artifacts;
+pub mod catalog;
+pub mod coords;
+pub mod deps;
 pub mod index;
 pub mod indexer;
+pub mod jar;
+pub mod java;
 pub mod lsp;
 pub mod parser;
 pub mod resolve;

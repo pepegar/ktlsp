@@ -31,6 +31,59 @@ impl Backend {
     }
 }
 
+#[derive(Default)]
+struct DepStats {
+    coordinates: usize,
+    files: usize,
+    symbols: usize,
+    failed: usize,
+}
+
+/// Index every dependency declared in the project's version catalog into the shared index.
+/// Runs on a blocking thread; IO/parsing is lock-free and results are inserted per-coordinate
+/// under brief locks so `goto_definition` can interleave while indexing proceeds.
+fn index_dependencies(ws: &Arc<Mutex<Workspace>>, root: &std::path::Path) -> DepStats {
+    use crate::artifacts::Repos;
+    use crate::deps;
+    use crate::java::JavaParser;
+    use crate::parser::KotlinParser;
+
+    let coords = deps::coordinates_for_root(root);
+    let repos = Repos::defaults();
+    let extract_root = deps::extract_root();
+    let mut kotlin = KotlinParser::new();
+    let mut java = JavaParser::new();
+
+    let mut stats = DepStats {
+        coordinates: coords.len(),
+        ..Default::default()
+    };
+    for coord in &coords {
+        // Isolate each coordinate: a panic while parsing one library's sources must not abort
+        // indexing of the rest.
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deps::resolve_coordinate(coord, &repos, &extract_root, &mut kotlin, &mut java)
+        }));
+        let batches = match resolved {
+            Ok(batches) => batches,
+            Err(_) => {
+                tracing::warn!("indexing panicked for {}; skipping", coord.label());
+                stats.failed += 1;
+                continue;
+            }
+        };
+        // Insert each file under its own brief lock so goto_definition can interleave (a single
+        // coordinate like kotlin-stdlib can contribute hundreds of files).
+        for batch in batches {
+            let mut guard = ws.lock().unwrap();
+            stats.symbols += batch.symbols.len();
+            guard.index.replace_file(&batch.file, batch.symbols);
+            stats.files += 1;
+        }
+    }
+    stats
+}
+
 /// `file://` URI -> canonical key (the file path string). `None` for non-file URIs.
 fn uri_to_key(uri: &Uri) -> Option<String> {
     uri.to_file_path().map(|p| p.to_string_lossy().into_owned())
@@ -90,11 +143,29 @@ impl LanguageServer for Backend {
             let ws = self.ws.clone();
             let client = self.client.clone();
             tokio::spawn(async move {
-                let count = tokio::task::spawn_blocking(move || ws.lock().unwrap().scan(&root))
+                // 1. Project sources (fast).
+                let scan_ws = ws.clone();
+                let scan_root = root.clone();
+                let count = tokio::task::spawn_blocking(move || scan_ws.lock().unwrap().scan(&scan_root))
                     .await
                     .unwrap_or(0);
                 client
-                    .log_message(MessageType::INFO, format!("ktlsp indexed {count} Kotlin files"))
+                    .log_message(MessageType::INFO, format!("ktlsp indexed {count} project files"))
+                    .await;
+
+                // 2. Library sources from the version catalog (locate/download/extract/parse off
+                //    the lock; insert per-coordinate under brief locks so goto can interleave).
+                let stats = tokio::task::spawn_blocking(move || index_dependencies(&ws, &root))
+                    .await
+                    .unwrap_or_default();
+                client
+                    .log_message(
+                        MessageType::INFO,
+                        format!(
+                            "ktlsp indexed {} library files ({} symbols) from {} dependencies ({} skipped)",
+                            stats.files, stats.symbols, stats.coordinates, stats.failed
+                        ),
+                    )
                     .await;
             });
         }

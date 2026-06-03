@@ -56,9 +56,9 @@ impl Index {
         }
     }
 
-    /// All entries with the given simple name.
-    pub fn lookup_by_name(&self, name: &str) -> Vec<Entry> {
-        self.by_name.get(name).cloned().unwrap_or_default()
+    /// All entries with the given simple name (borrowed; callers clone only what they keep).
+    pub fn lookup_by_name(&self, name: &str) -> &[Entry] {
+        self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
