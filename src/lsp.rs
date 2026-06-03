@@ -1,0 +1,191 @@
+//! The LSP layer: a thin `tower-lsp-server` backend that translates between LSP types and the
+//! pure core. This is the ONLY module that depends on `tower-lsp-server` / `ls-types`.
+//!
+//! Identity: we key the workspace by the file's *path string* (`uri.to_file_path()`), converting
+//! URI <-> path exactly once at this boundary and never re-deriving identity from the filesystem
+//! mid-request. Byte ranges from the core are converted to LSP positions via `LineIndex` here.
+
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+
+use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::*;
+use tower_lsp_server::{Client, LanguageServer};
+
+use crate::text::LineIndex;
+use crate::workspace::Workspace;
+
+pub struct Backend {
+    client: Client,
+    ws: Arc<Mutex<Workspace>>,
+    root: Mutex<Option<PathBuf>>,
+}
+
+impl Backend {
+    pub fn new(client: Client) -> Self {
+        Backend {
+            client,
+            ws: Arc::new(Mutex::new(Workspace::new())),
+            root: Mutex::new(None),
+        }
+    }
+}
+
+/// `file://` URI -> canonical key (the file path string). `None` for non-file URIs.
+fn uri_to_key(uri: &Uri) -> Option<String> {
+    uri.to_file_path().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Canonical key (path string) -> `file://` URI.
+fn key_to_uri(key: &str) -> Option<Uri> {
+    Uri::from_file_path(key)
+}
+
+impl LanguageServer for Backend {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Remember the workspace root so `initialized` can index it off the request path.
+        #[allow(deprecated)]
+        let root = params
+            .root_uri
+            .as_ref()
+            .and_then(uri_to_key)
+            .or_else(|| {
+                params
+                    .workspace_folders
+                    .as_ref()
+                    .and_then(|folders| folders.first())
+                    .and_then(|folder| uri_to_key(&folder.uri))
+            })
+            .map(PathBuf::from);
+        if root.is_some() {
+            *self.root.lock().unwrap() = root;
+        }
+
+        Ok(InitializeResult {
+            server_info: Some(ServerInfo {
+                name: "ktlsp".into(),
+                version: Some(env!("CARGO_PKG_VERSION").into()),
+            }),
+            capabilities: ServerCapabilities {
+                // FULL sync: each change carries the whole document (simple + correct for v1).
+                text_document_sync: Some(TextDocumentSyncCapability::Kind(
+                    TextDocumentSyncKind::FULL,
+                )),
+                definition_provider: Some(OneOf::Left(true)),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+
+    async fn initialized(&self, _: InitializedParams) {
+        self.client
+            .log_message(MessageType::INFO, "ktlsp initialized")
+            .await;
+
+        // Index the workspace once, off the request path. Early goto requests fall back to
+        // local-scope resolution until the index warms up.
+        let root = self.root.lock().unwrap().clone();
+        if let Some(root) = root {
+            let ws = self.ws.clone();
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                let count = tokio::task::spawn_blocking(move || ws.lock().unwrap().scan(&root))
+                    .await
+                    .unwrap_or(0);
+                client
+                    .log_message(MessageType::INFO, format!("ktlsp indexed {count} Kotlin files"))
+                    .await;
+            });
+        }
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let doc = params.text_document;
+        if let Some(key) = uri_to_key(&doc.uri) {
+            self.ws.lock().unwrap().open(key, doc.text);
+        }
+    }
+
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        // FULL sync: the last (only) change holds the entire new document.
+        if let Some(key) = uri_to_key(&params.text_document.uri) {
+            if let Some(change) = params.content_changes.into_iter().last() {
+                self.ws.lock().unwrap().change(&key, change.text);
+            }
+        }
+    }
+
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        if let Some(key) = uri_to_key(&params.text_document.uri) {
+            self.ws.lock().unwrap().close(&key);
+        }
+    }
+
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        // All work is synchronous; the lock is never held across an `.await`.
+        let locations = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let line_index = LineIndex::new(&text);
+            let offset = line_index.offset(&text, pos.line, pos.character);
+
+            let defs = ws.goto_definition(&key, offset);
+            let mut locations = Vec::with_capacity(defs.len());
+            for d in defs {
+                let target_uri = if d.file == key {
+                    uri.clone()
+                } else {
+                    match key_to_uri(&d.file) {
+                        Some(u) => u,
+                        None => continue,
+                    }
+                };
+                let target_text = if d.file == key {
+                    text.clone()
+                } else {
+                    match ws.doc_text(&d.file) {
+                        Some(t) => t,
+                        None => continue,
+                    }
+                };
+                let tli = LineIndex::new(&target_text);
+                let (sl, sc) = tli.position(&target_text, d.start_byte);
+                let (el, ec) = tli.position(&target_text, d.end_byte);
+                locations.push(Location::new(
+                    target_uri,
+                    Range {
+                        start: Position { line: sl, character: sc },
+                        end: Position { line: el, character: ec },
+                    },
+                ));
+            }
+            locations
+        };
+
+        Ok(match locations.len() {
+            0 => None,
+            1 => Some(GotoDefinitionResponse::Scalar(
+                locations.into_iter().next().unwrap(),
+            )),
+            _ => Some(GotoDefinitionResponse::Array(locations)),
+        })
+    }
+}

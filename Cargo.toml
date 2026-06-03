@@ -1,0 +1,29 @@
+[package]
+name = "ktlsp"
+version = "0.1.0"
+edition = "2021"
+description = "A simple, fast Kotlin language server (goto-definition) built on tree-sitter"
+license = "MIT"
+repository = "https://github.com/pepegar/ktlsp"
+
+[[bin]]
+name = "ktlsp"
+path = "src/main.rs"
+
+[lib]
+name = "ktlsp"
+path = "src/lib.rs"
+
+[dependencies]
+# LSP transport. Pinned: 0.21+ uses impl-Trait-in-trait (NO async_trait), trait is not object-safe.
+tower-lsp-server = "0.23"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "io-std", "sync"] }
+# Parsing. Grammar locked to tree-sitter-kotlin-ng (verified node kinds via examples/dump.rs).
+tree-sitter = "0.24"
+tree-sitter-kotlin-ng = "1.1"
+# Workspace scanning.
+walkdir = "2"
+# Logging to STDERR only (stdout is the JSON-RPC wire).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
