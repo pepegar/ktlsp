@@ -12,6 +12,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
+use crate::symbol::Def;
 use crate::text::LineIndex;
 use crate::workspace::Workspace;
 
@@ -45,6 +46,7 @@ struct DepStats {
 fn index_dependencies(ws: &Arc<Mutex<Workspace>>, root: &std::path::Path) -> DepStats {
     use crate::artifacts::Repos;
     use crate::deps;
+    use crate::index::Tier;
     use crate::java::JavaParser;
     use crate::parser::KotlinParser;
 
@@ -77,7 +79,7 @@ fn index_dependencies(ws: &Arc<Mutex<Workspace>>, root: &std::path::Path) -> Dep
         for batch in batches {
             let mut guard = ws.lock().unwrap();
             stats.symbols += batch.symbols.len();
-            guard.index.replace_file(&batch.file, batch.symbols);
+            guard.index.replace_file(&batch.file, batch.symbols, Tier::Durable);
             stats.files += 1;
         }
     }
@@ -125,6 +127,7 @@ impl LanguageServer for Backend {
                     TextDocumentSyncKind::FULL,
                 )),
                 definition_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
                 ..Default::default()
             },
             ..Default::default()
@@ -215,40 +218,9 @@ impl LanguageServer for Backend {
                 Some(t) => t,
                 None => return Ok(None),
             };
-            let line_index = LineIndex::new(&text);
-            let offset = line_index.offset(&text, pos.line, pos.character);
-
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
             let defs = ws.goto_definition(&key, offset);
-            let mut locations = Vec::with_capacity(defs.len());
-            for d in defs {
-                let target_uri = if d.file == key {
-                    uri.clone()
-                } else {
-                    match key_to_uri(&d.file) {
-                        Some(u) => u,
-                        None => continue,
-                    }
-                };
-                let target_text = if d.file == key {
-                    text.clone()
-                } else {
-                    match ws.doc_text(&d.file) {
-                        Some(t) => t,
-                        None => continue,
-                    }
-                };
-                let tli = LineIndex::new(&target_text);
-                let (sl, sc) = tli.position(&target_text, d.start_byte);
-                let (el, ec) = tli.position(&target_text, d.end_byte);
-                locations.push(Location::new(
-                    target_uri,
-                    Range {
-                        start: Position { line: sl, character: sc },
-                        end: Position { line: el, character: ec },
-                    },
-                ));
-            }
-            locations
+            defs.iter().filter_map(|d| def_to_location(&ws, d)).collect::<Vec<_>>()
         };
 
         Ok(match locations.len() {
@@ -259,4 +231,44 @@ impl LanguageServer for Backend {
             _ => Some(GotoDefinitionResponse::Array(locations)),
         })
     }
+
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let locations = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let sites = ws.references(&key, offset, include_declaration);
+            sites.iter().filter_map(|d| def_to_location(&ws, d)).collect::<Vec<_>>()
+        };
+
+        Ok((!locations.is_empty()).then_some(locations))
+    }
+}
+
+/// Convert a core `Def` (file key + byte range) into an LSP `Location`, reading the target file's
+/// text to convert byte offsets to UTF-16 positions. `None` if the file is unreadable or its key
+/// isn't a `file://`-convertible path.
+fn def_to_location(ws: &Workspace, d: &Def) -> Option<Location> {
+    let text = ws.doc_text(&d.file)?;
+    let line_index = LineIndex::new(&text);
+    let (sl, sc) = line_index.position(&text, d.start_byte);
+    let (el, ec) = line_index.position(&text, d.end_byte);
+    Some(Location::new(
+        key_to_uri(&d.file)?,
+        Range {
+            start: Position { line: sl, character: sc },
+            end: Position { line: el, character: ec },
+        },
+    ))
 }

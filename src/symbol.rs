@@ -1,8 +1,10 @@
 //! Core, LSP-independent data types: symbol kinds, indexed symbols, and definition results.
 
+use serde::{Deserialize, Serialize};
+
 /// What a name binds to. Drives kind-aware resolution (a `class Foo` and a `fun Foo` are
 /// indistinguishable by name alone, so the resolver filters candidates by kind).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SymbolKind {
     Class,
     Interface,
@@ -43,7 +45,7 @@ impl SymbolKind {
 /// A declaration recorded in the cross-file index (top-level & member declarations only;
 /// locals, parameters and type-parameters are resolved from the live AST and never indexed).
 /// The byte range is that of the declaration's *name* identifier.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexedSymbol {
     pub name: String,
     pub kind: SymbolKind,
@@ -58,7 +60,7 @@ pub struct IndexedSymbol {
 /// A goto-definition result: the canonical file key plus the byte range of the target name
 /// identifier. `file` is the single identity string shared by the index and the open-doc map
 /// (a path or URI string — never re-derived from the filesystem at query time).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Def {
     pub file: String,
     pub start_byte: usize,

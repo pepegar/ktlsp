@@ -58,5 +58,22 @@ async fn initialize_open_and_goto_definition() {
         other => panic!("expected a single definition location, got: {other:?}"),
     }
 
+    // textDocument/references on `helper` (declaration on line 0 + one call on line 1).
+    let refs = backend
+        .references(ReferenceParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 1, character },
+            },
+            context: ReferenceContext { include_declaration: true },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("references should be present");
+    assert_eq!(refs.len(), 2, "decl + one call: {refs:?}");
+    assert!(refs.iter().all(|l| l.uri.as_str() == uri.as_str()));
+
     assert!(backend.shutdown().await.is_ok());
 }

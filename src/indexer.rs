@@ -8,6 +8,7 @@
 
 use tree_sitter::Node;
 
+use crate::index::Usage;
 use crate::parser::{class_kind, first_ident, name_field, node_text};
 use crate::symbol::{IndexedSymbol, SymbolKind};
 
@@ -15,6 +16,35 @@ pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Ve
     let mut out = Vec::new();
     walk(tree.root_node(), src, package, None, &mut out);
     out
+}
+
+/// Collect every `identifier` occurrence (declarations and usages alike) as a usage site, for the
+/// reverse-reference index. Declarations are included so find-references can return the decl too.
+pub fn extract_usages(tree: &tree_sitter::Tree, src: &str) -> Vec<Usage> {
+    let mut out = Vec::new();
+    let mut cursor = tree.walk();
+    collect_usages(&mut cursor, src, &mut out);
+    out
+}
+
+fn collect_usages(cursor: &mut tree_sitter::TreeCursor, src: &str, out: &mut Vec<Usage>) {
+    loop {
+        let node = cursor.node();
+        if node.kind() == "identifier" {
+            out.push(Usage {
+                name: node_text(node, src).to_string(),
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+            });
+        }
+        if cursor.goto_first_child() {
+            collect_usages(cursor, src, out);
+            cursor.goto_parent();
+        }
+        if !cursor.goto_next_sibling() {
+            break;
+        }
+    }
 }
 
 fn push(

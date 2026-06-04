@@ -1,28 +1,59 @@
-//! In-memory cross-file symbol index.
+//! In-memory cross-file symbol index, split into two tiers.
 //!
-//! v1 is in-memory: nothing persists across restarts, the only query is by-name (then filtered
-//! Rust-side), and a `HashMap` beats SQLite here while dropping a bundled-C dependency and an SQL
-//! error surface. The API (`replace_file` / `remove_file` / `lookup_by_name`) is deliberately
-//! storage-agnostic so a persistent SQLite backend can drop in later without touching callers.
+//! Symbols are tagged `Volatile` (project files & open buffers — churned on every edit) or
+//! `Durable` (library dependency symbols — written once, never touched by an edit). A single
+//! shared by-name map keeps lookups O(1) and clone-free; `files` records each file's tier for
+//! whole-file replace/remove. The tier split makes "a keystroke can't disturb library symbols"
+//! structural, and marks exactly the set that the persistent symbol cache serializes.
 
 use std::collections::HashMap;
 
 use crate::symbol::IndexedSymbol;
 
-/// An indexed symbol together with the file that declared it.
+/// Which tier a file's symbols belong to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tier {
+    /// Project files and open buffers — re-indexed on edits.
+    Volatile,
+    /// Library dependency symbols — written once, never disturbed by project edits.
+    Durable,
+}
+
+/// An indexed symbol together with the file that declared it and its tier.
 #[derive(Clone, Debug)]
 pub struct Entry {
     /// Canonical file key (a path or URI string — the caller picks one identity scheme).
     pub path: String,
+    pub tier: Tier,
     pub sym: IndexedSymbol,
+}
+
+/// An identifier *usage* produced by the reverse-reference pass (carries its own name for removal).
+#[derive(Clone, Debug)]
+pub struct Usage {
+    pub name: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
+}
+
+/// A usage site keyed by name in the reverse index.
+#[derive(Clone, Debug)]
+pub struct RefEntry {
+    pub path: String,
+    pub start_byte: usize,
+    pub end_byte: usize,
 }
 
 #[derive(Default)]
 pub struct Index {
-    /// Source of truth: symbols contributed by each file (for whole-file replace/remove).
-    files: HashMap<String, Vec<IndexedSymbol>>,
-    /// Derived lookup: simple name -> entries.
+    /// Source of truth: each file's tier + symbols (for whole-file replace/remove).
+    files: HashMap<String, (Tier, Vec<IndexedSymbol>)>,
+    /// Derived lookup: simple name -> entries (both tiers merged).
     by_name: HashMap<String, Vec<Entry>>,
+    /// Reverse index source of truth: each file's identifier usages (project files only).
+    ref_files: HashMap<String, Vec<Usage>>,
+    /// Derived reverse lookup: simple name -> usage sites.
+    refs_by_name: HashMap<String, Vec<RefEntry>>,
 }
 
 impl Index {
@@ -30,21 +61,40 @@ impl Index {
         Self::default()
     }
 
-    /// Replace all symbols contributed by `path`.
-    pub fn replace_file(&mut self, path: &str, symbols: Vec<IndexedSymbol>) {
-        self.remove_file(path);
+    /// Replace all symbols contributed by `path`, recording them in the given tier.
+    pub fn replace_file(&mut self, path: &str, symbols: Vec<IndexedSymbol>, tier: Tier) {
+        self.remove_symbols(path);
         for sym in &symbols {
             self.by_name.entry(sym.name.clone()).or_default().push(Entry {
                 path: path.to_string(),
+                tier,
                 sym: sym.clone(),
             });
         }
-        self.files.insert(path.to_string(), symbols);
+        self.files.insert(path.to_string(), (tier, symbols));
     }
 
-    /// Drop all symbols contributed by `path`.
+    /// Replace all identifier usages contributed by `path` (the reverse-reference index).
+    pub fn replace_file_refs(&mut self, path: &str, usages: Vec<Usage>) {
+        self.remove_refs(path);
+        for u in &usages {
+            self.refs_by_name.entry(u.name.clone()).or_default().push(RefEntry {
+                path: path.to_string(),
+                start_byte: u.start_byte,
+                end_byte: u.end_byte,
+            });
+        }
+        self.ref_files.insert(path.to_string(), usages);
+    }
+
+    /// Drop everything (symbols + usages) contributed by `path`.
     pub fn remove_file(&mut self, path: &str) {
-        if let Some(old) = self.files.remove(path) {
+        self.remove_symbols(path);
+        self.remove_refs(path);
+    }
+
+    fn remove_symbols(&mut self, path: &str) {
+        if let Some((_, old)) = self.files.remove(path) {
             for sym in old {
                 if let Some(entries) = self.by_name.get_mut(&sym.name) {
                     entries.retain(|e| e.path != path);
@@ -56,9 +106,27 @@ impl Index {
         }
     }
 
+    fn remove_refs(&mut self, path: &str) {
+        if let Some(old) = self.ref_files.remove(path) {
+            for u in old {
+                if let Some(entries) = self.refs_by_name.get_mut(&u.name) {
+                    entries.retain(|e| e.path != path);
+                    if entries.is_empty() {
+                        self.refs_by_name.remove(&u.name);
+                    }
+                }
+            }
+        }
+    }
+
     /// All entries with the given simple name (borrowed; callers clone only what they keep).
     pub fn lookup_by_name(&self, name: &str) -> &[Entry] {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// All usage sites of the given simple name (the reverse-reference index).
+    pub fn lookup_refs(&self, name: &str) -> &[RefEntry] {
+        self.refs_by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 }
 
@@ -81,15 +149,18 @@ mod tests {
     #[test]
     fn replace_is_idempotent_per_file() {
         let mut idx = Index::new();
-        idx.replace_file("a.kt", vec![sym("foo"), sym("bar")]);
-        idx.replace_file("b.kt", vec![sym("foo")]);
+        idx.replace_file("a.kt", vec![sym("foo"), sym("bar")], Tier::Volatile);
+        idx.replace_file("b.kt", vec![sym("foo")], Tier::Durable);
         assert_eq!(idx.lookup_by_name("foo").len(), 2);
 
         // Re-indexing a.kt with fewer symbols must drop the stale ones.
-        idx.replace_file("a.kt", vec![sym("baz")]);
+        idx.replace_file("a.kt", vec![sym("baz")], Tier::Volatile);
         assert_eq!(idx.lookup_by_name("foo").len(), 1); // only b.kt remains
         assert_eq!(idx.lookup_by_name("bar").len(), 0);
         assert_eq!(idx.lookup_by_name("baz").len(), 1);
+
+        // Tiers are recorded on entries and merged in lookup.
+        assert_eq!(idx.lookup_by_name("foo")[0].tier, Tier::Durable);
 
         idx.remove_file("b.kt");
         assert_eq!(idx.lookup_by_name("foo").len(), 0);

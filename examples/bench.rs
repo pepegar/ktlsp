@@ -55,7 +55,7 @@ fn main() {
     let (mut files, mut syms) = (0usize, 0usize);
     for b in batches {
         syms += b.symbols.len();
-        ws.index.replace_file(&b.file, b.symbols);
+        ws.index.replace_file(&b.file, b.symbols, ktlsp::index::Tier::Durable);
         files += 1;
     }
     println!(

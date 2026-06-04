@@ -44,7 +44,7 @@ fn index_into_workspace(coord: &Coordinate, repos: &Repos, extract_root: &Path) 
     assert!(!batches.is_empty(), "expected indexed library files for {}", coord.label());
     let mut ws = Workspace::new();
     for batch in batches {
-        ws.index.replace_file(&batch.file, batch.symbols);
+        ws.index.replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
     }
     ws
 }

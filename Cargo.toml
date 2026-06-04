@@ -33,3 +33,6 @@ ureq = { version = "3", features = ["rustls"] }
 zip = { version = "2.3", default-features = false, features = ["deflate"] }
 toml = "1"
 serde = { version = "1", features = ["derive"] }
+# Persistent library-symbol cache: serialize indexed symbols keyed by a jar fingerprint.
+bincode = "1"
+sha2 = "0.10"

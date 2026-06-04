@@ -1,16 +1,27 @@
 # ktlsp
 
-A small, fast Kotlin language server written in Rust. It does one thing well:
-**goto-definition**. No JVM, no Gradle, no waiting.
+A small, fast Kotlin language server written in Rust. **goto-definition** and
+**find-references**, across both your own code and your library dependencies. No JVM, no Gradle,
+no waiting — goto is sub-millisecond and startup reuses a persistent symbol cache.
 
 It is built on [tree-sitter](https://tree-sitter.github.io/) for parsing and
 [tower-lsp-server](https://github.com/tower-lsp-community/tower-lsp-server) for the LSP plumbing,
 and is meant as a lightweight alternative when the official `kotlin-lsp` is too heavy or
 unreliable for your workflow.
 
-> Status: **goto-definition only**, but across both your own code **and your library
-> dependencies** (it downloads/indexes `-sources.jar` artifacts). Hover, references, and completion
-> are deliberately out of scope for now (the architecture leaves room for them later).
+> Status: **goto-definition + find-references**, across your own code **and your library
+> dependencies** (it downloads/indexes `-sources.jar` artifacts). Hover, completion, and rename
+> are out of scope for now (the architecture leaves room for them).
+
+## Performance
+
+- **goto-definition is sub-millisecond.** Open buffers are reparsed incrementally
+  (`tree.edit` against a cached tree), so goto reads an already-current tree instead of reparsing —
+  ~30µs on a typical file, a few hundred µs on a 600-line file (vs ~0.4–5ms reparsing each request).
+- **Startup is near-instant after the first run.** Library symbols are parsed once and cached to
+  disk keyed by a jar fingerprint; subsequent launches deserialize them (~3ms for kotlin-stdlib's
+  10k symbols) instead of re-parsing (~2–10s). A two-tier index keeps project edits from ever
+  touching library symbols.
 
 ## Install
 
@@ -68,6 +79,14 @@ ktlsp jumps into your dependencies' source, not just your own code:
 Both **Kotlin and Java** library sources are indexed. Indexing happens in the background after
 `initialize`, so early requests fall back to project-local resolution until it warms up.
 
+## Find-references
+
+`textDocument/references` returns every usage of the symbol at the cursor. ktlsp keeps a reverse
+index of identifier usages in project files and re-resolves each candidate against the cursor's
+definition, so results are at the same best-effort precision as goto (a shadowed homonym in another
+scope is excluded). The declaration itself is included when the client asks. Rename and call
+hierarchy are natural follow-ons on the same index.
+
 ## Limitations (by design)
 
 These are deliberate and documented, not bugs:
@@ -75,8 +94,7 @@ These are deliberate and documented, not bugs:
 - **Sources-jar only — no bytecode decompilation.** A dependency that doesn't publish a
   `-sources.jar` won't resolve (we skip it gracefully). There is no `.class` decompilation.
 - **Direct dependencies only.** Coordinates come from the version catalog, so transitive
-  dependencies (and BOM-managed, version-less entries) aren't resolved. Re-indexing happens on
-  restart.
+  dependencies (and BOM-managed, version-less entries) aren't resolved.
 - **JVM-targeted default imports.** Unqualified stdlib resolution assumes a JVM target
   (`kotlin.*`, `java.lang.*`, …); symbols from JS/Native-only default-import packages aren't
   auto-resolved.
@@ -102,27 +120,31 @@ the logic honest:
 | Module | Responsibility |
 |---|---|
 | `text` | byte ↔ (line, UTF-16 column) conversion (the classic LSP position bug, isolated) |
-| `parser` | tree-sitter wrapper + node helpers (verified node-kinds for `tree-sitter-kotlin-ng`) |
+| `parser` | tree-sitter wrapper + node helpers; incremental reparse (`compute_edit` + `reparse`) |
 | `java` | tree-sitter-java parser + Java symbol extraction (library `.java` sources) |
 | `symbol` | core data types (`SymbolKind`, `IndexedSymbol`, `Def`) — no LSP types |
-| `indexer` | extract top-level & member declarations from a Kotlin parse tree (descends into ERROR nodes) |
-| `index` | in-memory by-name symbol index (storage-agnostic API; SQLite could drop in later) |
+| `indexer` | extract declarations + identifier usages from a parse tree (descends into ERROR nodes) |
+| `index` | two-tier (volatile/durable) by-name symbol index + reverse usage index |
 | `resolve` | the goto-definition algorithm (local scope walk + kind-aware cross-file) |
 | `coords` / `catalog` | Maven coordinates + Gradle version-catalog (`libs.versions.toml`) parsing |
 | `artifacts` / `jar` | locate/download `-sources.jar` (cache → Maven Central); zip-slip-safe extraction |
-| `deps` | orchestrates catalog → coordinate → jar → extracted sources → indexed symbols |
+| `deps` | catalog → coordinate → jar → extracted sources → indexed symbols, with a persistent symbol cache |
 | `workspace` | owns the index + open buffers + parser; scanning and reindexing |
 | `lsp` | the only `tower-lsp-server` code: translates LSP ↔ core; drives background dep indexing |
 
 Everything except `lsp.rs`/`main.rs` speaks byte offsets, has no async, and is unit-tested in
 milliseconds — no process spawn, no JSON-RPC.
 
-### Why in-memory (not SQLite/LSIF)?
+### Index design
 
-Nothing in v1 persists across restarts and the only query is "by name", so an in-memory `HashMap`
-is faster and simpler than SQLite, with no bundled-C dependency. The `index` module's API is
-storage-agnostic, so a persistent backend can drop in later if cross-restart warm-start ever
-matters. LSIF was rejected outright — it's a static/batch dump format, wrong for live editing.
+The live index is an in-memory `HashMap` (by-name lookup + a reverse usage map) — faster and
+simpler than an embedded SQL engine for a by-name workload. It is split into two tiers: **volatile**
+(project files and open buffers, re-indexed on edits) and **durable** (library symbols, written
+once and never disturbed by an edit). Durability isn't full persistence of the *live* index, but
+the parse cost behind the durable tier *is* persisted: library symbols are serialized to a
+per-jar cache (`~/.cache/ktlsp/symcache/`, keyed by a jar fingerprint), so startup deserializes
+them instead of re-parsing. LSIF was rejected outright — it's a static/batch dump format, wrong for
+live editing.
 
 ## Development
 
