@@ -33,21 +33,65 @@ pub struct FileSymbols {
 }
 
 /// Read the project's coordinates from `gradle/libs.versions.toml` (or a top-level
-/// `libs.versions.toml`). Returns empty if no catalog is present or it can't be parsed.
+/// `libs.versions.toml`), then ensure kotlin-stdlib is among them (the Kotlin Gradle plugin adds it
+/// implicitly, so most projects never list it). Returns empty if no catalog is present, it can't be
+/// parsed, AND the root doesn't look like a Gradle project.
 pub fn coordinates_for_root(root: &Path) -> Vec<Coordinate> {
     let candidates = [
         root.join("gradle/libs.versions.toml"),
         root.join("libs.versions.toml"),
     ];
+    let mut coords = Vec::new();
     for path in candidates {
         if let Ok(src) = fs::read_to_string(&path) {
             match catalog::parse_catalog(&src) {
-                Ok(coords) => return coords,
+                Ok(c) => {
+                    coords = c;
+                    break;
+                }
                 Err(e) => tracing::warn!("failed to parse {}: {e}", path.display()),
             }
         }
     }
-    Vec::new()
+    inject_stdlib(&mut coords, is_gradle_project(root));
+    coords
+}
+
+/// Pinned fallback when a project's Kotlin version can't be derived from its catalog.
+const DEFAULT_KOTLIN_VERSION: &str = "2.1.20";
+
+/// Add a `org.jetbrains.kotlin:kotlin-stdlib` coordinate if absent and this is a Gradle project,
+/// versioned from an existing `org.jetbrains.kotlin` coordinate when possible (e.g. kotlin-reflect),
+/// else the pinned fallback. The gating avoids indexing ~10s of stdlib for an unrelated directory of
+/// loose `.kt` files. Pure (no filesystem) so it is unit-testable.
+fn inject_stdlib(coords: &mut Vec<Coordinate>, gradle_project: bool) {
+    const GROUP: &str = "org.jetbrains.kotlin";
+    const ARTIFACT: &str = "kotlin-stdlib";
+    if !gradle_project || coords.iter().any(|c| c.group == GROUP && c.artifact == ARTIFACT) {
+        return;
+    }
+    let version = coords
+        .iter()
+        .find(|c| c.group == GROUP)
+        .map(|c| c.version.clone())
+        .unwrap_or_else(|| DEFAULT_KOTLIN_VERSION.to_string());
+    if let Some(c) = Coordinate::parse(&format!("{GROUP}:{ARTIFACT}:{version}")) {
+        coords.push(c);
+    }
+}
+
+/// Whether `root` looks like a Gradle/Kotlin project (worth auto-indexing kotlin-stdlib for).
+fn is_gradle_project(root: &Path) -> bool {
+    [
+        "settings.gradle.kts",
+        "settings.gradle",
+        "build.gradle.kts",
+        "build.gradle",
+        "gradle/libs.versions.toml",
+        "libs.versions.toml",
+    ]
+    .iter()
+    .any(|f| root.join(f).exists())
 }
 
 /// ktlsp's cache root (`~/.cache/ktlsp`, or under the temp dir if HOME is unset).
@@ -206,4 +250,44 @@ pub fn resolve_coordinate(
     }
 
     parse_dir(&dest, kotlin, java)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn coord(s: &str) -> Coordinate {
+        Coordinate::parse(s).unwrap()
+    }
+
+    #[test]
+    fn injects_stdlib_when_absent_in_a_gradle_project() {
+        let mut coords = vec![coord("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0")];
+        inject_stdlib(&mut coords, true);
+        assert!(coords.iter().any(|c| c.artifact == "kotlin-stdlib"
+            && c.group == "org.jetbrains.kotlin"
+            && c.version == DEFAULT_KOTLIN_VERSION));
+    }
+
+    #[test]
+    fn derives_stdlib_version_from_a_kotlin_coordinate() {
+        let mut coords = vec![coord("org.jetbrains.kotlin:kotlin-reflect:2.0.21")];
+        inject_stdlib(&mut coords, true);
+        let stdlib = coords.iter().find(|c| c.artifact == "kotlin-stdlib").unwrap();
+        assert_eq!(stdlib.version, "2.0.21", "version derived from the kotlin-reflect coordinate");
+    }
+
+    #[test]
+    fn does_not_duplicate_existing_stdlib() {
+        let mut coords = vec![coord("org.jetbrains.kotlin:kotlin-stdlib:2.1.20")];
+        inject_stdlib(&mut coords, true);
+        assert_eq!(coords.iter().filter(|c| c.artifact == "kotlin-stdlib").count(), 1);
+    }
+
+    #[test]
+    fn skips_injection_for_non_gradle_dir() {
+        let mut coords = Vec::new();
+        inject_stdlib(&mut coords, false);
+        assert!(coords.is_empty(), "loose-file dirs must not auto-index stdlib");
+    }
 }
