@@ -8,7 +8,8 @@
 
 use std::collections::HashMap;
 
-use crate::symbol::IndexedSymbol;
+use crate::symbol::{IndexedSymbol, SymbolKind};
+use crate::types::TypeRef;
 
 /// Which tier a file's symbols belong to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +163,54 @@ impl Index {
     /// Borrowed.
     pub fn extensions_for(&self, receiver_type: &str) -> &[Entry] {
         self.ext_by_receiver.get(receiver_type).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Type-like entries with simple name `name` (a thin `is_type_like` filter over the by-name
+    /// map). NOT a separate maintained index — used by inference to resolve a simple type name's
+    /// package.
+    pub fn lookup_type(&self, name: &str) -> Vec<&Entry> {
+        self.by_name
+            .get(name)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .filter(|e| e.sym.kind.is_type_like())
+            .collect()
+    }
+
+    /// The declared return type of a function named `name`, optionally scoped by `container` and
+    /// `package`. Reads the `return_type` stamped at index time; the first scoped match with a
+    /// recorded return type wins. `None` when no such function has an explicit return annotation.
+    pub fn return_type_of(
+        &self,
+        name: &str,
+        container: Option<&str>,
+        package: Option<&str>,
+    ) -> Option<TypeRef> {
+        self.by_name
+            .get(name)?
+            .iter()
+            .filter(|e| e.sym.kind == SymbolKind::Function)
+            .filter(|e| container.map_or(true, |c| e.sym.container.as_deref() == Some(c)))
+            .filter(|e| package.map_or(true, |p| e.sym.package == p))
+            .find_map(|e| e.sym.return_type.clone())
+    }
+
+    /// The declared type of a property named `name`, optionally scoped by `container` and `package`.
+    /// Reads the `value_type` stamped at index time. `None` when no such property is annotated.
+    pub fn property_type_of(
+        &self,
+        name: &str,
+        container: Option<&str>,
+        package: Option<&str>,
+    ) -> Option<TypeRef> {
+        self.by_name
+            .get(name)?
+            .iter()
+            .filter(|e| e.sym.kind == SymbolKind::Property)
+            .filter(|e| container.map_or(true, |c| e.sym.container.as_deref() == Some(c)))
+            .filter(|e| package.map_or(true, |p| e.sym.package == p))
+            .find_map(|e| e.sym.value_type.clone())
     }
 
     /// The direct supertype simple-names of `type_name`, across both tiers. Reads the declaring

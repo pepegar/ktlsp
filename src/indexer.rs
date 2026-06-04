@@ -11,6 +11,7 @@ use tree_sitter::Node;
 use crate::index::Usage;
 use crate::parser::{child_of_kind, class_kind, first_ident, name_field, node_text};
 use crate::symbol::{IndexedSymbol, SymbolKind};
+use crate::types::TypeRef;
 
 pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Vec<IndexedSymbol> {
     let mut out = Vec::new();
@@ -81,7 +82,8 @@ fn push_property_names(
         match child.kind() {
             "variable_declaration" => {
                 if let Some(id) = first_ident(child) {
-                    push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver);
+                    let vt = value_type_of(child, src);
+                    push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver, vt);
                 }
             }
             "multi_variable_declaration" => {
@@ -89,7 +91,8 @@ fn push_property_names(
                 for vd in child.named_children(&mut c2) {
                     if vd.kind() == "variable_declaration" {
                         if let Some(id) = first_ident(vd) {
-                            push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver);
+                            let vt = value_type_of(vd, src);
+                            push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver, vt);
                         }
                     }
                 }
@@ -99,7 +102,8 @@ fn push_property_names(
     }
 }
 
-/// Like `push`, but stamps `ext_receiver` (for extension functions/properties).
+/// Like `push`, but stamps `ext_receiver` (for extension functions/properties) and `value_type`
+/// (the property's declared type, for type inference).
 fn push_ext(
     out: &mut Vec<IndexedSymbol>,
     name_node: Node,
@@ -108,9 +112,11 @@ fn push_ext(
     package: &str,
     container: Option<&str>,
     ext_receiver: Option<&str>,
+    value_type: Option<TypeRef>,
 ) {
     out.push(IndexedSymbol {
         ext_receiver: ext_receiver.map(str::to_string),
+        value_type,
         ..IndexedSymbol::new(
             node_text(name_node, src),
             kind,
@@ -122,8 +128,9 @@ fn push_ext(
     });
 }
 
-/// Push a `Function` symbol, stamping `ext_receiver` and `arity` (the count of value parameters,
-/// saturated at `u8::MAX`). `arity` drives the Stage C snippet shape (`name()$0` vs `name($0)`).
+/// Push a `Function` symbol, stamping `ext_receiver`, `arity` (the count of value parameters,
+/// saturated at `u8::MAX`), and `return_type` (the declared return annotation, for type inference).
+/// `arity` drives the Stage C snippet shape (`name()$0` vs `name($0)`).
 fn push_function(
     out: &mut Vec<IndexedSymbol>,
     decl: Node,
@@ -136,6 +143,7 @@ fn push_function(
     out.push(IndexedSymbol {
         ext_receiver: ext_receiver.map(str::to_string),
         arity: Some(value_param_count(decl)),
+        return_type: return_type_of(decl, src),
         ..IndexedSymbol::new(
             node_text(name_node, src),
             SymbolKind::Function,
@@ -235,6 +243,111 @@ fn extension_receiver(decl: Node, src: &str) -> Option<String> {
         // For functions the boundary is the `name:` field; once we reach it, stop.
         if name_field(decl) == Some(child) {
             return None;
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------------------------
+// Type extraction (return types / property types -> TypeRef for inference).
+// ---------------------------------------------------------------------------------------------
+
+/// The simple-name `identifier` of a `user_type`: its LAST direct `identifier` child. A qualified
+/// `a.b.C` lists its path as successive `identifier` children (`a`, `b`, `C`) — the simple name is
+/// the last; for `List<String>` the only direct identifier is `List` (the arg nests under
+/// `type_arguments`). Verified via `examples/dump`.
+fn user_type_name<'t>(ut: Node<'t>) -> Option<Node<'t>> {
+    let mut cursor = ut.walk();
+    let mut last = None;
+    for c in ut.named_children(&mut cursor) {
+        if c.kind() == "identifier" {
+            last = Some(c);
+        }
+    }
+    last
+}
+
+/// Build a [`TypeRef`] from a `user_type` / `nullable_type` node: simple name + nullability + raw
+/// type-arguments. `None` if no name identifier is present.
+fn type_ref_from(node: Node, src: &str) -> Option<TypeRef> {
+    match node.kind() {
+        "nullable_type" => {
+            let ut = find_descendant(node, "user_type")?;
+            let mut tr = type_ref_from_user_type(ut, src)?;
+            tr.nullable = true;
+            Some(tr)
+        }
+        "user_type" => type_ref_from_user_type(node, src),
+        _ => None,
+    }
+}
+
+fn type_ref_from_user_type(ut: Node, src: &str) -> Option<TypeRef> {
+    let name = user_type_name(ut)?;
+    Some(TypeRef {
+        name: node_text(name, src).to_string(),
+        nullable: false,
+        args: type_args_of(ut, src),
+    })
+}
+
+/// The type arguments of a `user_type` (`List<Foo>` -> `[Foo]`). Each `type_projection` wraps a
+/// `user_type`/`nullable_type`; star projections / unparsable args are skipped. Captured at index
+/// time for one-level generic inference (Stage 5).
+fn type_args_of(ut: Node, src: &str) -> Vec<TypeRef> {
+    let mut out = Vec::new();
+    let Some(ta) = child_of_kind(ut, "type_arguments") else {
+        return out;
+    };
+    let mut cursor = ta.walk();
+    for proj in ta.named_children(&mut cursor) {
+        if proj.kind() != "type_projection" {
+            continue;
+        }
+        let mut c2 = proj.walk();
+        for child in proj.named_children(&mut c2) {
+            if matches!(child.kind(), "user_type" | "nullable_type") {
+                if let Some(tr) = type_ref_from(child, src) {
+                    out.push(tr);
+                }
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// A `function_declaration`'s declared RETURN type: the `user_type`/`nullable_type` child that
+/// appears AFTER the `function_value_parameters` boundary (an extension's receiver is BEFORE
+/// `name:`; a parameter's own type lives inside `function_value_parameters`). `None` when there is
+/// no explicit return annotation. Verified via `examples/dump`:
+/// `fun method(a: Int): Widget` -> `... function_value_parameters, user_type «Widget», function_body`.
+fn return_type_of(decl: Node, src: &str) -> Option<TypeRef> {
+    let mut cursor = decl.walk();
+    let mut after_params = false;
+    for child in decl.named_children(&mut cursor) {
+        if child.kind() == "function_value_parameters" {
+            after_params = true;
+            continue;
+        }
+        if after_params {
+            match child.kind() {
+                "user_type" | "nullable_type" => return type_ref_from(child, src),
+                "function_body" => return None,
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// A `variable_declaration`'s declared type (`val x: T` -> `T`): the `user_type`/`nullable_type`
+/// child inside it. `None` for an unannotated binder.
+fn value_type_of(var_decl: Node, src: &str) -> Option<TypeRef> {
+    let mut cursor = var_decl.walk();
+    for child in var_decl.named_children(&mut cursor) {
+        if matches!(child.kind(), "user_type" | "nullable_type") {
+            return type_ref_from(child, src);
         }
     }
     None
@@ -440,5 +553,65 @@ object Reg { fun add() {} }
         let syms = index(src);
         let x = syms.iter().find(|s| s.name == "x").unwrap();
         assert_eq!(x.ext_receiver, None);
+    }
+
+    #[test]
+    fn return_and_value_types_recorded() {
+        let src = "package app\n\
+                   class Bar\n\
+                   fun foo(): Bar = Bar()\n\
+                   fun maybe(): String? = null\n\
+                   val p: Int = 1\n\
+                   class C {\n    fun method(): Widget = TODO()\n    val prop: Thing get() = field\n}\n\
+                   fun untyped() = 3\n";
+        let syms = index(src);
+        let foo = syms.iter().find(|s| s.name == "foo").unwrap();
+        assert_eq!(foo.return_type.as_ref().map(|t| t.name.as_str()), Some("Bar"));
+        let maybe = syms.iter().find(|s| s.name == "maybe").unwrap();
+        let mt = maybe.return_type.as_ref().unwrap();
+        assert_eq!(mt.name, "String");
+        assert!(mt.nullable, "String? return must be nullable");
+        let p = syms.iter().find(|s| s.name == "p").unwrap();
+        assert_eq!(p.value_type.as_ref().map(|t| t.name.as_str()), Some("Int"));
+        let method = syms.iter().find(|s| s.name == "method").unwrap();
+        assert_eq!(method.return_type.as_ref().map(|t| t.name.as_str()), Some("Widget"));
+        let prop = syms.iter().find(|s| s.name == "prop").unwrap();
+        assert_eq!(prop.value_type.as_ref().map(|t| t.name.as_str()), Some("Thing"));
+        // No annotation -> None (we do not infer from the body in Stage 1).
+        let untyped = syms.iter().find(|s| s.name == "untyped").unwrap();
+        assert_eq!(untyped.return_type, None);
+    }
+
+    #[test]
+    fn generic_return_type_args_recorded() {
+        let src = "fun items(): List<String> = listOf()\nfun pairs(): Map<String, Int> = mapOf()\n";
+        let syms = index(src);
+        let items = syms.iter().find(|s| s.name == "items").unwrap();
+        let rt = items.return_type.as_ref().unwrap();
+        assert_eq!(rt.name, "List");
+        assert_eq!(rt.args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["String"]);
+        let pairs = syms.iter().find(|s| s.name == "pairs").unwrap();
+        let pt = pairs.return_type.as_ref().unwrap();
+        assert_eq!(pt.name, "Map");
+        assert_eq!(pt.args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["String", "Int"]);
+    }
+
+    #[test]
+    fn extension_function_return_not_receiver() {
+        // The extension receiver (String) must NOT be mistaken for the return type (Int).
+        let src = "fun String.count(): Int = 0\n";
+        let syms = index(src);
+        let f = syms.iter().find(|s| s.name == "count").unwrap();
+        assert_eq!(f.ext_receiver.as_deref(), Some("String"));
+        assert_eq!(f.return_type.as_ref().map(|t| t.name.as_str()), Some("Int"));
+    }
+
+    #[test]
+    fn qualified_return_type_uses_simple_name() {
+        // A qualified return type `a.b.C` records the SIMPLE name `C` (last identifier).
+        let src = "fun f(): a.b.C = x\n";
+        let syms = index(src);
+        let f = syms.iter().find(|s| s.name == "f").unwrap();
+        assert_eq!(f.return_type.as_ref().map(|t| t.name.as_str()), Some("C"));
     }
 }
