@@ -363,3 +363,21 @@ fn error_descent_recovers_symbols_for_cross_file_use() {
         "//- Lib.kt\nclass A { fun /*def*/alpha() {} }\nclass B { fun beta() {} }\n//- Main.kt\nfun main() { val a = makeA(); a./*^*/alpha() }\n",
     );
 }
+
+#[test]
+fn member_goto_via_function_return_type() {
+    // goto on `b.describe()` infers b: Bar from makeBar()'s return type, resolving to Bar.describe.
+    check(
+        "//- lib.kt\npackage app\nclass Bar {\n    fun /*def*/describe(): String = \"\"\n}\nfun makeBar(): Bar = Bar()\n\
+         //- Main.kt\npackage app\nfun main() {\n    val b = makeBar()\n    b./*^*/describe()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_inherited_via_supertype() {
+    // goto on an inherited member resolves through the supertype walk (receiver typed by ctor call).
+    check(
+        "//- lib.kt\npackage app\nopen class Base {\n    fun /*def*/render() {}\n}\nclass Button : Base()\n\
+         //- Main.kt\npackage app\nfun main() {\n    val x = Button()\n    x./*^*/render()\n}\n",
+    );
+}

@@ -11,6 +11,7 @@ use walkdir::{DirEntry, WalkDir};
 use crate::complete::{self, ImportAnchor, ScopeCompletion, ShapedCompletions};
 use crate::index::{Entry, Index, RefEntry, Tier};
 use crate::indexer::{extract_symbols, extract_usages};
+use crate::infer;
 use crate::parser::{
     compute_edit, identifier_at, imports_of, join_identifiers, node_text, package_of, Import,
     KotlinParser,
@@ -225,16 +226,18 @@ impl Workspace {
         // the surrounding scope intact (the cached tree of the real buffer is the collapsed one).
         let tree = self.parser.parse(&synthetic);
         let receiver = complete::navigation_receiver_at(&tree, syn_offset)?;
-        let ty = resolve::infer_receiver_type(&self.index, receiver, &synthetic)?;
-        // Which package's `ty` does this file mean? (disambiguates same-named types across packages)
-        let ty_pkg = resolve::resolve_type_package(&self.index, &tree, &synthetic, &ty);
+        // Infer the receiver's type (package-qualified) via the unified inference layer — the same
+        // entry point goto uses, so completion and goto can never disagree. Silent omission when the
+        // type can't be determined.
+        let ctx = infer::FileCtx::from_tree(&tree, &synthetic);
+        let ty = infer::infer(&self.index, receiver, &synthetic, &ctx);
+        let ty_name = ty.name()?.to_string();
+        let ty_pkg = ty.package().map(str::to_string);
 
-        let pkg = package_of(&tree, &synthetic);
-        let imports = imports_of(&tree, &synthetic);
-        let vis = Visibility::new(&pkg, &imports);
+        let vis = Visibility::new(&ctx.package, &ctx.imports);
         let layout = import_layout(&tree, &synthetic);
 
-        let candidates = self.member_candidates(&ty, ty_pkg, &prefix, &vis);
+        let candidates = self.member_candidates(&ty_name, ty_pkg, &prefix, &vis);
         // Silent omission: an inferable type with zero matching members is treated as no result.
         if candidates.is_empty() {
             return None;

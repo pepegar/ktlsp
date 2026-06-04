@@ -17,6 +17,7 @@
 use tree_sitter::{Node, Tree};
 
 use crate::index::{Entry, Index};
+use crate::infer;
 use crate::parser::{
     child_of_kind, class_kind, first_ident, identifier_at, imports_of, name_field, node_text,
     package_of,
@@ -125,7 +126,8 @@ fn resolve_local(usage: Node, name: &str, uk: UseKind, src: &str, file: &str) ->
 }
 
 /// Walk ancestor scopes from `usage` and return the nearest declaration's name node + kind.
-fn local_decl<'t>(
+/// `pub(crate)` so inference can resolve an identifier to its local/param declaration.
+pub(crate) fn local_decl<'t>(
     usage: Node<'t>,
     name: &str,
     uk: UseKind,
@@ -150,19 +152,13 @@ fn resolve_member(index: &Index, selector: Node, name: &str, src: &str, tree: &T
     if let Some(nav) = selector.parent() {
         if nav.kind() == "navigation_expression" {
             if let Some(receiver) = nav.named_child(0) {
-                if let Some(ty) = infer_type(index, receiver, src) {
-                    // Disambiguate same-named types across packages: resolve which `ty` this file
-                    // means, then filter members by that package too (not just the simple name).
-                    let ty_pkg = resolve_type_package(index, tree, src, &ty);
-                    let hits: Vec<Def> = index
-                        .lookup_by_name(name)
-                        .iter()
-                        .filter(|e| {
-                            e.sym.container.as_deref() == Some(ty.as_str())
-                                && ty_pkg.as_deref().map_or(true, |p| e.sym.package == p)
-                        })
-                        .map(to_def)
-                        .collect();
+                // Infer the receiver's type (package-qualified) and resolve the member on it —
+                // own members, inherited (supertype walk), and extensions; package-filtered so a
+                // same-named type in another package can't be picked.
+                let ctx = infer::FileCtx::from_tree(tree, src);
+                let ty = infer::infer(index, receiver, src, &ctx);
+                if let Some(ty_name) = ty.name() {
+                    let hits = member_defs(index, ty_name, ty.package(), name);
                     if !hits.is_empty() {
                         return hits;
                     }
@@ -179,170 +175,55 @@ fn resolve_member(index: &Index, selector: Node, name: &str, src: &str, tree: &T
     }
 }
 
-/// Resolve a simple type name to the *package* of the type it refers to in this file's context,
-/// so same-named types in different packages can be told apart. Uses the same visibility precedence
-/// as cross-file resolution: alias/explicit import > same package > a single wildcard-imported match
-/// > a single Kotlin default-import match. Returns the sole candidate's package when there is only
-/// one type by that name, and `None` when the choice is genuinely ambiguous (callers then don't
-/// filter by package — best-effort rather than dropping results).
-pub fn resolve_type_package(index: &Index, tree: &Tree, src: &str, name: &str) -> Option<String> {
-    let candidates: Vec<&Entry> = index
-        .lookup_by_name(name)
-        .iter()
-        .filter(|e| e.sym.kind.is_type_like())
-        .collect();
-    match candidates.as_slice() {
-        [] => None,
-        [only] => Some(only.sym.package.clone()),
-        _ => {
-            let imports = imports_of(tree, src);
-            let current_pkg = package_of(tree, src);
-            // alias / explicit import that binds this name
-            for imp in &imports {
-                let binds = imp.alias.as_deref() == Some(name)
-                    || (!imp.wildcard && imp.local_name() == Some(name));
-                if binds {
-                    let pkg = imp.package();
-                    if candidates.iter().any(|e| e.sym.package == pkg) {
-                        return Some(pkg);
-                    }
+/// All definitions of a member named `name` reachable on type `ty` (package `ty_pkg` when known):
+/// own members, members inherited through the supertype closure, and extensions keyed on the type
+/// or a supertype. Package-filtered so a same-named type in a different package can't contribute.
+/// Bounded against deep / cyclic hierarchies.
+fn member_defs(index: &Index, ty: &str, ty_pkg: Option<&str>, name: &str) -> Vec<Def> {
+    let mut out = Vec::new();
+    let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut frontier: Vec<(String, Option<String>, usize)> =
+        vec![(ty.to_string(), ty_pkg.map(str::to_string), 0)];
+    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
+        if !visited.insert(cur.clone()) || depth > 32 {
+            continue;
+        }
+        for e in index.members_of(&cur) {
+            if let Some(p) = &cur_pkg {
+                if &e.sym.package != p {
+                    continue;
                 }
             }
-            // same package as the current file
-            if candidates.iter().any(|e| e.sym.package == current_pkg) {
-                return Some(current_pkg);
-            }
-            // a single wildcard-imported package
-            let star: Vec<String> = imports.iter().filter(|i| i.wildcard).map(|i| i.package()).collect();
-            let starred: Vec<&Entry> =
-                candidates.iter().copied().filter(|e| star.contains(&e.sym.package)).collect();
-            if let [one] = starred.as_slice() {
-                return Some(one.sym.package.clone());
-            }
-            // a single default-import package
-            let defaulted: Vec<&Entry> = candidates
-                .iter()
-                .copied()
-                .filter(|e| is_default_import_pkg(&e.sym.package))
-                .collect();
-            if let [one] = defaulted.as_slice() {
-                return Some(one.sym.package.clone());
-            }
-            None
-        }
-    }
-}
-
-/// Infer the simple type-name of a navigation receiver for **member completion** (Stage B).
-///
-/// `recv` is the receiver node — `named_child(0)` of the `navigation_expression`. This wraps the
-/// goto-path `infer_type` (locals/params via the scope walk, constructor calls, `this`) and adds
-/// one completion-only fallback: a bare identifier that is itself a known *type* name resolves to
-/// that type, enabling `Foo.` / `Color.` (companion / enum-entry / static access). A local binding
-/// always wins over the bare-type-name fallback (so `val Dog = Dog(); Dog.` completes on the
-/// instance), because `infer_type` is tried first. The result is `?`-stripped (nullable receivers
-/// like `d?.` / `val d: T?` reduce to `T`, since `decl_type` reads through the `nullable_type`
-/// wrapper). Returns `None` (silent omission) when the type cannot be inferred.
-pub fn infer_receiver_type(index: &Index, recv: Node, src: &str) -> Option<String> {
-    // 1. Reuse the goto inference (locals/params/this/constructor-call). A local always wins.
-    if let Some(ty) = infer_type(index, recv, src) {
-        return Some(ty);
-    }
-    // 2. Completion-only fallback: a bare identifier that names a known type -> that type (for
-    //    `Foo.` companion/static access and `Color.` enum-entry access). Guarded so we never
-    //    fabricate a type for an unknown identifier.
-    if recv.kind() == "identifier" {
-        let name = node_text(recv, src);
-        if index.lookup_by_name(name).iter().any(|e| e.sym.kind.is_type_like()) {
-            return Some(name.to_string());
-        }
-    }
-    None
-}
-
-/// Best-effort, compiler-free inference of a receiver expression's type name.
-fn infer_type(index: &Index, receiver: Node, src: &str) -> Option<String> {
-    match receiver.kind() {
-        // a local val/var or parameter: resolve it, then read its declared/initialized type
-        "identifier" => {
-            let (decl, _) = local_decl(receiver, node_text(receiver, src), UseKind::Value, src)?;
-            decl_type(index, decl, src)
-        }
-        // a constructor call `T(...)` -> T, but only if T is actually a known type
-        "call_expression" => {
-            let callee = receiver.named_child(0)?;
-            if callee.kind() != "identifier" {
-                return None;
-            }
-            let cname = node_text(callee, src);
-            if index.lookup_by_name(cname).iter().any(|e| e.sym.kind.is_type_like()) {
-                Some(cname.to_string())
-            } else {
-                None
+            if e.sym.name == name {
+                out.push(to_def(e));
             }
         }
-        // `this.member` -> the enclosing class/object
-        "this_expression" => enclosing_type_name(receiver, src),
-        _ => None,
-    }
-}
-
-/// The type a declaration's name node binds: an explicit annotation, or a constructor-call
-/// initializer (`val x = Foo(...)` -> `Foo`, verified to be a type).
-fn decl_type(index: &Index, decl: Node, src: &str) -> Option<String> {
-    let parent = decl.parent()?;
-    match parent.kind() {
-        "variable_declaration" => {
-            // explicit annotation (handles `Foo`, `Foo?`, `List<T>`, …)
-            if let Some(ty) = first_user_type_name(parent, src) {
-                return Some(ty);
+        for e in index.extensions_for(&cur) {
+            if e.sym.name == name {
+                out.push(to_def(e));
             }
-            // initializer: `val x = Foo(...)` under the enclosing property_declaration
-            let prop = parent.parent()?;
-            if prop.kind() == "property_declaration" {
-                if let Some(call) = child_of_kind(prop, "call_expression") {
-                    if let Some(callee) = call.named_child(0) {
-                        if callee.kind() == "identifier" {
-                            let cname = node_text(callee, src);
-                            if index
-                                .lookup_by_name(cname)
-                                .iter()
-                                .any(|e| e.sym.kind.is_type_like())
-                            {
-                                return Some(cname.to_string());
-                            }
-                        }
-                    }
+        }
+        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
+            // Prefer a same-package supertype; otherwise leave unfiltered rather than guess.
+            let sup_pkg = match &cur_pkg {
+                Some(p)
+                    if index
+                        .lookup_by_name(&sup)
+                        .iter()
+                        .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
+                {
+                    Some(p.clone())
                 }
-            }
-            None
-        }
-        "parameter" | "class_parameter" => first_user_type_name(parent, src),
-        _ => None,
-    }
-}
-
-/// The simple name of the first `user_type` anywhere under `node` (handles `nullable_type` wrapping).
-fn first_user_type_name(node: Node, src: &str) -> Option<String> {
-    let ut = find_descendant(node, "user_type")?;
-    first_ident(ut).map(|id| node_text(id, src).to_string())
-}
-
-fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        if child.kind() == kind {
-            return Some(child);
-        }
-        if let Some(found) = find_descendant(child, kind) {
-            return Some(found);
+                _ => None,
+            };
+            frontier.push((sup, sup_pkg, depth + 1));
         }
     }
-    None
+    out
 }
 
-/// The name of the class/object enclosing `node`.
-fn enclosing_type_name(node: Node, src: &str) -> Option<String> {
+/// The name of the class/object enclosing `node`. `pub(crate)` so inference can type `this`.
+pub(crate) fn enclosing_type_name(node: Node, src: &str) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
         if matches!(n.kind(), "class_declaration" | "object_declaration") {

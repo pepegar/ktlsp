@@ -341,9 +341,11 @@ fn return_type_of(decl: Node, src: &str) -> Option<TypeRef> {
     None
 }
 
-/// A `variable_declaration`'s declared type (`val x: T` -> `T`): the `user_type`/`nullable_type`
-/// child inside it. `None` for an unannotated binder.
-fn value_type_of(var_decl: Node, src: &str) -> Option<TypeRef> {
+/// A `variable_declaration`'s (or `parameter`'s) declared type (`val x: T` / `x: T` -> `T`): the
+/// `user_type`/`nullable_type` child inside it. `None` for an unannotated binder. `pub(crate)` so
+/// inference can read a local/param annotation from the live AST with the same rules used at index
+/// time.
+pub(crate) fn value_type_of(var_decl: Node, src: &str) -> Option<TypeRef> {
     let mut cursor = var_decl.walk();
     for child in var_decl.named_children(&mut cursor) {
         if matches!(child.kind(), "user_type" | "nullable_type") {

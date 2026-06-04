@@ -729,3 +729,68 @@ fn member_completion_disambiguates_same_name_by_package() {
     check_contains(input, &["greetDemo"]);
     check_excludes(input, &["greetOther"]);
 }
+
+// --------------------------------------------------------------------------------------------
+// Type-directed inference (Stage 1/2): function return types, chained calls, literals, properties
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn member_completion_via_function_return_type() {
+    // `val b = makeBar()` infers b: Bar from makeBar's declared return type, then offers Bar's
+    // members. This is the keystone case that was impossible before (return types weren't indexed).
+    let input = "//- lib.kt\npackage app\n\
+                 class Bar {\n    fun describe(): String = \"\"\n    fun label(): String = \"\"\n}\n\
+                 fun makeBar(): Bar = Bar()\n\
+                 //- Main.kt\npackage app\nfun main() {\n    val b = makeBar()\n    b.de/*^*/\n}\n";
+    check_contains(input, &["describe"]);
+    check_excludes(input, &["label"]); // prefix `de` excludes `label`
+}
+
+#[test]
+fn member_completion_chained_calls() {
+    // a.b().c() — each call's return type feeds the next selector.
+    let input = "//- lib.kt\npackage app\n\
+                 class C {\n    fun hello() {}\n    fun world() {}\n}\n\
+                 class B {\n    fun c(): C = C()\n}\n\
+                 class A {\n    fun b(): B = B()\n}\n\
+                 //- Main.kt\npackage app\nfun main() {\n    val a = A()\n    a.b().c().hel/*^*/\n}\n";
+    check_contains(input, &["hello"]);
+    check_excludes(input, &["world"]);
+}
+
+#[test]
+fn member_completion_on_property_type() {
+    // A property's declared type drives member completion on it.
+    let input = "//- lib.kt\npackage app\n\
+                 class Engine {\n    fun start() {}\n}\n\
+                 class Car {\n    val engine: Engine = Engine()\n}\n\
+                 //- Main.kt\npackage app\nfun main() {\n    val c = Car()\n    c.engine.sta/*^*/\n}\n";
+    check_contains(input, &["start"]);
+}
+
+#[test]
+fn member_completion_on_string_literal() {
+    // Literal inference: `""` is a String. With a project-defined `String` type (no stdlib here),
+    // its members are offered on a string literal receiver.
+    let input = "//- lib.kt\npackage kotlin\n\
+                 class String {\n    fun uppercase(): String = this\n    fun isBlank(): Boolean = true\n}\n\
+                 //- Main.kt\npackage app\nfun main() {\n    \"\".up/*^*/\n}\n";
+    check_contains(input, &["uppercase"]);
+}
+
+#[test]
+fn member_completion_on_int_literal() {
+    let input = "//- lib.kt\npackage kotlin\n\
+                 class Int {\n    fun toLong(): Long = this\n}\nclass Long\n\
+                 //- Main.kt\npackage app\nfun main() {\n    42.toL/*^*/\n}\n";
+    check_contains(input, &["toLong"]);
+}
+
+#[test]
+fn member_completion_via_local_typed_annotation() {
+    // An explicitly-annotated local resolves to its type even without an initializer constructor.
+    let input = "//- lib.kt\npackage app\n\
+                 interface Shape {\n    fun area(): Int\n}\n\
+                 //- Main.kt\npackage app\nfun render(s: Shape) {\n    s.ar/*^*/\n}\n";
+    check_contains(input, &["area"]);
+}
