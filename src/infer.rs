@@ -404,6 +404,9 @@ fn member_type(
             }
             if e.sym.name == name {
                 if let Some(tr) = member_type_ref(e, want_function) {
+                    if let Some(sub) = substitute_type_var(recv_ty, tr, index) {
+                        return sub;
+                    }
                     return resolve_type_ref(index, tr, ctx, depth + 1);
                 }
             }
@@ -411,6 +414,9 @@ fn member_type(
         for e in index.extensions_for(&cur) {
             if e.sym.name == name {
                 if let Some(tr) = member_type_ref(e, want_function) {
+                    if let Some(sub) = substitute_type_var(recv_ty, tr, index) {
+                        return sub;
+                    }
                     return resolve_type_ref(index, tr, ctx, depth + 1);
                 }
             }
@@ -421,6 +427,23 @@ fn member_type(
         }
     }
     Type::Unknown
+}
+
+/// One-level generic substitution for a single type variable: a member whose declared type is a
+/// bare name that is NOT a known concrete type (i.e. a type parameter like `T`/`E`), accessed on a
+/// receiver with exactly ONE type argument, resolves to that argument — `Box<Foo>.get(): T` -> Foo,
+/// `List<Foo>.first(): T` -> Foo. Deliberately conservative: requiring a single argument and an
+/// unresolvable name means it can never pick the wrong argument of a `Map<K, V>` (two args ->
+/// skipped -> Unknown -> silent omission), preserving the no-wrong-completion contract.
+fn substitute_type_var(recv_ty: &Type, tr: &TypeRef, index: &Index) -> Option<Type> {
+    if !tr.args.is_empty() || recv_ty.args().len() != 1 {
+        return None;
+    }
+    if !index.lookup_type(&tr.name).is_empty() {
+        return None; // a real concrete type, not a type variable
+    }
+    let arg = &recv_ty.args()[0];
+    arg.name().is_some().then(|| arg.clone())
 }
 
 /// The declared type ref to read from a member entry: a function's `return_type` (when

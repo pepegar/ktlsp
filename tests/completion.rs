@@ -872,3 +872,27 @@ fn scope_function_it_in_also() {
                  //- Main.kt\npackage app\nfun f(b: Bee) {\n    b.also {\n        it.bu/*^*/\n    }\n}\n";
     check_contains(input, &["buzz"]);
 }
+
+// --------------------------------------------------------------------------------------------
+// Generics (Stage 5): one-level single-type-variable substitution
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn generic_member_substitution_single_type_var() {
+    // Box<Foo>.get(): T resolves T to the receiver's single type argument Foo.
+    let input = "//- lib.kt\npackage app\n\
+                 class Foo {\n    fun bar() {}\n}\n\
+                 class Box<T> {\n    fun get(): T = TODO()\n}\n\
+                 //- Main.kt\npackage app\nfun f(b: Box<Foo>) {\n    b.get().ba/*^*/\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn generic_list_element_completion() {
+    // The canonical case: List<Foo>.first(): E -> Foo.
+    let input = "//- lib.kt\npackage kotlin.collections\n\
+                 class List<E> {\n    fun first(): E = TODO()\n}\n\
+                 //- app.kt\npackage app\nclass Widget {\n    fun render() {}\n}\n\
+                 //- Main.kt\npackage app\nimport kotlin.collections.List\nfun f(xs: List<Widget>) {\n    xs.first().ren/*^*/\n}\n";
+    check_contains(input, &["render"]);
+}
