@@ -267,7 +267,7 @@ fn ambiguous_same_package_returns_all() {
 }
 
 // --------------------------------------------------------------------------------------------
-// Member access (best-effort, unique-only)
+// Member access (S6: type-directed where the receiver type is inferable, else unique-only)
 // --------------------------------------------------------------------------------------------
 
 #[test]
@@ -275,10 +275,38 @@ fn member_selector_unique_resolves() {
     check("class Box { fun /*def*/open() {} }\nfun main() { val b = Box(); b./*^*/open() }\n");
 }
 
+// (Classes are multi-line; the terse `class A { … }\nclass B { … }` one-liner form collapses to
+// an ERROR node in the grammar and loses container tracking — see the limitations note.)
+
 #[test]
-fn member_selector_ambiguous_returns_none() {
+fn member_selector_picks_overload_by_inferred_constructor_type() {
+    // Two classes share `run2`; the receiver `a` is `val a = A()`, so it resolves to A's run2 —
+    // not the ambiguous-empty result we'd get without type inference.
     check(
-        "class A { fun run2() {} }\nclass B { fun run2() {} }\nfun main() { val a = A(); a./*^*/run2() }\n",
+        "class A {\n    fun /*def*/run2() {}\n}\nclass B {\n    fun run2() {}\n}\nfun main() {\n    val a = A()\n    a./*^*/run2()\n}\n",
+    );
+}
+
+#[test]
+fn member_selector_picks_overload_by_explicit_annotation() {
+    check(
+        "class A {\n    fun /*def*/run2() {}\n}\nclass B {\n    fun run2() {}\n}\nfun use(a: A) {\n    a./*^*/run2()\n}\n",
+    );
+}
+
+#[test]
+fn member_selector_picks_overload_via_this() {
+    check(
+        "class A {\n    fun /*def*/run2() {}\n    fun caller() {\n        this./*^*/run2()\n    }\n}\nclass B {\n    fun run2() {}\n}\n",
+    );
+}
+
+#[test]
+fn member_selector_unknown_receiver_type_stays_ambiguous() {
+    // Receiver type can't be inferred (param of an unindexed type), and the member is ambiguous,
+    // so we still return nothing rather than guess.
+    check(
+        "class A {\n    fun run2() {}\n}\nclass B {\n    fun run2() {}\n}\nfun use(x: Unknown) {\n    x./*^*/run2()\n}\n",
     );
 }
 

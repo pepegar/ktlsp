@@ -81,14 +81,15 @@ pub fn goto(index: &Index, file: &str, src: &str, tree: &Tree, offset: usize) ->
     }
     let uk = use_kind(ident);
 
-    // Member access never resolves locally (receiver type unknown) — go straight to index.
-    if uk != UseKind::MemberSelector {
-        if let Some(def) = definition_self(ident, file) {
-            return vec![def];
-        }
-        if let Some(def) = resolve_local(ident, name, uk, src, file) {
-            return vec![def];
-        }
+    // Member access: infer the receiver's type and filter members by it (S6), else best-effort.
+    if uk == UseKind::MemberSelector {
+        return resolve_member(index, ident, name, src);
+    }
+    if let Some(def) = definition_self(ident, file) {
+        return vec![def];
+    }
+    if let Some(def) = resolve_local(ident, name, uk, src, file) {
+        return vec![def];
     }
     resolve_cross_file(index, tree, src, name, uk)
 }
@@ -120,12 +121,147 @@ fn def_here(file: &str, node: Node) -> Def {
 // ---------------------------------------------------------------------------------------------
 
 fn resolve_local(usage: Node, name: &str, uk: UseKind, src: &str, file: &str) -> Option<Def> {
+    local_decl(usage, name, uk, src).map(|(node, _kind)| def_here(file, node))
+}
+
+/// Walk ancestor scopes from `usage` and return the nearest declaration's name node + kind.
+fn local_decl<'t>(
+    usage: Node<'t>,
+    name: &str,
+    uk: UseKind,
+    src: &str,
+) -> Option<(Node<'t>, SymbolKind)> {
     let mut scope = usage.parent();
     while let Some(s) = scope {
-        if let Some((node, _kind)) = decl_in_scope(s, name, usage, uk, src) {
-            return Some(def_here(file, node));
+        if let Some(hit) = decl_in_scope(s, name, usage, uk, src) {
+            return Some(hit);
         }
         scope = s.parent();
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------------------------
+// Member resolution (S6): type-directed where the receiver's type is inferable, else unique-only.
+// ---------------------------------------------------------------------------------------------
+
+fn resolve_member(index: &Index, selector: Node, name: &str, src: &str) -> Vec<Def> {
+    // `selector` is the `.member` identifier; its parent is the navigation_expression.
+    if let Some(nav) = selector.parent() {
+        if nav.kind() == "navigation_expression" {
+            if let Some(receiver) = nav.named_child(0) {
+                if let Some(ty) = infer_type(index, receiver, src) {
+                    let hits: Vec<Def> = index
+                        .lookup_by_name(name)
+                        .iter()
+                        .filter(|e| e.sym.container.as_deref() == Some(ty.as_str()))
+                        .map(to_def)
+                        .collect();
+                    if !hits.is_empty() {
+                        return hits;
+                    }
+                }
+            }
+        }
+    }
+    // Fallback: commit only if the member name is globally unique (best-effort, no type info).
+    let candidates = index.lookup_by_name(name);
+    if candidates.len() == 1 {
+        vec![to_def(&candidates[0])]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Best-effort, compiler-free inference of a receiver expression's type name.
+fn infer_type(index: &Index, receiver: Node, src: &str) -> Option<String> {
+    match receiver.kind() {
+        // a local val/var or parameter: resolve it, then read its declared/initialized type
+        "identifier" => {
+            let (decl, _) = local_decl(receiver, node_text(receiver, src), UseKind::Value, src)?;
+            decl_type(index, decl, src)
+        }
+        // a constructor call `T(...)` -> T, but only if T is actually a known type
+        "call_expression" => {
+            let callee = receiver.named_child(0)?;
+            if callee.kind() != "identifier" {
+                return None;
+            }
+            let cname = node_text(callee, src);
+            if index.lookup_by_name(cname).iter().any(|e| e.sym.kind.is_type_like()) {
+                Some(cname.to_string())
+            } else {
+                None
+            }
+        }
+        // `this.member` -> the enclosing class/object
+        "this_expression" => enclosing_type_name(receiver, src),
+        _ => None,
+    }
+}
+
+/// The type a declaration's name node binds: an explicit annotation, or a constructor-call
+/// initializer (`val x = Foo(...)` -> `Foo`, verified to be a type).
+fn decl_type(index: &Index, decl: Node, src: &str) -> Option<String> {
+    let parent = decl.parent()?;
+    match parent.kind() {
+        "variable_declaration" => {
+            // explicit annotation (handles `Foo`, `Foo?`, `List<T>`, …)
+            if let Some(ty) = first_user_type_name(parent, src) {
+                return Some(ty);
+            }
+            // initializer: `val x = Foo(...)` under the enclosing property_declaration
+            let prop = parent.parent()?;
+            if prop.kind() == "property_declaration" {
+                if let Some(call) = child_of_kind(prop, "call_expression") {
+                    if let Some(callee) = call.named_child(0) {
+                        if callee.kind() == "identifier" {
+                            let cname = node_text(callee, src);
+                            if index
+                                .lookup_by_name(cname)
+                                .iter()
+                                .any(|e| e.sym.kind.is_type_like())
+                            {
+                                return Some(cname.to_string());
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        }
+        "parameter" | "class_parameter" => first_user_type_name(parent, src),
+        _ => None,
+    }
+}
+
+/// The simple name of the first `user_type` anywhere under `node` (handles `nullable_type` wrapping).
+fn first_user_type_name(node: Node, src: &str) -> Option<String> {
+    let ut = find_descendant(node, "user_type")?;
+    first_ident(ut).map(|id| node_text(id, src).to_string())
+}
+
+fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+        if let Some(found) = find_descendant(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// The name of the class/object enclosing `node`.
+fn enclosing_type_name(node: Node, src: &str) -> Option<String> {
+    let mut cur = node.parent();
+    while let Some(n) = cur {
+        if matches!(n.kind(), "class_declaration" | "object_declaration") {
+            return name_field(n).map(|nn| node_text(nn, src).to_string());
+        }
+        cur = n.parent();
     }
     None
 }
@@ -367,15 +503,6 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
         .collect();
     if candidates.is_empty() {
         return Vec::new();
-    }
-
-    // Member access: only commit if unambiguous.
-    if uk == UseKind::MemberSelector {
-        return if candidates.len() == 1 {
-            vec![to_def(&candidates[0])]
-        } else {
-            Vec::new()
-        };
     }
 
     // Explicit (non-wildcard) import of this exact name.

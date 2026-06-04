@@ -86,6 +86,20 @@ do
   end
 end
 
+-- ---- S6: member access `g.greet()` resolves into Greeter.kt via the receiver's inferred type ----
+do
+  local l, c = find("g.greet()", "greet")
+  check("found g.greet() member usage", l ~= nil)
+  if l then
+    local res = request("textDocument/definition", { textDocument = { uri = uri }, position = { line = l, character = c } })
+    local loc = res
+    if type(res) == "table" and res[1] then
+      loc = res[1]
+    end
+    check("member goto g.greet -> Greeter.kt", loc ~= nil and loc.uri ~= nil and loc.uri:match("Greeter%.kt$") ~= nil, loc and loc.uri)
+  end
+end
+
 -- ---- S1: edit the buffer (did_change -> incremental reparse), then goto on the new code ----
 do
   local n = vim.api.nvim_buf_line_count(bufnr)

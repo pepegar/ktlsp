@@ -101,9 +101,12 @@ These are deliberate and documented, not bugs:
 - **Multiplatform sources may yield multiple results.** A multiplatform library's `-sources.jar`
   bundles several source sets (`commonMain`, `jvmMain`, …), so a symbol like `listOf` can resolve
   to more than one location — your editor shows a pick list rather than a single jump.
-- **No type-directed member resolution.** For `receiver.member`, the receiver's type is unknown, so
-  a selector resolves only when its name is **unique** across the project (an editor prefers no
-  result over several wrong ones). `this.member` follows the same rule.
+- **Partial type-directed member resolution.** For `receiver.member`, ktlsp infers the receiver's
+  type when it's a local `val`/parameter with an explicit annotation, a constructor call
+  (`Foo().bar`), or `this`, and resolves the member against that type (picking the right overload
+  among same-named members). When the type can't be inferred — chained calls (`a.b.c`),
+  unannotated function returns, generics — it falls back to resolving only when the member name is
+  **unique** across the project. No full type inference or overload-by-argument resolution.
 - **No overload resolution by argument types.** Ambiguous names may return multiple locations.
 - **Terse, multi-statement-per-line code can parse poorly.** The Kotlin grammar can collapse files
   like `class A { fun f(){} }\nclass B { fun g(){} }` into an error node and discard most of the
