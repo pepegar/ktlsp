@@ -1,0 +1,23 @@
+# Gradle version catalog for the ktlsp test fixture.
+#
+# ktlsp parses THIS file (gradle/libs.versions.toml) via src/catalog.rs::parse_catalog and
+# downloads each library's `-sources.jar` from Maven Central. Every entry below uses the
+# `module = "group:artifact"` + `version.ref` form, which is the subset the parser supports,
+# and every coordinate was verified to publish a real `-sources.jar` at its root coordinate:
+#
+#   org.jetbrains.kotlin:kotlin-stdlib:2.1.20
+#   org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3
+#   org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0
+#   com.squareup.okio:okio:3.9.1
+
+[versions]
+kotlin = "2.1.20"
+kotlinxSerialization = "1.7.3"
+kotlinxCoroutines = "1.9.0"
+okio = "3.9.1"
+
+[libraries]
+kotlin-stdlib = { module = "org.jetbrains.kotlin:kotlin-stdlib", version.ref = "kotlin" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "kotlinxSerialization" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
+okio = { module = "com.squareup.okio:okio", version.ref = "okio" }
