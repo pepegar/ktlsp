@@ -149,10 +149,10 @@ do
   local n0 = vim.api.nvim_buf_line_count(bufnr)
   vim.api.nvim_buf_set_lines(bufnr, n0, n0, false, {
     "",
-    "fun usesDecorator() { Decorat }",
+    "fun tryAutoImport() { Decorat }",
   })
   vim.wait(800)
-  local l, c = find("fun usesDecorator() { Decorat }", "Decorat")
+  local l, c = find("fun tryAutoImport() { Decorat }", "Decorat")
   check("found Decorat reference for auto-import", l ~= nil)
   if l then
     -- The cross-file `Decorator` symbol comes from the background project scan, which races with
