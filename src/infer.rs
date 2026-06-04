@@ -17,7 +17,7 @@ use std::collections::HashSet;
 use tree_sitter::{Node, Tree};
 
 use crate::index::Index;
-use crate::parser::{imports_of, node_text, package_of, Import};
+use crate::parser::{child_of_kind, first_ident, imports_of, node_text, package_of, Import};
 use crate::resolve::{self, UseKind};
 use crate::symbol::SymbolKind;
 use crate::types::{Type, TypeRef};
@@ -90,10 +90,147 @@ fn infer_depth(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize
             Some(arg) => infer_depth(index, arg, src, ctx, depth + 1).into_non_null(),
             None => Type::Unknown,
         },
+        // A cast `x as T` (or `x as? T`) has the cast-target type T.
+        "as_expression" => match node.child_by_field_name("right") {
+            Some(ty) => match type_node_simple_name(ty, src) {
+                Some(name) => resolve_type_name(index, &name, ctx, ty.kind() == "nullable_type"),
+                None => Type::Unknown,
+            },
+            None => Type::Unknown,
+        },
         "call_expression" => infer_call(index, node, src, ctx, depth),
         "navigation_expression" => infer_navigation(index, node, src, ctx, depth),
         _ => Type::Unknown,
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Flow typing (Stage 4): smart casts (`is` in if/when, `as`) and `it`-based scope functions.
+// ---------------------------------------------------------------------------------------------
+
+/// The smart-cast narrowed type for identifier `name` at `ident`, from an enclosing `if (name is T)`
+/// then-branch or `when(name){ is T -> }` entry that contains `ident`. Negated checks (`!is`) and
+/// the else-branch are never narrowed (they'd be a wrong type). Returns the narrowed simple type
+/// name, or `None`.
+fn narrowed_type_name(ident: Node, name: &str, src: &str) -> Option<String> {
+    let mut cur = ident.parent();
+    while let Some(n) = cur {
+        match n.kind() {
+            "if_expression" => {
+                if let Some(t) = if_narrowing(n, ident, name, src) {
+                    return Some(t);
+                }
+            }
+            "when_entry" => {
+                if let Some(t) = when_entry_narrowing(n, ident, name, src) {
+                    return Some(t);
+                }
+            }
+            _ => {}
+        }
+        cur = n.parent();
+    }
+    None
+}
+
+/// Narrowing from `if (name is T) <then>`: only inside the then-branch, only for the positive `is`.
+fn if_narrowing(if_expr: Node, ident: Node, name: &str, src: &str) -> Option<String> {
+    let cond = if_expr.child_by_field_name("condition")?;
+    if cond.kind() != "is_expression" || has_child_token(cond, "!is") {
+        return None; // not an `is` test, or a negated one (narrows the else-branch, not here)
+    }
+    let left = cond.child_by_field_name("left")?;
+    if node_text(left, src) != name {
+        return None;
+    }
+    let right = cond.child_by_field_name("right")?;
+    // The then-branch is the named child right after the condition (index 1); the else (if any) is
+    // index 2. Only narrow when `ident` is within the then-branch.
+    let then_branch = if_expr.named_child(1)?;
+    if ident.start_byte() < then_branch.start_byte() || ident.end_byte() > then_branch.end_byte() {
+        return None;
+    }
+    type_node_simple_name(right, src)
+}
+
+/// Narrowing from a `when(name) { is T -> <body> }` entry: only when the when-subject is the bare
+/// identifier `name` and `ident` is in the entry body (not the `is T` condition itself).
+fn when_entry_narrowing(entry: Node, ident: Node, name: &str, src: &str) -> Option<String> {
+    let cond = entry.child_by_field_name("condition")?;
+    if cond.kind() != "type_test" {
+        return None;
+    }
+    // `ident` must be in the body, not inside the condition.
+    if ident.start_byte() >= cond.start_byte() && ident.end_byte() <= cond.end_byte() {
+        return None;
+    }
+    let when_expr = entry.parent()?;
+    if when_expr.kind() != "when_expression" {
+        return None;
+    }
+    let subject = child_of_kind(when_expr, "when_subject")?;
+    let subject_id = first_ident(subject)?;
+    if node_text(subject_id, src) != name {
+        return None;
+    }
+    let ut = child_of_kind(cond, "user_type")?;
+    type_node_simple_name(ut, src)
+}
+
+/// The simple name of a `user_type` / `nullable_type` node (last direct `identifier` child of the
+/// user_type), for smart-cast targets.
+fn type_node_simple_name(node: Node, src: &str) -> Option<String> {
+    let ut = match node.kind() {
+        "user_type" => node,
+        "nullable_type" => child_of_kind(node, "user_type")?,
+        _ => return None,
+    };
+    let mut last = None;
+    let mut cursor = ut.walk();
+    for ch in ut.named_children(&mut cursor) {
+        if ch.kind() == "identifier" {
+            last = Some(ch);
+        }
+    }
+    last.map(|n| node_text(n, src).to_string())
+}
+
+/// If `it` sits inside the trailing lambda of a `recv.let { … }` / `recv.also { … }` call, its type
+/// is `recv`'s type. (`it` binds to the innermost lambda, so we stop at the first `lambda_literal`.)
+fn it_receiver_type(
+    index: &Index,
+    ident: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    let mut cur = ident.parent();
+    while let Some(n) = cur {
+        if n.kind() == "lambda_literal" {
+            let annotated = n.parent()?;
+            let call = annotated.parent()?;
+            if call.kind() == "call_expression" {
+                if let Some(callee) = call.named_child(0) {
+                    if callee.kind() == "navigation_expression" {
+                        if let Some(sel) = callee.named_child(1) {
+                            let s = node_text(sel, src);
+                            if s == "let" || s == "also" {
+                                if let Some(recv) = callee.named_child(0) {
+                                    let t = infer_depth(index, recv, src, ctx, depth + 1);
+                                    if t.name().is_some() {
+                                        return Some(t);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            return None; // `it` belongs to this innermost lambda
+        }
+        cur = n.parent();
+    }
+    None
 }
 
 /// Whether `node` has a direct (possibly anonymous) child token equal to `token`. Operators like
@@ -118,6 +255,17 @@ fn infer_identifier(index: &Index, ident: Node, src: &str, ctx: &FileCtx, depth:
     let name = node_text(ident, src);
     if name == "true" || name == "false" {
         return resolve_type_name(index, "Boolean", ctx, false);
+    }
+    // `it` inside a `let`/`also` lambda is the call receiver's type.
+    if name == "it" {
+        if let Some(t) = it_receiver_type(index, ident, src, ctx, depth) {
+            return t;
+        }
+    }
+    // A smart cast from an enclosing `if (name is T)` / `when(name){ is T -> }` overrides the
+    // declared type within the narrowed region.
+    if let Some(narrowed) = narrowed_type_name(ident, name, src) {
+        return resolve_type_name(index, &narrowed, ctx, false);
     }
     // 1. A local val/var/parameter in scope wins (so `val Dog = Dog(); Dog.` is the instance).
     if let Some((decl, _)) = resolve::local_decl(ident, name, UseKind::Value, src) {

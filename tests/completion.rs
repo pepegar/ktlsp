@@ -822,3 +822,53 @@ fn member_completion_through_elvis() {
                  //- Main.kt\npackage app\nfun f(a: Foo?, fallback: Foo) {\n    (a ?: fallback).ba/*^*/\n}\n";
     check_contains(input, &["bar"]);
 }
+
+// --------------------------------------------------------------------------------------------
+// Flow typing (Stage 4): smart casts (is / when / as) and it-based scope functions
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn smart_cast_is_in_if() {
+    // Inside `if (x is Dog)`, x is narrowed to Dog and its members are offered.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    if (x is Dog) {\n        x.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn smart_cast_not_narrowed_in_else_branch() {
+    // In the ELSE branch x is NOT Dog — must not offer Dog's members (silent omission / no wrong
+    // completion). With no other type info, the else receiver is unknown -> None.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    if (x is Dog) {\n    } else {\n        x.ba/*^*/\n    }\n}\n";
+    check_none(input);
+}
+
+#[test]
+fn smart_cast_is_in_when() {
+    let input = "//- lib.kt\npackage app\nclass Cat {\n    fun meow() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    when (x) {\n        is Cat -> x.me/*^*/\n    }\n}\n";
+    check_contains(input, &["meow"]);
+}
+
+#[test]
+fn smart_cast_as_expression() {
+    let input = "//- lib.kt\npackage app\nclass Fish {\n    fun swim() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    (x as Fish).sw/*^*/\n}\n";
+    check_contains(input, &["swim"]);
+}
+
+#[test]
+fn scope_function_it_in_let() {
+    // `it` inside `recv.let { }` has recv's type.
+    let input = "//- lib.kt\npackage app\nclass Bird {\n    fun fly() {}\n}\nfun makeBird(): Bird = Bird()\n\
+                 //- Main.kt\npackage app\nfun f() {\n    makeBird().let {\n        it.fl/*^*/\n    }\n}\n";
+    check_contains(input, &["fly"]);
+}
+
+#[test]
+fn scope_function_it_in_also() {
+    let input = "//- lib.kt\npackage app\nclass Bee {\n    fun buzz() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(b: Bee) {\n    b.also {\n        it.bu/*^*/\n    }\n}\n";
+    check_contains(input, &["buzz"]);
+}
