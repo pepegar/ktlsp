@@ -25,7 +25,7 @@ use crate::symbol::{Def, SymbolKind};
 
 /// Where an identifier sits syntactically — determines which symbol kinds may resolve it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum UseKind {
+pub(crate) enum UseKind {
     /// In type position: `val x: Foo`, `fun f(): Foo`.
     Type,
     /// The callee of a call: `Foo(...)`.
@@ -36,7 +36,7 @@ enum UseKind {
     Value,
 }
 
-fn use_kind(usage: Node) -> UseKind {
+pub(crate) fn use_kind(usage: Node) -> UseKind {
     if let Some(parent) = usage.parent() {
         match parent.kind() {
             "navigation_expression" => {
@@ -550,6 +550,13 @@ const DEFAULT_IMPORT_PACKAGES: &[&str] = &[
     "kotlin.jvm",
     "java.lang",
 ];
+
+/// Whether `pkg` is one of Kotlin's implicit default-import packages (symbols in it resolve
+/// without an explicit `import`). A thin predicate over `DEFAULT_IMPORT_PACKAGES` so callers
+/// (e.g. completion) reuse the exact same set without leaking its representation.
+pub(crate) fn is_default_import_pkg(pkg: &str) -> bool {
+    DEFAULT_IMPORT_PACKAGES.contains(&pkg)
+}
 
 fn pick(candidates: &[Entry], keep: impl Fn(&Entry) -> bool) -> Option<Vec<Def>> {
     let hits: Vec<Def> = candidates.iter().filter(|e| keep(e)).map(to_def).collect();

@@ -36,6 +36,7 @@ end, 50)
 
 local client = vim.lsp.get_client_by_id(id)
 check("advertises referencesProvider", client and client.server_capabilities.referencesProvider ~= nil)
+check("advertises completionProvider", client and client.server_capabilities.completionProvider ~= nil)
 
 -- locate (0-indexed) line/col of `token` on the buffer line containing `anchor`
 local function find(anchor, token)
@@ -83,6 +84,30 @@ do
     if res then
       check("  references are in Main.kt", vim.tbl_count(res) > 0 and res[1].uri:match("Main%.kt$") ~= nil, res[1] and res[1].uri)
     end
+  end
+end
+
+-- ---- Stage A: scope/name completion offers a visible top-level name at an unqualified prefix ----
+do
+  -- Position the cursor one char into the `helper` token of the `println(helper())` call, so the
+  -- completion prefix is `h` (an unqualified scope-name position).
+  local l, c = find("println(helper())", "helper")
+  check("found helper() call for completion", l ~= nil)
+  if l then
+    local res = request("textDocument/completion", {
+      textDocument = { uri = uri },
+      position = { line = l, character = c + 1 },
+    })
+    -- The result may be a CompletionList ({ items = {...} }) or a bare item array.
+    local items = res and (res.items or res) or {}
+    local has_helper = false
+    for _, item in ipairs(items) do
+      if item.label == "helper" then
+        has_helper = true
+        break
+      end
+    end
+    check("completion offers `helper`", has_helper, "got " .. #items .. " items")
   end
 end
 

@@ -124,6 +124,22 @@ impl Index {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// Iterate all entries whose symbol name starts with `prefix`. When `top_level_only` is true,
+    /// yields only entries with `sym.container.is_none()` (so a common prefix does not surface
+    /// thousands of stdlib member symbols). Linear scan of `by_name`; fine at project+stdlib scale,
+    /// bounded by the caller's cap. An empty prefix yields everything (capped by the caller).
+    pub fn entries_with_prefix<'a>(
+        &'a self,
+        prefix: &'a str,
+        top_level_only: bool,
+    ) -> impl Iterator<Item = &'a Entry> + 'a {
+        self.by_name
+            .iter()
+            .filter(move |(name, _)| name.starts_with(prefix))
+            .flat_map(|(_, entries)| entries.iter())
+            .filter(move |e| !top_level_only || e.sym.container.is_none())
+    }
+
     /// All usage sites of the given simple name (the reverse-reference index).
     pub fn lookup_refs(&self, name: &str) -> &[RefEntry] {
         self.refs_by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
@@ -146,6 +162,13 @@ mod tests {
         }
     }
 
+    fn member(name: &str, container: &str) -> IndexedSymbol {
+        IndexedSymbol {
+            container: Some(container.to_string()),
+            ..sym(name)
+        }
+    }
+
     #[test]
     fn replace_is_idempotent_per_file() {
         let mut idx = Index::new();
@@ -164,5 +187,43 @@ mod tests {
 
         idx.remove_file("b.kt");
         assert_eq!(idx.lookup_by_name("foo").len(), 0);
+    }
+
+    fn names_with_prefix(idx: &Index, prefix: &str, top_level_only: bool) -> Vec<String> {
+        let mut got: Vec<String> = idx
+            .entries_with_prefix(prefix, top_level_only)
+            .map(|e| e.sym.name.clone())
+            .collect();
+        got.sort();
+        got
+    }
+
+    #[test]
+    fn entries_with_prefix_filters_by_name_and_container() {
+        let mut idx = Index::new();
+        idx.replace_file(
+            "a.kt",
+            vec![sym("listOf"), sym("listOfNotNull"), sym("mapOf"), member("size", "List")],
+            Tier::Durable,
+        );
+
+        // Prefix match across top-level + member names.
+        assert_eq!(
+            names_with_prefix(&idx, "list", false),
+            vec!["listOf".to_string(), "listOfNotNull".to_string()]
+        );
+
+        // `top_level_only` drops members; `size` has a container so it is excluded for the "s" prefix.
+        assert_eq!(names_with_prefix(&idx, "s", true), Vec::<String>::new());
+        assert_eq!(names_with_prefix(&idx, "s", false), vec!["size".to_string()]);
+
+        // Empty prefix yields everything (top-level only here drops the member `size`).
+        assert_eq!(
+            names_with_prefix(&idx, "", true),
+            vec!["listOf".to_string(), "listOfNotNull".to_string(), "mapOf".to_string()]
+        );
+
+        // No match -> empty.
+        assert_eq!(names_with_prefix(&idx, "zzz", false), Vec::<String>::new());
     }
 }

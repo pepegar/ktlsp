@@ -12,7 +12,8 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
-use crate::symbol::Def;
+use crate::complete::ScopeCompletion;
+use crate::symbol::{Def, SymbolKind};
 use crate::text::LineIndex;
 use crate::workspace::Workspace;
 
@@ -128,6 +129,13 @@ impl LanguageServer for Backend {
                 )),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                // `.` is registered now so the capability is correct for Stage B; the after-dot
+                // branch returns nothing in Stage A.
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 ..Default::default()
             },
             ..Default::default()
@@ -253,6 +261,59 @@ impl LanguageServer for Backend {
         };
 
         Ok((!locations.is_empty()).then_some(locations))
+    }
+
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        // Synchronous; the lock is never held across an `.await`. `doc_text` is read ONCE only to
+        // build the `LineIndex` and compute the byte offset, then the offset is passed to
+        // `ws.complete`, which internally accesses the cached tree exactly like `goto_definition`.
+        let items = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            match ws.complete(&key, offset) {
+                Some(cs) => cs.into_iter().map(to_completion_item).collect::<Vec<_>>(),
+                None => return Ok(None),
+            }
+        };
+
+        Ok((!items.is_empty()).then(|| CompletionResponse::Array(items)))
+    }
+}
+
+/// The single `SymbolKind`/`is_keyword` -> `CompletionItemKind` mapping site. The bare name is
+/// inserted (no parens/snippets) — correct and simple for Stage A.
+fn to_completion_item(c: ScopeCompletion) -> CompletionItem {
+    let kind = if c.is_keyword {
+        CompletionItemKind::KEYWORD
+    } else {
+        match c.kind {
+            SymbolKind::Class => CompletionItemKind::CLASS,
+            SymbolKind::Interface => CompletionItemKind::INTERFACE,
+            SymbolKind::Object => CompletionItemKind::MODULE,
+            SymbolKind::EnumClass => CompletionItemKind::ENUM,
+            SymbolKind::EnumEntry => CompletionItemKind::ENUM_MEMBER,
+            SymbolKind::Function => CompletionItemKind::FUNCTION,
+            SymbolKind::Property => CompletionItemKind::PROPERTY,
+            SymbolKind::Parameter => CompletionItemKind::VARIABLE,
+            SymbolKind::TypeParameter => CompletionItemKind::TYPE_PARAMETER,
+            SymbolKind::LocalVariable => CompletionItemKind::VARIABLE,
+        }
+    };
+    CompletionItem {
+        label: c.label,
+        kind: Some(kind),
+        ..Default::default()
     }
 }
 

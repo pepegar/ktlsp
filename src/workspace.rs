@@ -8,11 +8,12 @@ use std::path::Path;
 use tree_sitter::Tree;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::complete::{self, ScopeCompletion};
 use crate::index::{Index, RefEntry, Tier};
 use crate::indexer::{extract_symbols, extract_usages};
-use crate::parser::{compute_edit, identifier_at, node_text, package_of, KotlinParser};
+use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_of, KotlinParser};
 use crate::resolve;
-use crate::symbol::Def;
+use crate::symbol::{Def, SymbolKind};
 
 /// An open buffer: its current text plus the parsed tree, kept in sync so goto-definition reads an
 /// already-current tree instead of re-parsing on every request.
@@ -146,6 +147,103 @@ impl Workspace {
         resolve::goto(&self.index, key, &text, &tree, offset)
     }
 
+    /// `textDocument/completion` (Stage A: scope/name completion). Returns visible names whose
+    /// prefix matches the cursor — locals/params/type-params, same-file members + top-level,
+    /// cross-file/imported/default-import top-level names, import aliases, and Kotlin keywords.
+    /// Returns `None` unless the cursor is in a plain `ScopeName` position (after-dot, import,
+    /// string/comment/number all decline — silent omission). Open buffers reuse their cached tree
+    /// (no parse on the hot path), exactly like `goto_definition`.
+    pub fn complete(&mut self, key: &str, offset: usize) -> Option<Vec<ScopeCompletion>> {
+        // Grab the cached (text, tree) without holding a borrow across the index access. For open
+        // buffers we must clone the text+reparse-free tree out, because `complete_scope` needs the
+        // tree while we also borrow `&self.index`. To avoid cloning the tree, do all tree-dependent
+        // work (context, prefix, scope) inside the borrow scope, collecting owned results.
+        let (prefix, mut items, pkg, imports) = {
+            // Resolve the doc: open buffer (cached tree) or disk (parse once).
+            let parsed;
+            let (text, tree): (&str, &Tree) = match self.open_docs.get(key) {
+                Some(doc) => (&doc.text, &doc.tree),
+                None => {
+                    let text = self.doc_text(key)?;
+                    parsed = (self.parser.parse(&text), text);
+                    (&parsed.1, &parsed.0)
+                }
+            };
+
+            // Stage A declines anything but a plain scope-name position (silent omission). This is
+            // also where Stage B will hook in for AfterDot.
+            if complete::completion_context(tree, text, offset) != complete::CompletionContext::ScopeName {
+                return None;
+            }
+            let (prefix, _anchor) = complete::prefix_at(tree, text, offset);
+            let items = complete::complete_scope(tree, text, offset, &prefix);
+            let pkg = package_of(tree, text);
+            let imports = imports_of(tree, text);
+            (prefix, items, pkg, imports)
+        };
+
+        // Index-wide visible top-level names (skip the current file — its top-level symbols already
+        // come from `complete_scope`'s source_file arm). Apply the SAME visibility rules
+        // `resolve_cross_file` uses: explicit/alias import binds the name, OR same package, OR a
+        // wildcard import, OR a Kotlin default-import package.
+        let star_pkgs: Vec<String> = imports.iter().filter(|i| i.wildcard).map(|i| i.package()).collect();
+        let explicit_names: std::collections::HashSet<&str> =
+            imports.iter().filter(|i| !i.wildcard).filter_map(|i| i.local_name()).collect();
+
+        // Stable sort key for index additions: (label, tier-rank) so Volatile beats Durable and the
+        // surviving set is deterministic across the HashMap's randomized iteration order.
+        let mut index_items: Vec<(ScopeCompletion, u8)> = Vec::new();
+        for e in self.index.entries_with_prefix(&prefix, true) {
+            if e.path == key {
+                continue;
+            }
+            let visible = explicit_names.contains(e.sym.name.as_str())
+                || e.sym.package == pkg
+                || star_pkgs.contains(&e.sym.package)
+                || resolve::is_default_import_pkg(&e.sym.package);
+            if !visible {
+                continue;
+            }
+            let rank = match e.tier {
+                Tier::Volatile => 0,
+                Tier::Durable => 1,
+            };
+            index_items.push((ScopeCompletion::new(e.sym.name.clone(), e.sym.kind), rank));
+        }
+
+        // Import aliases that match the prefix (the alias is the local name; kind unknown -> Object).
+        for imp in &imports {
+            if let Some(alias) = imp.alias.as_deref() {
+                if alias.starts_with(&prefix) {
+                    index_items.push((ScopeCompletion::new(alias.to_string(), SymbolKind::Object), 0));
+                }
+            }
+        }
+
+        // Keywords valid as a leading token, filtered by prefix.
+        for kw in KOTLIN_KEYWORDS {
+            if kw.starts_with(&prefix) {
+                index_items.push((ScopeCompletion::keyword(*kw), 0));
+            }
+        }
+
+        // Deterministic order before dedup/cap: by (label, tier-rank).
+        index_items.sort_by(|a, b| a.0.label.cmp(&b.0.label).then(a.1.cmp(&b.1)));
+
+        // Dedup against scope names already present (scope/local names win — keep first), and across
+        // the sorted index/keyword additions themselves.
+        let mut seen: std::collections::HashSet<String> =
+            items.iter().map(|c| c.label.clone()).collect();
+        for (c, _) in index_items {
+            if seen.insert(c.label.clone()) {
+                items.push(c);
+            }
+        }
+
+        items.truncate(MAX_COMPLETIONS);
+        Some(items)
+    }
+
     /// `textDocument/references`: all usage sites (as `Def` locations) of the symbol at `offset`.
     /// Goto-grade precision: every candidate usage of the name is re-resolved and kept only if it
     /// resolves to the same definition as the cursor. Optionally includes the declaration site.
@@ -253,6 +351,23 @@ impl Workspace {
         Some(node_text(id, &text).to_string())
     }
 }
+
+/// Cap on the number of completion candidates returned (UX contract: ~1000). High enough that a
+/// common prefix rarely truncates useful names; editors re-request as the prefix narrows.
+const MAX_COMPLETIONS: usize = 1000;
+
+/// Kotlin keywords valid as a leading token in a scope-name position. Soft / context-sensitive
+/// keywords (`by`, `get`, `set`, `field`, `it`, `constructor`, `init`) are intentionally EXCLUDED:
+/// they are keywords only in specific positions, so offering them at top level would be wrong.
+const KOTLIN_KEYWORDS: &[&str] = &[
+    // Hard keywords.
+    "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if", "in",
+    "interface", "is", "null", "object", "package", "return", "super", "this", "throw", "true",
+    "try", "typealias", "typeof", "val", "var", "when", "while", "import",
+    // Modifier / visibility leading tokens commonly typed first.
+    "private", "public", "protected", "internal", "abstract", "final", "open", "override",
+    "sealed", "data", "enum", "companion", "lateinit", "inline", "suspend", "const",
+];
 
 /// Prune build output, common generated dirs, and dot directories from the scan.
 fn is_excluded(entry: &DirEntry) -> bool {

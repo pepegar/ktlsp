@@ -18,6 +18,19 @@ async fn initialize_open_and_goto_definition() {
         init.capabilities.definition_provider.is_some(),
         "server must advertise definition support"
     );
+    // and completion support with a `.` trigger character
+    let completion = init
+        .capabilities
+        .completion_provider
+        .as_ref()
+        .expect("server must advertise completion support");
+    assert!(
+        completion
+            .trigger_characters
+            .as_ref()
+            .is_some_and(|chars| chars.iter().any(|c| c == ".")),
+        "completion trigger characters must include `.`"
+    );
     backend.initialized(InitializedParams {}).await;
 
     // open a document
@@ -74,6 +87,31 @@ async fn initialize_open_and_goto_definition() {
         .expect("references should be present");
     assert_eq!(refs.len(), 2, "decl + one call: {refs:?}");
     assert!(refs.iter().all(|l| l.uri.as_str() == uri.as_str()));
+
+    // textDocument/completion at a `h` prefix on line 1 (inside the `helper()` call): the response
+    // must include the top-level `helper`.
+    let call_col = text.lines().nth(1).unwrap().find("helper").unwrap() as u32;
+    let comp = backend
+        .completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 1, character: call_col + 1 }, // after the `h`
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("completion should be present");
+    let items = match comp {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    assert!(
+        items.iter().any(|i| i.label == "helper"),
+        "completion must offer `helper`: {items:?}"
+    );
 
     assert!(backend.shutdown().await.is_ok());
 }
