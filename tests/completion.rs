@@ -794,3 +794,31 @@ fn member_completion_via_local_typed_annotation() {
                  //- Main.kt\npackage app\nfun render(s: Shape) {\n    s.ar/*^*/\n}\n";
     check_contains(input, &["area"]);
 }
+
+// --------------------------------------------------------------------------------------------
+// Nullability (Stage 3): safe-call, non-null assertion, elvis
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn member_completion_through_safe_call() {
+    // `a?.` on a nullable receiver offers the underlying type's members (editor convention).
+    let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(a: Foo?) {\n    a?.ba/*^*/\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn member_completion_through_not_null_assertion() {
+    // `a!!.` strips nullability and offers the type's members.
+    let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(a: Foo?) {\n    a!!.ba/*^*/\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn member_completion_through_elvis() {
+    // `(a ?: fallback).` resolves to the operands' (non-null) type.
+    let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(a: Foo?, fallback: Foo) {\n    (a ?: fallback).ba/*^*/\n}\n";
+    check_contains(input, &["bar"]);
+}

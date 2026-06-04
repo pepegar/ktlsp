@@ -77,10 +77,38 @@ fn infer_depth(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize
             Some(inner) => infer_depth(index, inner, src, ctx, depth + 1),
             None => Type::Unknown,
         },
+        // Elvis `a ?: b`: the non-null type of the left operand (best-effort; we don't unify with
+        // the right). `?:` is an anonymous operator token, so detect it by scanning all children.
+        // Other binary operators don't yield a useful receiver type — leave them Unknown.
+        "binary_expression" if has_child_token(node, "?:") => match node.named_child(0) {
+            Some(left) => infer_depth(index, left, src, ctx, depth + 1).into_non_null(),
+            None => Type::Unknown,
+        },
+        // Unary, incl. the non-null assertion `a!!`: the argument's type with nullability stripped.
+        // (`-n`/`!b` keep the argument's type too, which is correct for Int/Boolean.)
+        "unary_expression" => match node.named_child(0) {
+            Some(arg) => infer_depth(index, arg, src, ctx, depth + 1).into_non_null(),
+            None => Type::Unknown,
+        },
         "call_expression" => infer_call(index, node, src, ctx, depth),
         "navigation_expression" => infer_navigation(index, node, src, ctx, depth),
         _ => Type::Unknown,
     }
+}
+
+/// Whether `node` has a direct (possibly anonymous) child token equal to `token`. Operators like
+/// `?:` and `!!` are exposed by tree-sitter as UNNAMED children, invisible to `named_children`, so
+/// detecting them requires iterating all children.
+fn has_child_token(node: Node, token: &str) -> bool {
+    let mut cursor = node.walk();
+    let mut found = false;
+    for c in node.children(&mut cursor) {
+        if !c.is_named() && c.kind() == token {
+            found = true;
+            break;
+        }
+    }
+    found
 }
 
 /// A bare identifier: a local/param (read its declared/initialized type), the boolean literals
