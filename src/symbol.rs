@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 
 /// What a name binds to. Drives kind-aware resolution (a `class Foo` and a `fun Foo` are
 /// indistinguishable by name alone, so the resolver filters candidates by kind).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum SymbolKind {
     Class,
     Interface,
@@ -55,6 +55,41 @@ pub struct IndexedSymbol {
     pub container: Option<String>,
     pub start_byte: usize,
     pub end_byte: usize,
+    /// For a `Class`/`Interface`/`Object`/`EnumClass`: the simple names of its declared
+    /// supertypes (the `extends`/`implements` list). Empty for everything else. Used by member
+    /// completion (Stage B) to walk the inheritance chain. `#[serde(default)]` so older symcaches
+    /// (which lack the field) still deserialize.
+    #[serde(default)]
+    pub supertypes: Vec<String>,
+    /// For a top-level extension `Function`/`Property` (`fun T.f()` / `val T.p`): the simple name
+    /// of the receiver type `T`, `?`-stripped. `None` for non-extensions. Used by Stage B to offer
+    /// extensions on a receiver of that type (or a subtype).
+    #[serde(default)]
+    pub ext_receiver: Option<String>,
+}
+
+impl IndexedSymbol {
+    /// A minimal symbol (no supertypes, not an extension). Convenience for call sites that don't
+    /// deal with types/extensions (Java, tests).
+    pub fn new(
+        name: impl Into<String>,
+        kind: SymbolKind,
+        package: impl Into<String>,
+        container: Option<String>,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Self {
+        IndexedSymbol {
+            name: name.into(),
+            kind,
+            package: package.into(),
+            container,
+            start_byte,
+            end_byte,
+            supertypes: Vec::new(),
+            ext_receiver: None,
+        }
+    }
 }
 
 /// A goto-definition result: the canonical file key plus the byte range of the target name

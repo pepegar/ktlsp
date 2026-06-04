@@ -173,6 +173,33 @@ fn resolve_member(index: &Index, selector: Node, name: &str, src: &str) -> Vec<D
     }
 }
 
+/// Infer the simple type-name of a navigation receiver for **member completion** (Stage B).
+///
+/// `recv` is the receiver node — `named_child(0)` of the `navigation_expression`. This wraps the
+/// goto-path `infer_type` (locals/params via the scope walk, constructor calls, `this`) and adds
+/// one completion-only fallback: a bare identifier that is itself a known *type* name resolves to
+/// that type, enabling `Foo.` / `Color.` (companion / enum-entry / static access). A local binding
+/// always wins over the bare-type-name fallback (so `val Dog = Dog(); Dog.` completes on the
+/// instance), because `infer_type` is tried first. The result is `?`-stripped (nullable receivers
+/// like `d?.` / `val d: T?` reduce to `T`, since `decl_type` reads through the `nullable_type`
+/// wrapper). Returns `None` (silent omission) when the type cannot be inferred.
+pub fn infer_receiver_type(index: &Index, recv: Node, src: &str) -> Option<String> {
+    // 1. Reuse the goto inference (locals/params/this/constructor-call). A local always wins.
+    if let Some(ty) = infer_type(index, recv, src) {
+        return Some(ty);
+    }
+    // 2. Completion-only fallback: a bare identifier that names a known type -> that type (for
+    //    `Foo.` companion/static access and `Color.` enum-entry access). Guarded so we never
+    //    fabricate a type for an unknown identifier.
+    if recv.kind() == "identifier" {
+        let name = node_text(recv, src);
+        if index.lookup_by_name(name).iter().any(|e| e.sym.kind.is_type_like()) {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
 /// Best-effort, compiler-free inference of a receiver expression's type name.
 fn infer_type(index: &Index, receiver: Node, src: &str) -> Option<String> {
     match receiver.kind() {

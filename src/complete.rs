@@ -12,9 +12,19 @@ use std::collections::HashSet;
 
 use tree_sitter::{Node, Tree};
 
+use crate::index::Index;
 use crate::parser::{child_of_kind, class_kind, first_ident, identifier_at, name_field, node_text};
 use crate::resolve::{use_kind, UseKind};
 use crate::symbol::SymbolKind;
+
+/// Hard cap on the number of member-completion results (UX defensive cap, mirrors the references
+/// `MAX_CANDIDATES` convention). High enough to never truncate a real type's member set.
+const MAX_MEMBER_COMPLETIONS: usize = 1000;
+
+/// Depth cap on the supertype walk: guards a pathologically deep (or cyclic, alongside the visited
+/// set) chain. The deepest stdlib chains (`ArrayList : AbstractList : AbstractCollection : ...`) are
+/// well under this.
+const SUPERTYPE_DEPTH_CAP: usize = 32;
 
 /// Where an identifier sits, for completion routing. Shared scaffold for Stage B/C.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -227,6 +237,119 @@ pub fn complete_scope(tree: &Tree, src: &str, offset: usize, prefix: &str) -> Ve
         scope = s.parent();
     }
     out
+}
+
+/// The synthetic identifier appended after the dot so a bare trailing `expr.` reparses into a clean
+/// `navigation_expression` (tree-sitter otherwise collapses `expr.` into an `ERROR`). Chosen to be
+/// an unlikely real identifier; it is never offered (it is the selector, not a candidate).
+pub const DOT_PLACEHOLDER: &str = "__ktlsp_completion__";
+
+/// For an `AfterDot` cursor at `offset`, compute the partial selector `prefix` (the identifier
+/// chars already typed after the dot, possibly empty) and a synthetic `(text, offset)` in which a
+/// placeholder identifier has been spliced in at the cursor so the buffer reparses to a clean
+/// `navigation_expression`. All slicing is char-boundary safe.
+///
+/// Returns `None` if there is no `.` before the cursor (shouldn't happen once the context detector
+/// has classified `AfterDot`, but we never panic).
+pub fn dot_recovery(src: &str, offset: usize) -> Option<(String, String, usize)> {
+    let end = floor_boundary(src, offset);
+    // The partial selector: identifier chars immediately before the cursor.
+    let mut start = end;
+    while let Some((s, ch)) = prev_char(src, start) {
+        if ch.is_alphanumeric() || ch == '_' {
+            start = s;
+        } else {
+            break;
+        }
+    }
+    let prefix = src[start..end].to_string();
+
+    // Confirm a `.` precedes the (whitespace-skipped) selector start — i.e. this really is AfterDot.
+    let mut i = start;
+    while let Some((s, ch)) = prev_char(src, i) {
+        if ch == ' ' || ch == '\t' {
+            i = s;
+        } else {
+            break;
+        }
+    }
+    if !matches!(prev_char(src, i), Some((_, '.'))) {
+        return None;
+    }
+
+    // Splice the placeholder in at the cursor (replacing nothing): `...b.gr|` -> `...b.gr<PH>`.
+    // The new navigation selector ends at `end + DOT_PLACEHOLDER.len()`.
+    let mut synthetic = String::with_capacity(src.len() + DOT_PLACEHOLDER.len());
+    synthetic.push_str(&src[..end]);
+    synthetic.push_str(DOT_PLACEHOLDER);
+    synthetic.push_str(&src[end..]);
+    let synthetic_offset = end + DOT_PLACEHOLDER.len();
+    Some((prefix, synthetic, synthetic_offset))
+}
+
+/// Locate the navigation receiver for member completion at `offset`. tree-sitter collapses a bare
+/// trailing `expr.` into an `ERROR` (no `navigation_expression`), so the caller must hand us a tree
+/// parsed from text with a synthetic placeholder appended after the dot — that reparse yields a
+/// clean `navigation_expression (receiver) (placeholder)`. We find the `navigation_expression`
+/// covering `offset` and return its receiver node (`named_child(0)`). Works for both the
+/// placeholder case and a real partial selector (`b.gr`), since both parse to a navigation_expr.
+pub fn navigation_receiver_at(tree: &Tree, offset: usize) -> Option<Node<'_>> {
+    let root = tree.root_node();
+    // Probe at the cursor and just before it (cursor may sit at the end of the placeholder/selector).
+    for probe in [offset, offset.saturating_sub(1)] {
+        let mut node = root.named_descendant_for_byte_range(probe, probe);
+        while let Some(n) = node {
+            if n.kind() == "navigation_expression" {
+                return n.named_child(0);
+            }
+            node = n.parent();
+        }
+    }
+    None
+}
+
+/// Assemble the complete member set of type `ty` for `receiver.` completion, filtered by `prefix`:
+/// own members (`container == ty`) UNION members inherited through the supertype chain UNION
+/// applicable extensions (receiver == ty or any supertype). Dedup by `(label, kind)`. Returns at
+/// most `MAX_MEMBER_COMPLETIONS`. Empty when the type contributes nothing visible (silent omission
+/// is the caller's concern — an empty vec here just means no members matched).
+pub fn assemble_members(index: &Index, ty: &str, prefix: &str) -> Vec<ScopeCompletion> {
+    let mut out: Vec<ScopeCompletion> = Vec::new();
+    let mut seen: HashSet<(String, SymbolKind)> = HashSet::new();
+
+    // Walk the type + its supertype closure (BFS, visited-guarded, depth-capped). For each type in
+    // the closure, contribute its own members and the extensions keyed on it.
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<(String, usize)> = vec![(ty.to_string(), 0)];
+    while let Some((cur, depth)) = frontier.pop() {
+        if !visited.insert(cur.clone()) || depth > SUPERTYPE_DEPTH_CAP {
+            continue;
+        }
+        for e in index.members_of(&cur) {
+            push_member(&mut out, &mut seen, &e.sym.name, e.sym.kind, prefix);
+        }
+        for e in index.extensions_for(&cur) {
+            push_member(&mut out, &mut seen, &e.sym.name, e.sym.kind, prefix);
+        }
+        for sup in index.supertypes_of(&cur) {
+            frontier.push((sup, depth + 1));
+        }
+    }
+
+    out.truncate(MAX_MEMBER_COMPLETIONS);
+    out
+}
+
+fn push_member(
+    out: &mut Vec<ScopeCompletion>,
+    seen: &mut HashSet<(String, SymbolKind)>,
+    name: &str,
+    kind: SymbolKind,
+    prefix: &str,
+) {
+    if name.starts_with(prefix) && seen.insert((name.to_string(), kind)) {
+        out.push(ScopeCompletion::new(name, kind));
+    }
 }
 
 /// A binder is emitted only if its name starts with `prefix` and it has not been seen yet
@@ -600,5 +723,79 @@ mod tests {
         let tree = parse(src);
         let off = "import ".len();
         assert_eq!(completion_context(&tree, src, off), CompletionContext::Import);
+    }
+
+    // ----- Stage B core helpers -----
+
+    #[test]
+    fn dot_recovery_trailing_dot() {
+        let src = "fun main() {\n    val b = X()\n    b.\n}\n";
+        let off = src.find("b.").unwrap() + "b.".len();
+        let (prefix, synthetic, syn_off) = dot_recovery(src, off).expect("AfterDot recovery");
+        assert_eq!(prefix, "", "empty partial selector after a bare dot");
+        // The placeholder is spliced in at the cursor; the new tree must have a navigation_expression
+        // whose receiver is `b`.
+        let tree = parse(&synthetic);
+        let recv = navigation_receiver_at(&tree, syn_off).expect("navigation receiver");
+        assert_eq!(node_text(recv, &synthetic), "b");
+    }
+
+    #[test]
+    fn dot_recovery_partial_selector_prefix() {
+        let src = "fun main() {\n    val b = X()\n    b.op\n}\n";
+        let off = src.find("b.op").unwrap() + "b.op".len();
+        let (prefix, synthetic, syn_off) = dot_recovery(src, off).expect("AfterDot recovery");
+        assert_eq!(prefix, "op", "partial selector becomes the prefix");
+        let tree = parse(&synthetic);
+        let recv = navigation_receiver_at(&tree, syn_off).expect("navigation receiver");
+        assert_eq!(node_text(recv, &synthetic), "b");
+    }
+
+    #[test]
+    fn dot_recovery_skips_whitespace_after_dot() {
+        let src = "fun main() {\n    val b = X()\n    b. \n}\n";
+        let off = src.find("b. ").unwrap() + "b. ".len();
+        let (prefix, synthetic, syn_off) = dot_recovery(src, off).expect("AfterDot recovery");
+        assert_eq!(prefix, "");
+        let tree = parse(&synthetic);
+        let recv = navigation_receiver_at(&tree, syn_off).expect("navigation receiver");
+        assert_eq!(node_text(recv, &synthetic), "b");
+    }
+
+    #[test]
+    fn dot_recovery_none_without_dot() {
+        // No dot before the cursor -> not an AfterDot recovery.
+        let src = "fun main() {\n    abc\n}\n";
+        let off = src.find("abc").unwrap() + "abc".len();
+        assert!(dot_recovery(src, off).is_none());
+    }
+
+    #[test]
+    fn assemble_members_dedups_and_filters() {
+        use crate::index::{Index, Tier};
+        use crate::symbol::IndexedSymbol;
+
+        let mut idx = Index::new();
+        idx.replace_file(
+            "x.kt",
+            vec![
+                IndexedSymbol { supertypes: vec!["Base".into()], ..IndexedSymbol::new("Dog", SymbolKind::Class, "p", None, 0, 3) },
+                IndexedSymbol::new("Base", SymbolKind::Class, "p", None, 0, 4),
+                IndexedSymbol::new("bark", SymbolKind::Function, "p", Some("Dog".into()), 0, 4),
+                IndexedSymbol::new("b", SymbolKind::Function, "p", Some("Base".into()), 0, 1),
+                IndexedSymbol { ext_receiver: Some("Dog".into()), ..IndexedSymbol::new("fetch", SymbolKind::Function, "p", None, 0, 5) },
+            ],
+            Tier::Volatile,
+        );
+        let all: std::collections::HashSet<String> =
+            assemble_members(&idx, "Dog", "").into_iter().map(|c| c.label).collect();
+        assert!(all.contains("bark"), "own member");
+        assert!(all.contains("b"), "inherited member");
+        assert!(all.contains("fetch"), "extension");
+
+        // Prefix filter.
+        let filtered: Vec<String> =
+            assemble_members(&idx, "Dog", "ba").into_iter().map(|c| c.label).collect();
+        assert_eq!(filtered, vec!["bark".to_string()]);
     }
 }

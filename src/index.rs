@@ -50,6 +50,13 @@ pub struct Index {
     files: HashMap<String, (Tier, Vec<IndexedSymbol>)>,
     /// Derived lookup: simple name -> entries (both tiers merged).
     by_name: HashMap<String, Vec<Entry>>,
+    /// Derived lookup for member completion: container type simple-name -> member entries (the
+    /// hot path for `receiver.` completion, so it gets a dedicated maintained map). Keyed off
+    /// `sym.container`; top-level symbols (no container) are not recorded here.
+    members_by_container: HashMap<String, Vec<Entry>>,
+    /// Derived lookup for member completion: extension-receiver type simple-name -> extension
+    /// entries (`fun T.f` / `val T.p`). Keyed off `sym.ext_receiver`.
+    ext_by_receiver: HashMap<String, Vec<Entry>>,
     /// Reverse index source of truth: each file's identifier usages (project files only).
     ref_files: HashMap<String, Vec<Usage>>,
     /// Derived reverse lookup: simple name -> usage sites.
@@ -65,11 +72,20 @@ impl Index {
     pub fn replace_file(&mut self, path: &str, symbols: Vec<IndexedSymbol>, tier: Tier) {
         self.remove_symbols(path);
         for sym in &symbols {
-            self.by_name.entry(sym.name.clone()).or_default().push(Entry {
+            let entry = Entry {
                 path: path.to_string(),
                 tier,
                 sym: sym.clone(),
-            });
+            };
+            self.by_name.entry(sym.name.clone()).or_default().push(entry.clone());
+            // Member-by-container map: only symbols that ARE members (Some container).
+            if let Some(container) = &sym.container {
+                self.members_by_container.entry(container.clone()).or_default().push(entry.clone());
+            }
+            // Extension-by-receiver map: only extension functions/properties (Some ext_receiver).
+            if let Some(recv) = &sym.ext_receiver {
+                self.ext_by_receiver.entry(recv.clone()).or_default().push(entry);
+            }
         }
         self.files.insert(path.to_string(), (tier, symbols));
     }
@@ -96,12 +112,24 @@ impl Index {
     fn remove_symbols(&mut self, path: &str) {
         if let Some((_, old)) = self.files.remove(path) {
             for sym in old {
-                if let Some(entries) = self.by_name.get_mut(&sym.name) {
-                    entries.retain(|e| e.path != path);
-                    if entries.is_empty() {
-                        self.by_name.remove(&sym.name);
-                    }
+                Self::drop_from(&mut self.by_name, &sym.name, path);
+                if let Some(container) = &sym.container {
+                    Self::drop_from(&mut self.members_by_container, container, path);
                 }
+                if let Some(recv) = &sym.ext_receiver {
+                    Self::drop_from(&mut self.ext_by_receiver, recv, path);
+                }
+            }
+        }
+    }
+
+    /// Remove every entry contributed by `path` from one bucket of a name->entries map, pruning
+    /// the now-empty bucket.
+    fn drop_from(map: &mut HashMap<String, Vec<Entry>>, key: &str, path: &str) {
+        if let Some(entries) = map.get_mut(key) {
+            entries.retain(|e| e.path != path);
+            if entries.is_empty() {
+                map.remove(key);
             }
         }
     }
@@ -122,6 +150,29 @@ impl Index {
     /// All entries with the given simple name (borrowed; callers clone only what they keep).
     pub fn lookup_by_name(&self, name: &str) -> &[Entry] {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// All entries whose `container == type_name` — members declared directly on the type (instance
+    /// members, companion members, enum entries; both tiers merged). Borrowed.
+    pub fn members_of(&self, type_name: &str) -> &[Entry] {
+        self.members_by_container.get(type_name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// All extension functions/properties whose receiver type simple-name == `receiver_type`.
+    /// Borrowed.
+    pub fn extensions_for(&self, receiver_type: &str) -> &[Entry] {
+        self.ext_by_receiver.get(receiver_type).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The direct supertype simple-names of `type_name`, across both tiers. Reads the declaring
+    /// type's `sym.supertypes` (the first `is_type_like` entry wins — simple names rarely collide).
+    /// Returns empty if the type is unknown or has no supertypes.
+    pub fn supertypes_of(&self, type_name: &str) -> Vec<String> {
+        self.by_name
+            .get(type_name)
+            .and_then(|entries| entries.iter().find(|e| e.sym.kind.is_type_like()))
+            .map(|e| e.sym.supertypes.clone())
+            .unwrap_or_default()
     }
 
     /// Iterate all entries whose symbol name starts with `prefix`. When `top_level_only` is true,
@@ -152,19 +203,27 @@ mod tests {
     use crate::symbol::SymbolKind;
 
     fn sym(name: &str) -> IndexedSymbol {
-        IndexedSymbol {
-            name: name.to_string(),
-            kind: SymbolKind::Function,
-            package: "p".to_string(),
-            container: None,
-            start_byte: 0,
-            end_byte: name.len(),
-        }
+        IndexedSymbol::new(name, SymbolKind::Function, "p", None, 0, name.len())
     }
 
     fn member(name: &str, container: &str) -> IndexedSymbol {
         IndexedSymbol {
             container: Some(container.to_string()),
+            ..sym(name)
+        }
+    }
+
+    fn extension(name: &str, receiver: &str) -> IndexedSymbol {
+        IndexedSymbol {
+            ext_receiver: Some(receiver.to_string()),
+            ..sym(name)
+        }
+    }
+
+    fn typ(name: &str, supertypes: &[&str]) -> IndexedSymbol {
+        IndexedSymbol {
+            kind: SymbolKind::Class,
+            supertypes: supertypes.iter().map(|s| s.to_string()).collect(),
             ..sym(name)
         }
     }
@@ -187,6 +246,42 @@ mod tests {
 
         idx.remove_file("b.kt");
         assert_eq!(idx.lookup_by_name("foo").len(), 0);
+    }
+
+    #[test]
+    fn member_extension_supertype_maps_idempotent() {
+        let mut idx = Index::new();
+        // A file contributing a type with supertypes, a member, and an extension.
+        idx.replace_file(
+            "a.kt",
+            vec![typ("Dog", &["Base"]), member("bark", "Dog"), extension("fetch", "Dog")],
+            Tier::Volatile,
+        );
+        assert_eq!(idx.members_of("Dog").len(), 1);
+        assert_eq!(idx.members_of("Dog")[0].sym.name, "bark");
+        assert_eq!(idx.extensions_for("Dog").len(), 1);
+        assert_eq!(idx.extensions_for("Dog")[0].sym.name, "fetch");
+        assert_eq!(idx.supertypes_of("Dog"), vec!["Base".to_string()]);
+
+        // Re-indexing the same file must not duplicate entries in any derived map.
+        idx.replace_file(
+            "a.kt",
+            vec![typ("Dog", &["Base"]), member("bark", "Dog"), extension("fetch", "Dog")],
+            Tier::Volatile,
+        );
+        assert_eq!(idx.members_of("Dog").len(), 1, "members must not duplicate on re-index");
+        assert_eq!(idx.extensions_for("Dog").len(), 1, "extensions must not duplicate");
+
+        // Re-indexing with the member/extension gone must prune them from the derived maps.
+        idx.replace_file("a.kt", vec![typ("Dog", &[])], Tier::Volatile);
+        assert!(idx.members_of("Dog").is_empty(), "stale member must be pruned");
+        assert!(idx.extensions_for("Dog").is_empty(), "stale extension must be pruned");
+        assert!(idx.supertypes_of("Dog").is_empty(), "supertypes updated on re-index");
+
+        // Removing the file clears everything.
+        idx.remove_file("a.kt");
+        assert!(idx.members_of("Dog").is_empty());
+        assert!(idx.supertypes_of("Dog").is_empty());
     }
 
     fn names_with_prefix(idx: &Index, prefix: &str, top_level_only: bool) -> Vec<String> {

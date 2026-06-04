@@ -123,6 +123,78 @@ fn goto_into_indexed_library_kotlin_and_java() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+/// Stage B: supertype + extension data recorded by the indexer must survive into the **Durable**
+/// tier, so member completion on a user-file receiver of a library type offers inherited members
+/// and library extensions. This proves the supertype/extension index is populated for libraries
+/// (parsed through the same `extract_symbols` as project files).
+#[test]
+fn member_completion_into_indexed_library() {
+    let tmp = unique_tmp("libcomplete");
+    let coord = Coordinate::parse("acme:widgets:2.0").unwrap();
+
+    let gradle_cache = tmp.join("gradle/caches");
+    let jar = gradle_cache
+        .join("modules-2/files-2.1")
+        .join(&coord.group)
+        .join(&coord.artifact)
+        .join(&coord.version)
+        .join("cafebabe")
+        .join(coord.sources_jar_name());
+    // A base class + a subclass + a top-level extension on the base, all in the library.
+    write_sources_jar(
+        &jar,
+        &[(
+            "acme/ui/Widgets.kt",
+            "package acme.ui\n\
+             \n\
+             open class View {\n\
+             \x20\x20\x20\x20fun render() {}\n\
+             }\n\
+             \n\
+             class Button : View() {\n\
+             \x20\x20\x20\x20fun click() {}\n\
+             }\n\
+             \n\
+             fun View.highlight() {}\n",
+        )],
+    );
+
+    let repos = Repos {
+        gradle_cache,
+        m2: tmp.join("m2"),
+        central_base: "http://127.0.0.1:0/unused".to_string(),
+        download_dir: tmp.join("dl"),
+        allow_download: false,
+    };
+    let extract_root = tmp.join("extracted");
+    let mut ws = index_into_workspace(&coord, &repos, &extract_root);
+
+    // A user file constructing the library `Button` and completing after a dot.
+    let key = tmp.join("app/Main.kt").to_string_lossy().into_owned();
+    // `b.` is a bare trailing dot — exercises the placeholder-recovery path.
+    let src = "package app\n\
+               import acme.ui.Button\n\
+               \n\
+               fun main() {\n\
+               \x20\x20\x20\x20val b = Button()\n\
+               \x20\x20\x20\x20b.\n\
+               }\n";
+    ws.open(key.clone(), src.to_string());
+
+    let dot = src.rfind("b.").unwrap() + "b.".len();
+    let labels: std::collections::HashSet<String> = ws
+        .complete(&key, dot)
+        .expect("member completion should resolve the library type")
+        .into_iter()
+        .map(|c| c.label)
+        .collect();
+    assert!(labels.contains("click"), "own member: {labels:?}");
+    assert!(labels.contains("render"), "inherited from View (Durable supertype walk): {labels:?}");
+    assert!(labels.contains("highlight"), "library extension on View: {labels:?}");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Real download path: fetch a small sources jar from Maven Central, index it, and resolve goto.
 /// Network-dependent, so ignored by default. Run with: `cargo test -- --ignored download`.
 #[test]

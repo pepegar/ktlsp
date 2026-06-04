@@ -9,7 +9,7 @@
 use tree_sitter::Node;
 
 use crate::index::Usage;
-use crate::parser::{class_kind, first_ident, name_field, node_text};
+use crate::parser::{child_of_kind, class_kind, first_ident, name_field, node_text};
 use crate::symbol::{IndexedSymbol, SymbolKind};
 
 pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Vec<IndexedSymbol> {
@@ -55,22 +55,25 @@ fn push(
     package: &str,
     container: Option<&str>,
 ) {
-    out.push(IndexedSymbol {
-        name: node_text(name_node, src).to_string(),
+    out.push(IndexedSymbol::new(
+        node_text(name_node, src),
         kind,
-        package: package.to_string(),
-        container: container.map(str::to_string),
-        start_byte: name_node.start_byte(),
-        end_byte: name_node.end_byte(),
-    });
+        package,
+        container.map(str::to_string),
+        name_node.start_byte(),
+        name_node.end_byte(),
+    ));
 }
 
 /// Push the name(s) bound by a `property_declaration`, handling `val (a, b) = ...` destructuring.
+/// `ext_receiver` is stamped on each pushed property (an extension property `val T.p` binds a
+/// single name; destructured extension properties don't exist, but the field is uniformly applied).
 fn push_property_names(
     decl: Node,
     src: &str,
     package: &str,
     container: Option<&str>,
+    ext_receiver: Option<&str>,
     out: &mut Vec<IndexedSymbol>,
 ) {
     let mut cursor = decl.walk();
@@ -78,7 +81,7 @@ fn push_property_names(
         match child.kind() {
             "variable_declaration" => {
                 if let Some(id) = first_ident(child) {
-                    push(out, id, src, SymbolKind::Property, package, container);
+                    push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver);
                 }
             }
             "multi_variable_declaration" => {
@@ -86,7 +89,7 @@ fn push_property_names(
                 for vd in child.named_children(&mut c2) {
                     if vd.kind() == "variable_declaration" {
                         if let Some(id) = first_ident(vd) {
-                            push(out, id, src, SymbolKind::Property, package, container);
+                            push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver);
                         }
                     }
                 }
@@ -96,6 +99,119 @@ fn push_property_names(
     }
 }
 
+/// Like `push`, but stamps `ext_receiver` (for extension functions/properties).
+fn push_ext(
+    out: &mut Vec<IndexedSymbol>,
+    name_node: Node,
+    src: &str,
+    kind: SymbolKind,
+    package: &str,
+    container: Option<&str>,
+    ext_receiver: Option<&str>,
+) {
+    out.push(IndexedSymbol {
+        ext_receiver: ext_receiver.map(str::to_string),
+        ..IndexedSymbol::new(
+            node_text(name_node, src),
+            kind,
+            package,
+            container.map(str::to_string),
+            name_node.start_byte(),
+            name_node.end_byte(),
+        )
+    });
+}
+
+/// Push a type declaration's name with its `supertypes`.
+fn push_type(
+    out: &mut Vec<IndexedSymbol>,
+    name_node: Node,
+    src: &str,
+    kind: SymbolKind,
+    package: &str,
+    container: Option<&str>,
+    supertypes: Vec<String>,
+) {
+    out.push(IndexedSymbol {
+        supertypes,
+        ..IndexedSymbol::new(
+            node_text(name_node, src),
+            kind,
+            package,
+            container.map(str::to_string),
+            name_node.start_byte(),
+            name_node.end_byte(),
+        )
+    });
+}
+
+/// The simple names of a `class_declaration`/`object_declaration`'s declared supertypes
+/// (the `: Base(), Animal` list). Shape (verified via `examples/dump`):
+/// `delegation_specifiers > delegation_specifier > {constructor_invocation > user_type | user_type}
+/// > identifier`. Returns `["Base", "Animal"]` for `class Dog : Base(), Animal`.
+fn supertypes_of(decl: Node, src: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let Some(specs) = child_of_kind(decl, "delegation_specifiers") else {
+        return out;
+    };
+    let mut cursor = specs.walk();
+    for spec in specs.named_children(&mut cursor) {
+        if spec.kind() != "delegation_specifier" {
+            continue;
+        }
+        // The receiver type is the first `user_type` under the specifier (directly, or wrapped in a
+        // `constructor_invocation` for the `Base()` superclass-call form).
+        if let Some(ut) = find_descendant(spec, "user_type") {
+            if let Some(id) = first_ident(ut) {
+                out.push(node_text(id, src).to_string());
+            }
+        }
+    }
+    out
+}
+
+/// For a `function_declaration` / `property_declaration`, the simple name of an extension receiver:
+/// a `user_type`/`nullable_type` appearing BEFORE the boundary node (the `name:` field for
+/// functions, the `variable_declaration` for properties). `?`-stripped. `None` for plain
+/// declarations (whose `user_type`s only appear after the boundary). Verified via `examples/dump`:
+/// `fun Dog.fetch()` has `user_type(Dog)` before `name:`; `val x by lazy{}` has no `user_type`
+/// before its `variable_declaration` (the delegate is a `property_delegate`, not a receiver).
+fn extension_receiver(decl: Node, src: &str) -> Option<String> {
+    let mut cursor = decl.walk();
+    for child in decl.named_children(&mut cursor) {
+        match child.kind() {
+            // Boundary: anything at/after this is not an extension receiver.
+            "variable_declaration" => return None,
+            "user_type" => return first_ident(child).map(|id| node_text(id, src).to_string()),
+            "nullable_type" => {
+                return find_descendant(child, "user_type")
+                    .and_then(first_ident)
+                    .map(|id| node_text(id, src).to_string())
+            }
+            _ => {}
+        }
+        // For functions the boundary is the `name:` field; once we reach it, stop.
+        if name_field(decl) == Some(child) {
+            return None;
+        }
+    }
+    None
+}
+
+/// First descendant of `node` (depth-first) with the given kind.
+fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == kind {
+            return Some(child);
+        }
+        if let Some(found) = find_descendant(child, kind) {
+            return Some(found);
+        }
+    }
+    None
+}
+
 fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut Vec<IndexedSymbol>) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -103,7 +219,8 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
             "class_declaration" => {
                 let kind = class_kind(child);
                 if let Some(name) = name_field(child) {
-                    push(out, name, src, kind, package, container);
+                    let sts = supertypes_of(child, src);
+                    push_type(out, name, src, kind, package, container, sts);
                     let cname = node_text(name, src).to_string();
                     let mut c2 = child.walk();
                     for body in child.named_children(&mut c2) {
@@ -115,27 +232,34 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
             }
             "object_declaration" => {
                 if let Some(name) = name_field(child) {
-                    push(out, name, src, SymbolKind::Object, package, container);
+                    let sts = supertypes_of(child, src);
+                    push_type(out, name, src, SymbolKind::Object, package, container, sts);
                     let cname = node_text(name, src).to_string();
-                    if let Some(body) = crate::parser::child_of_kind(child, "class_body") {
+                    if let Some(body) = child_of_kind(child, "class_body") {
                         walk(body, src, package, Some(&cname), out);
                     }
                 }
             }
             // Companion members belong to the enclosing class (keep `container`).
             "companion_object" => {
-                if let Some(body) = crate::parser::child_of_kind(child, "class_body") {
+                if let Some(body) = child_of_kind(child, "class_body") {
                     walk(body, src, package, container, out);
                 }
             }
             "function_declaration" => {
                 if let Some(name) = name_field(child) {
-                    push(out, name, src, SymbolKind::Function, package, container);
+                    // An extension receiver is only meaningful for a top-level function
+                    // (`container.is_none()`); a member function's leading `user_type` would be a
+                    // different shape, but `extension_receiver` keys off the `name:` boundary so it
+                    // is correct either way. We record it unconditionally.
+                    let recv = extension_receiver(child, src);
+                    push_ext(out, name, src, SymbolKind::Function, package, container, recv.as_deref());
                 }
                 // Do NOT recurse into the body: it only contains locals.
             }
             "property_declaration" => {
-                push_property_names(child, src, package, container, out);
+                let recv = extension_receiver(child, src);
+                push_property_names(child, src, package, container, recv.as_deref(), out);
             }
             "enum_entry" => {
                 if let Some(id) = first_ident(child) {
@@ -213,5 +337,53 @@ object Reg { fun add() {} }
         assert!(got.contains(&"main"));
         assert!(!got.contains(&"secret"));
         assert!(!got.contains(&"nested"));
+    }
+
+    #[test]
+    fn supertypes_recorded() {
+        let src = "class Dog : Base(), Animal {\n    fun bark() {}\n}\n";
+        let syms = index(src);
+        let dog = syms.iter().find(|s| s.name == "Dog").unwrap();
+        assert_eq!(dog.supertypes, vec!["Base".to_string(), "Animal".to_string()]);
+        // A type with no supertypes has an empty list.
+        let bark = syms.iter().find(|s| s.name == "bark").unwrap();
+        assert!(bark.supertypes.is_empty());
+    }
+
+    #[test]
+    fn extension_receiver_recorded() {
+        let src = "fun Dog.fetch() {}\nfun plain(x: String): String = x\n";
+        let syms = index(src);
+        let fetch = syms.iter().find(|s| s.name == "fetch").unwrap();
+        assert_eq!(fetch.ext_receiver.as_deref(), Some("Dog"));
+        let plain = syms.iter().find(|s| s.name == "plain").unwrap();
+        assert_eq!(plain.ext_receiver, None);
+    }
+
+    #[test]
+    fn extension_receiver_nullable_stripped() {
+        let src = "fun String?.ext(): Int = 1\n";
+        let syms = index(src);
+        let ext = syms.iter().find(|s| s.name == "ext").unwrap();
+        assert_eq!(ext.ext_receiver.as_deref(), Some("String"));
+    }
+
+    #[test]
+    fn extension_property_receiver_recorded() {
+        let src = "val Dog.prop: Int get() = 1\nval plainProp: Int = 1\n";
+        let syms = index(src);
+        let prop = syms.iter().find(|s| s.name == "prop").unwrap();
+        assert_eq!(prop.ext_receiver.as_deref(), Some("Dog"));
+        let plain = syms.iter().find(|s| s.name == "plainProp").unwrap();
+        assert_eq!(plain.ext_receiver, None);
+    }
+
+    #[test]
+    fn delegated_property_is_not_an_extension() {
+        // `val x by lazy { }` must NOT register a receiver (the delegate is a property_delegate).
+        let src = "val x by lazy { 1 }\n";
+        let syms = index(src);
+        let x = syms.iter().find(|s| s.name == "x").unwrap();
+        assert_eq!(x.ext_receiver, None);
     }
 }

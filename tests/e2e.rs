@@ -113,5 +113,51 @@ async fn initialize_open_and_goto_definition() {
         "completion must offer `helper`: {items:?}"
     );
 
+    // textDocument/completion after a dot (Stage B member completion). Open a file with a class and
+    // a trailing-dot receiver; the response must include the receiver type's member.
+    let uri2: Uri = "file:///tmp/ktlsp_e2e/Member.kt".parse().unwrap();
+    let text2 = "class Box {\n    fun open() {}\n}\nfun main() {\n    val b = Box()\n    b.\n}\n";
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri2.clone(),
+                language_id: "kotlin".into(),
+                version: 1,
+                text: text2.into(),
+            },
+        })
+        .await;
+
+    // Position the cursor right after the `b.` on its line.
+    let dot_line = text2.lines().position(|l| l.trim() == "b.").unwrap() as u32;
+    let dot_col = text2
+        .lines()
+        .nth(dot_line as usize)
+        .unwrap()
+        .find("b.")
+        .map(|c| c + "b.".len())
+        .unwrap() as u32;
+    let member_comp = backend
+        .completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri2.clone() },
+                position: Position { line: dot_line, character: dot_col },
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("member completion should be present after a dot");
+    let member_items = match member_comp {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    assert!(
+        member_items.iter().any(|i| i.label == "open"),
+        "member completion must offer `open`: {member_items:?}"
+    );
+
     assert!(backend.shutdown().await.is_ok());
 }

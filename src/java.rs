@@ -73,14 +73,14 @@ fn push(
     package: &str,
     container: Option<&str>,
 ) {
-    out.push(IndexedSymbol {
-        name: node_text(name_node, src).to_string(),
+    out.push(IndexedSymbol::new(
+        node_text(name_node, src),
         kind,
-        package: package.to_string(),
-        container: container.map(str::to_string),
-        start_byte: name_node.start_byte(),
-        end_byte: name_node.end_byte(),
-    });
+        package,
+        container.map(str::to_string),
+        name_node.start_byte(),
+        name_node.end_byte(),
+    ));
 }
 
 fn type_decl(

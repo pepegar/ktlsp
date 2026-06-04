@@ -252,14 +252,14 @@ fn default_import_stdlib() {
     ws.open("Main.kt".to_string(), clean);
     ws.index.replace_file(
         "stdlib://Collections.kt",
-        vec![IndexedSymbol {
-            name: "listOf".to_string(),
-            kind: SymbolKind::Function,
-            package: "kotlin.collections".to_string(),
-            container: None,
-            start_byte: 0,
-            end_byte: 6,
-        }],
+        vec![IndexedSymbol::new(
+            "listOf",
+            SymbolKind::Function,
+            "kotlin.collections",
+            None,
+            0,
+            6,
+        )],
         Tier::Durable,
     );
     let got: HashSet<String> = ws
@@ -355,6 +355,158 @@ fn after_dot_unicode_with_space_none() {
 fn inside_string_interpolation_none() {
     // An identifier inside a `${...}` string template expression must be silently omitted.
     check_none("fun f() { val s = \"x ${y/*^*/}\" }\n");
+}
+
+// --------------------------------------------------------------------------------------------
+// Stage B: member completion after a dot (`receiver.`)
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn own_members_after_dot() {
+    check_contains(
+        "class Box {\n    fun open() {}\n    val size = 1\n}\nfun main() {\n    val b = Box()\n    b./*^*/\n}\n",
+        &["open", "size"],
+    );
+}
+
+#[test]
+fn partial_member_prefix_filters() {
+    // A partially-typed selector filters the member set by prefix.
+    let got = labels(
+        "class Box {\n    fun open() {}\n    fun close() {}\n    val size = 1\n}\nfun main() {\n    val b = Box()\n    b.op/*^*/\n}\n",
+    )
+    .unwrap();
+    assert!(got.contains("open"), "got {got:?}");
+    assert!(!got.contains("close"), "prefix `op` must exclude `close`: {got:?}");
+    assert!(!got.contains("size"), "prefix `op` must exclude `size`: {got:?}");
+}
+
+#[test]
+fn inherited_members_via_supertype() {
+    check_contains(
+        "open class Base {\n    fun b() {}\n}\nclass Dog : Base() {\n    fun bark() {}\n}\nfun main() {\n    val d = Dog()\n    d./*^*/\n}\n",
+        &["bark", "b"],
+    );
+}
+
+#[test]
+fn extension_function_applies() {
+    check_contains(
+        "class Dog {\n    fun bark() {}\n}\nfun Dog.fetch() {}\nfun main() {\n    val d = Dog()\n    d./*^*/\n}\n",
+        &["fetch", "bark"],
+    );
+}
+
+#[test]
+fn extension_on_supertype_applies() {
+    // An extension on an interface applies to a class implementing it.
+    check_contains(
+        "interface Iface {\n    fun ifaceMethod() {}\n}\nclass Impl : Iface {\n    fun own() {}\n}\nfun Iface.ext() {}\nfun main() {\n    val x = Impl()\n    x./*^*/\n}\n",
+        &["ext", "ifaceMethod", "own"],
+    );
+}
+
+#[test]
+fn companion_member_after_type_name() {
+    // `Foo.` (bare type name) resolves the type; companion members are attributed to the enclosing
+    // class container, so they appear. (v1: instance members also appear — see the documented
+    // limitation test below.)
+    check_contains(
+        "class Foo {\n    companion object {\n        fun create() {}\n    }\n}\nfun main() {\n    Foo./*^*/\n}\n",
+        &["create"],
+    );
+}
+
+#[test]
+fn enum_entries_after_type_name() {
+    check_contains(
+        "enum class Color {\n    RED, GREEN\n}\nfun main() {\n    Color./*^*/\n}\n",
+        &["RED", "GREEN"],
+    );
+}
+
+#[test]
+fn nullable_receiver_strips_question_mark() {
+    check_contains(
+        "class Dog {\n    fun bark() {}\n}\nfun f(d: Dog?) {\n    d?./*^*/\n}\n",
+        &["bark"],
+    );
+}
+
+#[test]
+fn nullable_annotation_strips_question_mark() {
+    // `val d: Dog?` annotation, plain `.` access — the nullable wrapper is stripped during inference.
+    check_contains(
+        "class Dog {\n    fun bark() {}\n}\nfun main() {\n    val d: Dog? = null\n    d?./*^*/\n}\n",
+        &["bark"],
+    );
+}
+
+#[test]
+fn this_receiver_members() {
+    check_contains(
+        "class Box {\n    fun open() {}\n    val size = 1\n    fun use() {\n        this./*^*/\n    }\n}\n",
+        &["open", "size"],
+    );
+}
+
+#[test]
+fn constructor_call_receiver() {
+    // `Box().` directly — the receiver is a call_expression whose callee is a known type.
+    check_contains(
+        "class Box {\n    fun open() {}\n}\nfun main() {\n    Box()./*^*/\n}\n",
+        &["open"],
+    );
+}
+
+#[test]
+fn param_receiver_members() {
+    // A parameter with an explicit type annotation.
+    check_contains(
+        "class Box {\n    fun open() {}\n}\nfun f(b: Box) {\n    b./*^*/\n}\n",
+        &["open"],
+    );
+}
+
+#[test]
+fn unknown_receiver_type_yields_nothing() {
+    // The receiver type cannot be inferred (Unknown is not indexed) -> silent omission.
+    check_none("fun f(x: Unknown) {\n    x./*^*/\n}\n");
+}
+
+#[test]
+fn untyped_local_receiver_yields_nothing() {
+    // A local whose initializer is not a constructor call of a known type -> silent omission.
+    check_none("fun main() {\n    val x = 1\n    x./*^*/\n}\n");
+}
+
+#[test]
+fn supertype_cycle_terminates() {
+    // A `: B` / `: A` cycle must not hang; assert completion returns (own members at least).
+    check_contains(
+        "class A : B() {\n    fun aMethod() {}\n}\nclass B : A() {\n    fun bMethod() {}\n}\nfun main() {\n    val a = A()\n    a./*^*/\n}\n",
+        &["aMethod"],
+    );
+}
+
+#[test]
+fn cross_file_receiver_members() {
+    // The receiver type is declared in another file (same package -> visible).
+    check_contains(
+        "//- Box.kt\npackage app\nclass Box {\n    fun open() {}\n}\n//- Main.kt\npackage app\nfun main() {\n    val b = Box()\n    b./*^*/\n}\n",
+        &["open"],
+    );
+}
+
+#[test]
+fn local_shadows_bare_type_name() {
+    // `val Dog = Dog()` then `Dog.` — the local instance wins; we complete on the instance's
+    // members, NOT the type's static/companion members. Here both yield `bark`, so we assert the
+    // result is present and (since there's no companion) is just instance members.
+    check_contains(
+        "class Dog {\n    fun bark() {}\n}\nfun main() {\n    val Dog = Dog()\n    Dog./*^*/\n}\n",
+        &["bark"],
+    );
 }
 
 // --------------------------------------------------------------------------------------------

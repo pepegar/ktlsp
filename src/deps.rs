@@ -68,6 +68,12 @@ fn symcache_dir() -> PathBuf {
     cache_home().join("symcache")
 }
 
+/// Bumped whenever the serialized `IndexedSymbol` layout changes. bincode is positional /
+/// non-self-describing, so a layout shift (e.g. adding `supertypes`/`ext_receiver`) makes old
+/// `.bin` caches deserialize wrong; folding this tag into the fingerprint forces a one-time
+/// re-parse instead of relying on the corrupt-cache fallback (which only logs a warning).
+const SYMCACHE_VERSION: &[u8] = b"v2";
+
 /// A cheap, stat-only fingerprint of a resolved jar (path + mtime + size). Published jars are
 /// immutable, so this is a stable cache key without reading the jar's contents; any content change
 /// (re-download, SNAPSHOT update) changes size/mtime and misses the cache.
@@ -80,6 +86,8 @@ fn jar_fingerprint(path: &Path) -> Option<String> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut hasher = Sha256::new();
+    hasher.update(SYMCACHE_VERSION);
+    hasher.update(b"|");
     hasher.update(path.to_string_lossy().as_bytes());
     hasher.update(b"|");
     hasher.update(mtime.to_le_bytes());

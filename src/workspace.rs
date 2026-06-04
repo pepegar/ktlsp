@@ -147,13 +147,60 @@ impl Workspace {
         resolve::goto(&self.index, key, &text, &tree, offset)
     }
 
-    /// `textDocument/completion` (Stage A: scope/name completion). Returns visible names whose
-    /// prefix matches the cursor — locals/params/type-params, same-file members + top-level,
-    /// cross-file/imported/default-import top-level names, import aliases, and Kotlin keywords.
-    /// Returns `None` unless the cursor is in a plain `ScopeName` position (after-dot, import,
-    /// string/comment/number all decline — silent omission). Open buffers reuse their cached tree
-    /// (no parse on the hot path), exactly like `goto_definition`.
+    /// `textDocument/completion`. Returns visible completion candidates at the cursor, or `None`
+    /// for a silent-omission position (string/comment/number/import).
+    ///
+    /// Two branches, keyed by the shared context detector:
+    /// - **`ScopeName`** (Stage A): in-scope names — locals/params/type-params, same-file members +
+    ///   top-level, cross-file/imported/default-import top-level names, import aliases, keywords.
+    /// - **`AfterDot`** (Stage B): the member set of the receiver's inferred type — own members,
+    ///   inherited members (supertype walk), and applicable extensions. Silent omission (`None`)
+    ///   when the receiver type can't be inferred.
+    ///
+    /// Open buffers reuse their cached tree (no parse on the hot path); a non-open file is read from
+    /// disk and parsed once, exactly like `goto_definition`.
     pub fn complete(&mut self, key: &str, offset: usize) -> Option<Vec<ScopeCompletion>> {
+        // Classify the context up front (cheap; uses the cached tree). Branch on it.
+        let ctx = {
+            let parsed;
+            let (text, tree): (&str, &Tree) = match self.open_docs.get(key) {
+                Some(doc) => (&doc.text, &doc.tree),
+                None => {
+                    let text = self.doc_text(key)?;
+                    parsed = (self.parser.parse(&text), text);
+                    (&parsed.1, &parsed.0)
+                }
+            };
+            complete::completion_context(tree, text, offset)
+        };
+        match ctx {
+            complete::CompletionContext::ScopeName => self.complete_scope_name(key, offset),
+            complete::CompletionContext::AfterDot => self.complete_after_dot(key, offset),
+            // Import / package / string / comment / number: silent omission.
+            complete::CompletionContext::Import | complete::CompletionContext::None => None,
+        }
+    }
+
+    /// Stage B: member completion after a dot. Receiver-type inference reuses the S6 machinery; the
+    /// trailing-dot parse collapse is handled by splicing a synthetic placeholder selector in at the
+    /// cursor and reparsing (the partial-selector text becomes the completion prefix).
+    fn complete_after_dot(&mut self, key: &str, offset: usize) -> Option<Vec<ScopeCompletion>> {
+        let text = self.doc_text(key)?;
+        let (prefix, synthetic, syn_offset) = complete::dot_recovery(&text, offset)?;
+        // Reparse the synthetic buffer so a bare `expr.` becomes a clean navigation_expression with
+        // the surrounding scope intact (the cached tree of the real buffer is the collapsed one).
+        let tree = self.parser.parse(&synthetic);
+        let receiver = complete::navigation_receiver_at(&tree, syn_offset)?;
+        let ty = resolve::infer_receiver_type(&self.index, receiver, &synthetic)?;
+        let members = complete::assemble_members(&self.index, &ty, &prefix);
+        // Silent omission: never return an empty list as a "successful" completion (it would
+        // suppress the client's fallback). An inferable type with zero matching members is treated
+        // as no result.
+        (!members.is_empty()).then_some(members)
+    }
+
+    /// Stage A: scope/name completion.
+    fn complete_scope_name(&mut self, key: &str, offset: usize) -> Option<Vec<ScopeCompletion>> {
         // Grab the cached (text, tree) without holding a borrow across the index access. For open
         // buffers we must clone the text+reparse-free tree out, because `complete_scope` needs the
         // tree while we also borrow `&self.index`. To avoid cloning the tree, do all tree-dependent
@@ -170,11 +217,6 @@ impl Workspace {
                 }
             };
 
-            // Stage A declines anything but a plain scope-name position (silent omission). This is
-            // also where Stage B will hook in for AfterDot.
-            if complete::completion_context(tree, text, offset) != complete::CompletionContext::ScopeName {
-                return None;
-            }
             let (prefix, _anchor) = complete::prefix_at(tree, text, offset);
             let items = complete::complete_scope(tree, text, offset, &prefix);
             let pkg = package_of(tree, text);
