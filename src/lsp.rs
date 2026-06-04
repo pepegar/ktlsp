@@ -12,7 +12,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
-use crate::complete::ScopeCompletion;
+use crate::complete::ShapedItem;
 use crate::symbol::{Def, SymbolKind};
 use crate::text::LineIndex;
 use crate::workspace::Workspace;
@@ -21,6 +21,9 @@ pub struct Backend {
     client: Client,
     ws: Arc<Mutex<Workspace>>,
     root: Mutex<Option<PathBuf>>,
+    /// Whether the client advertised snippet support in `initialize`. Set once; gates whether
+    /// completion items insert `name($0)` snippets or plain bare names.
+    snippets_supported: Mutex<bool>,
 }
 
 impl Backend {
@@ -29,6 +32,7 @@ impl Backend {
             client,
             ws: Arc::new(Mutex::new(Workspace::new())),
             root: Mutex::new(None),
+            snippets_supported: Mutex::new(false),
         }
     }
 }
@@ -116,6 +120,17 @@ impl LanguageServer for Backend {
         if root.is_some() {
             *self.root.lock().unwrap() = root;
         }
+
+        // Whether the client supports snippet insertion (`name($0)`). Option chain; default false.
+        let snippets = params
+            .capabilities
+            .text_document
+            .as_ref()
+            .and_then(|td| td.completion.as_ref())
+            .and_then(|c| c.completion_item.as_ref())
+            .and_then(|ci| ci.snippet_support)
+            .unwrap_or(false);
+        *self.snippets_supported.lock().unwrap() = snippets;
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -274,30 +289,40 @@ impl LanguageServer for Backend {
         // Synchronous; the lock is never held across an `.await`. `doc_text` is read ONCE only to
         // build the `LineIndex` and compute the byte offset, then the offset is passed to
         // `ws.complete`, which internally accesses the cached tree exactly like `goto_definition`.
-        let items = {
+        let snippets = *self.snippets_supported.lock().unwrap();
+        let (items, is_incomplete) = {
             let mut ws = self.ws.lock().unwrap();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
             };
             let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
-            match ws.complete(&key, offset) {
-                Some(cs) => cs.into_iter().map(to_completion_item).collect::<Vec<_>>(),
+            match ws.complete(&key, offset, snippets) {
+                Some(shaped) => {
+                    let incomplete = shaped.is_incomplete;
+                    let items =
+                        shaped.items.into_iter().map(to_completion_item).collect::<Vec<_>>();
+                    (items, incomplete)
+                }
                 None => return Ok(None),
             }
         };
 
-        Ok((!items.is_empty()).then(|| CompletionResponse::Array(items)))
+        Ok((!items.is_empty()).then(|| {
+            CompletionResponse::List(CompletionList { is_incomplete, items })
+        }))
     }
 }
 
-/// The single `SymbolKind`/`is_keyword` -> `CompletionItemKind` mapping site. The bare name is
-/// inserted (no parens/snippets) — correct and simple for Stage A.
-fn to_completion_item(c: ScopeCompletion) -> CompletionItem {
-    let kind = if c.is_keyword {
+/// The single `SymbolKind`/`is_keyword` -> `CompletionItemKind` mapping site. Stage C also threads
+/// through the shaped `sortText`/`filterText`/`insertText`/`insertTextFormat`/`detail` and the
+/// auto-import `additionalTextEdits` (a zero-width insert of one `import` line at column 0). This is
+/// the only `ls-types`-aware completion code.
+fn to_completion_item(it: ShapedItem) -> CompletionItem {
+    let kind = if it.is_keyword {
         CompletionItemKind::KEYWORD
     } else {
-        match c.kind {
+        match it.kind {
             SymbolKind::Class => CompletionItemKind::CLASS,
             SymbolKind::Interface => CompletionItemKind::INTERFACE,
             SymbolKind::Object => CompletionItemKind::MODULE,
@@ -311,8 +336,26 @@ fn to_completion_item(c: ScopeCompletion) -> CompletionItem {
         }
     };
     CompletionItem {
-        label: c.label,
+        label: it.label,
         kind: Some(kind),
+        sort_text: Some(it.sort_text),
+        filter_text: Some(it.filter_text),
+        insert_text: Some(it.insert_text),
+        insert_text_format: Some(if it.is_snippet {
+            InsertTextFormat::SNIPPET
+        } else {
+            InsertTextFormat::PLAIN_TEXT
+        }),
+        detail: it.detail,
+        additional_text_edits: it.auto_import.map(|imp| {
+            vec![TextEdit {
+                range: Range {
+                    start: Position { line: imp.line, character: 0 },
+                    end: Position { line: imp.line, character: 0 },
+                },
+                new_text: format!("{}\n", imp.text),
+            }]
+        }),
         ..Default::default()
     }
 }

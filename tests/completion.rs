@@ -11,6 +11,7 @@
 
 use std::collections::HashSet;
 
+use ktlsp::complete::{ShapedCompletions, ShapedItem};
 use ktlsp::index::Tier;
 use ktlsp::symbol::{IndexedSymbol, SymbolKind};
 use ktlsp::workspace::Workspace;
@@ -75,17 +76,38 @@ fn parse_fixture(input: &str) -> Fixture {
     }
 }
 
-/// Build a workspace, open every fixture file, return the completion labels at the cursor (or
-/// `None` when completion declines).
-fn labels(input: &str) -> Option<HashSet<String>> {
+/// Build a workspace, open every fixture file, return the full ordered shaped completion result at
+/// the cursor (or `None` when completion declines). `snippets_supported` defaults true here.
+fn shaped(input: &str) -> Option<ShapedCompletions> {
+    shaped_with(input, true)
+}
+
+fn shaped_with(input: &str, snippets_supported: bool) -> Option<ShapedCompletions> {
     let fx = parse_fixture(input);
     let mut ws = Workspace::new();
     for (key, text) in &fx.files {
         ws.open(key.clone(), text.clone());
     }
     let (cursor_key, cursor_off) = &fx.cursor;
-    ws.complete(cursor_key, *cursor_off)
-        .map(|cs| cs.into_iter().map(|c| c.label).collect())
+    ws.complete(cursor_key, *cursor_off, snippets_supported)
+}
+
+/// The ordered list of `(label)` from the shaped result.
+fn ordered_labels(input: &str) -> Vec<String> {
+    shaped(input)
+        .map(|s| s.items.into_iter().map(|i| i.label).collect())
+        .unwrap_or_default()
+}
+
+/// Find the first shaped item with the given label.
+fn item_with<'a>(shaped: &'a ShapedCompletions, label: &str) -> Option<&'a ShapedItem> {
+    shaped.items.iter().find(|i| i.label == label)
+}
+
+/// Build a workspace, open every fixture file, return the completion labels at the cursor (or
+/// `None` when completion declines).
+fn labels(input: &str) -> Option<HashSet<String>> {
+    shaped(input).map(|s| s.items.into_iter().map(|i| i.label).collect())
 }
 
 fn check_contains(input: &str, expected: &[&str]) {
@@ -209,11 +231,16 @@ fn cross_file_explicit_import() {
 }
 
 #[test]
-fn cross_file_other_package_without_import_excluded() {
-    check_excludes(
-        "//- Other.kt\npackage other\nfun widgetXyz() {}\n//- Main.kt\npackage app\nfun main() { wid/*^*/ }\n",
-        &["widgetXyz"],
-    );
+fn cross_file_other_package_offered_with_auto_import() {
+    // Stage C change (was: excluded in Stage A): an indexed top-level symbol in another, unimported
+    // package is now OFFERED, but only WITH an auto-import edit for its own FQN — never silently as
+    // if already in scope.
+    let input =
+        "//- Other.kt\npackage other\nfun widgetXyz() {}\n//- Main.kt\npackage app\nfun main() { wid/*^*/ }\n";
+    let s = shaped(input).expect("completions");
+    let widget = item_with(&s, "widgetXyz").expect("widgetXyz now offered with an import");
+    let imp = widget.auto_import.as_ref().expect("other-package symbol carries an auto-import");
+    assert_eq!(imp.text, "import other.widgetXyz");
 }
 
 #[test]
@@ -263,8 +290,9 @@ fn default_import_stdlib() {
         Tier::Durable,
     );
     let got: HashSet<String> = ws
-        .complete("Main.kt", off)
+        .complete("Main.kt", off, true)
         .expect("expected completions")
+        .items
         .into_iter()
         .map(|c| c.label)
         .collect();
@@ -519,4 +547,174 @@ fn hoisted_local_fun_not_offered() {
     // Kotlin hoists local functions, but Stage A inherits scan_block's uniform before-use filter,
     // so a local `fun` declared textually below the cursor is not offered.
     check_contains("fun main() {\n    hoi/*^*/\n    fun hoisted() {}\n}\n", &["hoisted"]);
+}
+
+// --------------------------------------------------------------------------------------------
+// Stage C: ranking, snippets, detail, auto-import (the ordered ShapedItem list)
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn ranking_shorter_before_longer_from_fixture() {
+    // `greet`, `greeting`, `abgreet` as same-file top-level functions; prefix `gr`.
+    let input = "fun greet() {}\nfun greeting() {}\nfun abgreet() {}\nfun main() { gr/*^*/ }\n";
+    let labels = ordered_labels(input);
+    assert!(labels.contains(&"greet".to_string()), "greet present: {labels:?}");
+    assert!(labels.contains(&"greeting".to_string()), "greeting present: {labels:?}");
+    assert!(!labels.contains(&"abgreet".to_string()), "abgreet must be filtered out: {labels:?}");
+    let gi = labels.iter().position(|l| l == "greet").unwrap();
+    let gti = labels.iter().position(|l| l == "greeting").unwrap();
+    assert!(gi < gti, "shorter `greet` ranks before `greeting`: {labels:?}");
+}
+
+#[test]
+fn sort_text_is_byte_monotone() {
+    // The raw sort_text bytes must be monotone non-decreasing across the whole ranked output (no
+    // accidental delimiter/space).
+    let input = "fun greet() {}\nfun greeting() {}\nfun main() { gr/*^*/ }\n";
+    let s = shaped(input).expect("completions");
+    for w in s.items.windows(2) {
+        assert!(
+            w[0].sort_text <= w[1].sort_text,
+            "sort_text not monotone: {:?} > {:?}",
+            w[0].sort_text,
+            w[1].sort_text
+        );
+    }
+}
+
+#[test]
+fn function_snippet_from_fixture() {
+    // `g.` on a `Greeter` receiver with a zero-arg `potato` -> snippet `potato()$0`.
+    let input = "class Greeter {\n    fun potato() {}\n    fun greet() {}\n}\nfun main() {\n    val g = Greeter()\n    g.po/*^*/\n}\n";
+    let s = shaped(input).expect("member completions");
+    let potato = item_with(&s, "potato").expect("potato present");
+    assert_eq!(potato.insert_text, "potato()$0");
+    assert!(potato.is_snippet);
+    assert_eq!(potato.kind, SymbolKind::Function);
+}
+
+#[test]
+fn function_snippet_with_params_from_fixture() {
+    // A function with parameters -> snippet `name($0)`.
+    let input = "class Box {\n    fun put(x: Int) {}\n}\nfun main() {\n    val b = Box()\n    b.pu/*^*/\n}\n";
+    let s = shaped(input).expect("member completions");
+    let put = item_with(&s, "put").expect("put present");
+    assert_eq!(put.insert_text, "put($0)");
+    assert!(put.is_snippet);
+}
+
+#[test]
+fn property_and_class_plain_insert() {
+    // A property member is a plain insert with kind PROPERTY.
+    let input = "class Box {\n    val tag = 1\n    fun open() {}\n}\nfun main() {\n    val b = Box()\n    b.ta/*^*/\n}\n";
+    let s = shaped(input).expect("member completions");
+    let tag = item_with(&s, "tag").expect("tag present");
+    assert_eq!(tag.insert_text, "tag");
+    assert!(!tag.is_snippet);
+    assert_eq!(tag.kind, SymbolKind::Property);
+
+    // A class in scope position is a plain insert with kind CLASS.
+    let input2 = "class Greeter {}\nfun main() { Gre/*^*/ }\n";
+    let s2 = shaped(input2).expect("scope completions");
+    let greeter = item_with(&s2, "Greeter").expect("Greeter present");
+    assert_eq!(greeter.insert_text, "Greeter");
+    assert!(!greeter.is_snippet);
+    assert_eq!(greeter.kind, SymbolKind::Class);
+}
+
+#[test]
+fn no_snippet_when_client_lacks_support() {
+    // Same zero-arg function, but snippets_supported = false -> bare name, no `$0`.
+    let input = "class Greeter {\n    fun potato() {}\n}\nfun main() {\n    val g = Greeter()\n    g.po/*^*/\n}\n";
+    let s = shaped_with(input, false).expect("member completions");
+    let potato = item_with(&s, "potato").expect("potato present");
+    assert_eq!(potato.insert_text, "potato");
+    assert!(!potato.is_snippet);
+    assert!(!potato.insert_text.contains("$0"));
+}
+
+#[test]
+fn detail_string_for_member() {
+    let input = "package demo\nclass Greeter {\n    fun greet() {}\n}\nfun main() {\n    val g = Greeter()\n    g.gr/*^*/\n}\n";
+    let s = shaped(input).expect("member completions");
+    let greet = item_with(&s, "greet").expect("greet present");
+    assert_eq!(greet.detail.as_deref(), Some("fun greet in Greeter (demo)"));
+}
+
+#[test]
+fn auto_import_for_type_from_another_package() {
+    // `Helper` in package `lib`, referenced (unimported) from package `demo`.
+    let input = "//- Helper.kt\npackage lib\nclass Helper\n//- Main.kt\npackage demo\nfun main() { Hel/*^*/ }\n";
+    let s = shaped(input).expect("completions");
+    let helper = item_with(&s, "Helper").expect("Helper present");
+    let imp = helper.auto_import.as_ref().expect("auto_import present for unimported type");
+    assert_eq!(imp.text, "import lib.Helper");
+    // The line is after the `package demo` line (row 0) -> row 1.
+    assert_eq!(imp.line, 1);
+}
+
+#[test]
+fn no_auto_import_for_same_package_symbol() {
+    // A same-package type needs no import.
+    let input = "//- Helper.kt\npackage demo\nclass Helper\n//- Main.kt\npackage demo\nfun main() { Hel/*^*/ }\n";
+    let s = shaped(input).expect("completions");
+    let helper = item_with(&s, "Helper").expect("Helper present");
+    assert_eq!(helper.auto_import, None, "same-package symbol must not auto-import");
+}
+
+#[test]
+fn no_auto_import_for_already_imported_symbol() {
+    let input = "//- Helper.kt\npackage lib\nclass Helper\n//- Main.kt\npackage demo\nimport lib.Helper\nfun main() { Hel/*^*/ }\n";
+    let s = shaped(input).expect("completions");
+    let helper = item_with(&s, "Helper").expect("Helper present");
+    assert_eq!(helper.auto_import, None, "already-imported symbol must not auto-import");
+}
+
+#[test]
+fn auto_import_sorted_position() {
+    // File already imports `a.A` and `c.C`; completing an unimported `b.B` lands between them.
+    let input = "//- A.kt\npackage a\nclass A\n//- B.kt\npackage b\nclass Bxx\n//- C.kt\npackage c\nclass C\n//- Main.kt\npackage demo\nimport a.A\nimport c.C\nfun main() { Bx/*^*/ }\n";
+    let s = shaped(input).expect("completions");
+    let b = item_with(&s, "Bxx").expect("Bxx present");
+    let imp = b.auto_import.as_ref().expect("auto_import present");
+    assert_eq!(imp.text, "import b.Bxx");
+    // Imports are on rows 1 (`import a.A`) and 2 (`import c.C`); `b.Bxx` sorts between them, so it
+    // takes the row of `c.C` (2), pushing `c.C` down.
+    assert_eq!(imp.line, 2, "import must keep the import block sorted");
+}
+
+#[test]
+fn extension_auto_import_by_own_fqn() {
+    // An extension `fun Box.second()` in package `ext`, completed on a `Box` receiver, `ext` not
+    // imported -> auto-import the extension's OWN FQN.
+    let input = "//- Box.kt\npackage demo\nclass Box {\n    fun first() {}\n}\n//- Ext.kt\npackage ext\nimport demo.Box\nfun Box.second() {}\n//- Main.kt\npackage demo\nfun main() {\n    val b = Box()\n    b.se/*^*/\n}\n";
+    let s = shaped(input).expect("member completions");
+    let second = item_with(&s, "second").expect("extension `second` present");
+    let imp = second.auto_import.as_ref().expect("extension auto_import present");
+    assert_eq!(imp.text, "import ext.second", "extension imports by its OWN fqn");
+    assert_eq!(second.kind, SymbolKind::Function);
+}
+
+#[test]
+fn extension_already_imported_no_auto_import() {
+    // The extension's package is imported via wildcard -> visible, no auto-import.
+    let input = "//- Box.kt\npackage demo\nclass Box {\n    fun first() {}\n}\n//- Ext.kt\npackage ext\nimport demo.Box\nfun Box.second() {}\n//- Main.kt\npackage demo\nimport ext.*\nfun main() {\n    val b = Box()\n    b.se/*^*/\n}\n";
+    let s = shaped(input).expect("member completions");
+    let second = item_with(&s, "second").expect("extension `second` present");
+    assert_eq!(second.auto_import, None, "wildcard-imported extension must not auto-import");
+}
+
+#[test]
+fn silent_omission_unknown_receiver() {
+    // The receiver type can't be inferred -> None.
+    assert!(shaped("fun f(x: Unknown) {\n    x./*^*/\n}\n").is_none());
+}
+
+#[test]
+fn silent_omission_non_completion_positions() {
+    assert!(shaped("import kotlin.col/*^*/\nfun main() {}\n").is_none());
+    assert!(shaped("package com.ex/*^*/\nfun main() {}\n").is_none());
+    assert!(shaped("fun main() { val s = \"gr/*^*/\" }\n").is_none());
+    assert!(shaped("fun main() {\n    // gr/*^*/\n}\n").is_none());
+    assert!(shaped("fun main() {\n    val n = 12/*^*/\n}\n").is_none());
 }

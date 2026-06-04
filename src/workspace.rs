@@ -8,10 +8,13 @@ use std::path::Path;
 use tree_sitter::Tree;
 use walkdir::{DirEntry, WalkDir};
 
-use crate::complete::{self, ScopeCompletion};
-use crate::index::{Index, RefEntry, Tier};
+use crate::complete::{self, ImportAnchor, ScopeCompletion, ShapedCompletions};
+use crate::index::{Entry, Index, RefEntry, Tier};
 use crate::indexer::{extract_symbols, extract_usages};
-use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_of, KotlinParser};
+use crate::parser::{
+    compute_edit, identifier_at, imports_of, join_identifiers, node_text, package_of, Import,
+    KotlinParser,
+};
 use crate::resolve;
 use crate::symbol::{Def, SymbolKind};
 
@@ -159,7 +162,12 @@ impl Workspace {
     ///
     /// Open buffers reuse their cached tree (no parse on the hot path); a non-open file is read from
     /// disk and parsed once, exactly like `goto_definition`.
-    pub fn complete(&mut self, key: &str, offset: usize) -> Option<Vec<ScopeCompletion>> {
+    pub fn complete(
+        &mut self,
+        key: &str,
+        offset: usize,
+        snippets_supported: bool,
+    ) -> Option<ShapedCompletions> {
         // Classify the context up front (cheap; uses the cached tree). Branch on it.
         let ctx = {
             let parsed;
@@ -173,18 +181,44 @@ impl Workspace {
             };
             complete::completion_context(tree, text, offset)
         };
-        match ctx {
-            complete::CompletionContext::ScopeName => self.complete_scope_name(key, offset),
-            complete::CompletionContext::AfterDot => self.complete_after_dot(key, offset),
+        // Assemble owned candidates (with stamped fields) + the import layout under the lock; then
+        // run the pure ranking/shaping pass + per-item import-line resolution over that owned data.
+        let (prefix, candidates, layout) = match ctx {
+            complete::CompletionContext::ScopeName => self.assemble_scope_name(key, offset)?,
+            complete::CompletionContext::AfterDot => self.assemble_after_dot(key, offset)?,
             // Import / package / string / comment / number: silent omission.
-            complete::CompletionContext::Import | complete::CompletionContext::None => None,
+            complete::CompletionContext::Import | complete::CompletionContext::None => return None,
+        };
+
+        let mut shaped = complete::shape(ctx, &prefix, candidates, snippets_supported);
+        // Resolve each surviving item's auto-import line from the file's import layout. `shape`
+        // leaves `ImportEdit.line` at 0 (the text is set); the line depends on the live tree, so it
+        // is resolved here (where the layout is known).
+        if let Some((sorted_imports, anchor)) = layout.as_ref() {
+            for item in &mut shaped.items {
+                if let Some(imp) = item.auto_import.as_mut() {
+                    let fqn = imp.text.strip_prefix("import ").unwrap_or(&imp.text);
+                    imp.line = complete::resolve_import_line(fqn, sorted_imports, *anchor);
+                }
+            }
         }
+        // Silent omission: an empty result is never a "success".
+        (!shaped.items.is_empty()).then_some(shaped)
     }
 
-    /// Stage B: member completion after a dot. Receiver-type inference reuses the S6 machinery; the
-    /// trailing-dot parse collapse is handled by splicing a synthetic placeholder selector in at the
-    /// cursor and reparsing (the partial-selector text becomes the completion prefix).
-    fn complete_after_dot(&mut self, key: &str, offset: usize) -> Option<Vec<ScopeCompletion>> {
+    /// Stage B assembly: member completion after a dot. Receiver-type inference reuses the S6
+    /// machinery; the trailing-dot parse collapse is handled by splicing a synthetic placeholder
+    /// selector in at the cursor and reparsing (the partial-selector text becomes the prefix).
+    /// Instance/inherited members are always in scope (reached through a receiver in scope), so they
+    /// carry no `import_path`; an applicable EXTENSION that is not yet visible gets its own FQN as
+    /// `import_path` (Kotlin imports extensions by their own fully-qualified name). The import layout
+    /// (computed from the synthetic tree — same imports/package as the real file) flows out so the
+    /// extension's import line can be resolved.
+    fn assemble_after_dot(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<(String, Vec<ScopeCompletion>, ImportLayout)> {
         let text = self.doc_text(key)?;
         let (prefix, synthetic, syn_offset) = complete::dot_recovery(&text, offset)?;
         // Reparse the synthetic buffer so a bare `expr.` becomes a clean navigation_expression with
@@ -192,20 +226,67 @@ impl Workspace {
         let tree = self.parser.parse(&synthetic);
         let receiver = complete::navigation_receiver_at(&tree, syn_offset)?;
         let ty = resolve::infer_receiver_type(&self.index, receiver, &synthetic)?;
-        let members = complete::assemble_members(&self.index, &ty, &prefix);
-        // Silent omission: never return an empty list as a "successful" completion (it would
-        // suppress the client's fallback). An inferable type with zero matching members is treated
-        // as no result.
-        (!members.is_empty()).then_some(members)
+
+        let pkg = package_of(&tree, &synthetic);
+        let imports = imports_of(&tree, &synthetic);
+        let vis = Visibility::new(&pkg, &imports);
+        let layout = import_layout(&tree, &synthetic);
+
+        let candidates = self.member_candidates(&ty, &prefix, &vis);
+        // Silent omission: an inferable type with zero matching members is treated as no result.
+        if candidates.is_empty() {
+            return None;
+        }
+        Some((prefix, candidates, layout))
     }
 
-    /// Stage A: scope/name completion.
-    fn complete_scope_name(&mut self, key: &str, offset: usize) -> Option<Vec<ScopeCompletion>> {
-        // Grab the cached (text, tree) without holding a borrow across the index access. For open
-        // buffers we must clone the text+reparse-free tree out, because `complete_scope` needs the
-        // tree while we also borrow `&self.index`. To avoid cloning the tree, do all tree-dependent
-        // work (context, prefix, scope) inside the borrow scope, collecting owned results.
-        let (prefix, mut items, pkg, imports) = {
+    /// Assemble the member set of type `ty` for `receiver.` completion as fully-stamped candidates:
+    /// own members (`container == ty`) UNION members inherited through the supertype chain UNION
+    /// applicable extensions (receiver == ty or a supertype). Deduped by `(label, kind)`. Each
+    /// candidate carries `tier`/`arity`/`package`/`container` from its `Entry`. Instance/inherited
+    /// members never carry `import_path` (reached through an in-scope receiver); an extension that is
+    /// not yet visible (per `vis`) carries its OWN FQN as `import_path` so it can be auto-imported.
+    fn member_candidates(&self, ty: &str, prefix: &str, vis: &Visibility) -> Vec<ScopeCompletion> {
+        let mut out: Vec<ScopeCompletion> = Vec::new();
+        let mut seen: std::collections::HashSet<(String, SymbolKind)> = std::collections::HashSet::new();
+        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut frontier: Vec<(String, usize)> = vec![(ty.to_string(), 0)];
+        while let Some((cur, depth)) = frontier.pop() {
+            if !visited.insert(cur.clone()) || depth > SUPERTYPE_DEPTH_CAP {
+                continue;
+            }
+            for e in self.index.members_of(&cur) {
+                push_member_candidate(&mut out, &mut seen, e, prefix, None);
+            }
+            for e in self.index.extensions_for(&cur) {
+                // An unimported extension is offered WITH its own FQN as an auto-import; a visible
+                // one (same package / explicitly imported / wildcard / default-import) gets none.
+                let import_path = if vis.is_visible(&e.sym.package, &e.sym.name) {
+                    None
+                } else {
+                    Some(fqn(&e.sym.package, &e.sym.name))
+                };
+                push_member_candidate(&mut out, &mut seen, e, prefix, import_path);
+            }
+            for sup in self.index.supertypes_of(&cur) {
+                frontier.push((sup, depth + 1));
+            }
+        }
+        out.truncate(MAX_COMPLETIONS);
+        out
+    }
+
+    /// Stage A assembly: scope/name completion. Returns the prefix, the owned stamped candidates,
+    /// and the file's import layout (for auto-import line resolution).
+    fn assemble_scope_name(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<(String, Vec<ScopeCompletion>, ImportLayout)> {
+        // Grab the cached (text, tree) without holding a borrow across the index access. Do all
+        // tree-dependent work (context, prefix, scope, import layout) inside the borrow scope,
+        // collecting owned results.
+        let (prefix, mut items, pkg, imports, layout) = {
             // Resolve the doc: open buffer (cached tree) or disk (parse once).
             let parsed;
             let (text, tree): (&str, &Tree) = match self.open_docs.get(key) {
@@ -221,13 +302,15 @@ impl Workspace {
             let items = complete::complete_scope(tree, text, offset, &prefix);
             let pkg = package_of(tree, text);
             let imports = imports_of(tree, text);
-            (prefix, items, pkg, imports)
+            let layout = import_layout(tree, text);
+            (prefix, items, pkg, imports, layout)
         };
 
         // Index-wide visible top-level names (skip the current file — its top-level symbols already
         // come from `complete_scope`'s source_file arm). Apply the SAME visibility rules
         // `resolve_cross_file` uses: explicit/alias import binds the name, OR same package, OR a
-        // wildcard import, OR a Kotlin default-import package.
+        // wildcard import, OR a Kotlin default-import package. A symbol that is none of those is an
+        // unimported (but indexed) top-level symbol — offered WITH an auto-import edit.
         let star_pkgs: Vec<String> = imports.iter().filter(|i| i.wildcard).map(|i| i.package()).collect();
         let explicit_names: std::collections::HashSet<&str> =
             imports.iter().filter(|i| !i.wildcard).filter_map(|i| i.local_name()).collect();
@@ -239,25 +322,36 @@ impl Workspace {
             if e.path == key {
                 continue;
             }
-            let visible = explicit_names.contains(e.sym.name.as_str())
+            let already_visible = explicit_names.contains(e.sym.name.as_str())
                 || e.sym.package == pkg
                 || star_pkgs.contains(&e.sym.package)
                 || resolve::is_default_import_pkg(&e.sym.package);
-            if !visible {
-                continue;
-            }
             let rank = match e.tier {
                 Tier::Volatile => 0,
                 Tier::Durable => 1,
             };
-            index_items.push((ScopeCompletion::new(e.sym.name.clone(), e.sym.kind), rank));
+            // An unimported symbol gets an auto-import (its own FQN); a visible one gets none.
+            let import_path = if already_visible {
+                None
+            } else {
+                Some(fqn(&e.sym.package, &e.sym.name))
+            };
+            let mut c = ScopeCompletion::new(e.sym.name.clone(), e.sym.kind);
+            c.tier = e.tier;
+            c.arity = e.sym.arity;
+            c.package = e.sym.package.clone();
+            c.container = e.sym.container.clone();
+            c.import_path = import_path;
+            index_items.push((c, rank));
         }
 
-        // Import aliases that match the prefix (the alias is the local name; kind unknown -> Object).
+        // Import aliases that match the prefix (the alias is the local name; kind unknown -> Object,
+        // already visible -> no import_path).
         for imp in &imports {
             if let Some(alias) = imp.alias.as_deref() {
                 if alias.starts_with(&prefix) {
-                    index_items.push((ScopeCompletion::new(alias.to_string(), SymbolKind::Object), 0));
+                    index_items
+                        .push((ScopeCompletion::new(alias.to_string(), SymbolKind::Object), 0));
                 }
             }
         }
@@ -283,7 +377,7 @@ impl Workspace {
         }
 
         items.truncate(MAX_COMPLETIONS);
-        Some(items)
+        Some((prefix, items, layout))
     }
 
     /// `textDocument/references`: all usage sites (as `Def` locations) of the symbol at `offset`.
@@ -394,9 +488,136 @@ impl Workspace {
     }
 }
 
-/// Cap on the number of completion candidates returned (UX contract: ~1000). High enough that a
-/// common prefix rarely truncates useful names; editors re-request as the prefix narrows.
-const MAX_COMPLETIONS: usize = 1000;
+/// Cap on the number of completion candidates assembled before shaping (UX contract: ~1000). High
+/// enough that a common prefix rarely truncates useful names; editors re-request as the prefix
+/// narrows. Equals `complete::RESULT_CAP` (the post-ranking cap), so assembly never starves shaping.
+const MAX_COMPLETIONS: usize = complete::RESULT_CAP;
+
+/// Depth cap on the supertype walk for member assembly: guards a pathologically deep (or cyclic,
+/// alongside the visited set) chain. Mirrors `complete::assemble_members`' cap.
+const SUPERTYPE_DEPTH_CAP: usize = 32;
+
+/// The file's import layout for auto-import line resolution: the alphabetically-sorted existing
+/// import `(path, 0-based row)` pairs plus the anchor (where to insert when there are no imports).
+/// `None` is used by member completion (which never auto-imports).
+type ImportLayout = Option<(Vec<(String, u32)>, ImportAnchor)>;
+
+/// A symbol's fully-qualified name (`package.name`), or the bare `name` when the package is empty.
+fn fqn(package: &str, name: &str) -> String {
+    if package.is_empty() {
+        name.to_string()
+    } else {
+        format!("{package}.{name}")
+    }
+}
+
+/// Stamp an indexed member/extension `Entry` into a completion candidate, prefix-filtered and
+/// deduped by `(label, kind)`. Carries `tier`/`arity`/`package`/`container`; `import_path` is
+/// `None` for instance/inherited members (reached through an in-scope receiver) and the extension's
+/// own FQN for an unimported extension.
+fn push_member_candidate(
+    out: &mut Vec<ScopeCompletion>,
+    seen: &mut std::collections::HashSet<(String, SymbolKind)>,
+    e: &Entry,
+    prefix: &str,
+    import_path: Option<String>,
+) {
+    let name = &e.sym.name;
+    if !name.starts_with(prefix) {
+        return;
+    }
+    if !seen.insert((name.clone(), e.sym.kind)) {
+        return;
+    }
+    let mut c = ScopeCompletion::new(name.clone(), e.sym.kind);
+    c.tier = e.tier;
+    c.arity = e.sym.arity;
+    c.package = e.sym.package.clone();
+    c.container = e.sym.container.clone();
+    c.import_path = import_path;
+    out.push(c);
+}
+
+/// The current file's name-visibility context, mirroring the rules `resolve_cross_file` /
+/// `assemble_scope_name` use: a name is visible if explicitly/alias-imported, in the same package,
+/// in a wildcard-imported package, or in a Kotlin default-import package.
+struct Visibility {
+    pkg: String,
+    star_pkgs: Vec<String>,
+    explicit_names: std::collections::HashSet<String>,
+}
+
+impl Visibility {
+    fn new(pkg: &str, imports: &[Import]) -> Self {
+        Visibility {
+            pkg: pkg.to_string(),
+            star_pkgs: imports.iter().filter(|i| i.wildcard).map(|i| i.package()).collect(),
+            explicit_names: imports
+                .iter()
+                .filter(|i| !i.wildcard)
+                .filter_map(|i| i.local_name().map(str::to_string))
+                .collect(),
+        }
+    }
+
+    fn is_visible(&self, package: &str, name: &str) -> bool {
+        self.explicit_names.contains(name)
+            || package == self.pkg
+            || self.star_pkgs.iter().any(|p| p == package)
+            || resolve::is_default_import_pkg(package)
+    }
+}
+
+/// Compute the file's import layout from the tree: the sorted `(import_path, 0-based row)` pairs and
+/// the `ImportAnchor`. The anchor decision tree (no ambiguity): (1) ≥1 import → anchor line =
+/// `last_import_row + 1`; (2) else a `package_header` → `package_row + 1`; (3) else → `0`. We derive
+/// every line from tree rows (one method — no "tree rows vs byte→line" ambiguity).
+fn import_layout(tree: &Tree, src: &str) -> ImportLayout {
+    let root = tree.root_node();
+    let mut imports: Vec<(String, u32)> = Vec::new();
+    let mut last_import_row: Option<u32> = None;
+    let mut package_row: Option<u32> = None;
+    let mut cursor = root.walk();
+    for child in root.named_children(&mut cursor) {
+        match child.kind() {
+            "package_header" => package_row = Some(child.start_position().row as u32),
+            "import" => {
+                let row = child.start_position().row as u32;
+                // Reuse `imports_of`'s per-node parse shape via a single Import.
+                let imp = parse_single_import(child, src);
+                imports.push((imp.path, row));
+                last_import_row = Some(row);
+            }
+            _ => {}
+        }
+    }
+    let anchor = ImportAnchor {
+        line: match (last_import_row, package_row) {
+            (Some(r), _) => r + 1,
+            (None, Some(r)) => r + 1,
+            (None, None) => 0,
+        },
+    };
+    imports.sort_by(|a, b| a.0.cmp(&b.0));
+    Some((imports, anchor))
+}
+
+/// Parse one `import` node into an `Import` (path/alias/wildcard). Mirrors `imports_of`'s per-node
+/// logic; kept local so `import_layout` can pair each path with its row.
+fn parse_single_import(node: tree_sitter::Node, src: &str) -> Import {
+    let wildcard = node_text(node, src).trim_end().ends_with('*');
+    let mut path = String::new();
+    let mut alias = None;
+    let mut c = node.walk();
+    for sub in node.named_children(&mut c) {
+        match sub.kind() {
+            "qualified_identifier" => path = join_identifiers(sub, src),
+            "identifier" => alias = Some(node_text(sub, src).to_string()),
+            _ => {}
+        }
+    }
+    Import { path, alias, wildcard }
+}
 
 /// Kotlin keywords valid as a leading token in a scope-name position. Soft / context-sensitive
 /// keywords (`by`, `get`, `set`, `field`, `it`, `constructor`, `init`) are intentionally EXCLUDED:

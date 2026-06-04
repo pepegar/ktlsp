@@ -66,6 +66,12 @@ pub struct IndexedSymbol {
     /// extensions on a receiver of that type (or a subtype).
     #[serde(default)]
     pub ext_receiver: Option<String>,
+    /// For a `Function`: the number of value parameters (`function_value_parameters` children),
+    /// for choosing the snippet shape (`name()$0` vs `name($0)`). `None` for non-functions and for
+    /// functions whose arity could not be determined. `#[serde(default)]` so older symcaches (which
+    /// lack the field) still deserialize.
+    #[serde(default)]
+    pub arity: Option<u8>,
 }
 
 impl IndexedSymbol {
@@ -88,6 +94,7 @@ impl IndexedSymbol {
             end_byte,
             supertypes: Vec::new(),
             ext_receiver: None,
+            arity: None,
         }
     }
 }

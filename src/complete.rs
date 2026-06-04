@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use tree_sitter::{Node, Tree};
 
-use crate::index::Index;
+use crate::index::{Index, Tier};
 use crate::parser::{child_of_kind, class_kind, first_ident, identifier_at, name_field, node_text};
 use crate::resolve::{use_kind, UseKind};
 use crate::symbol::SymbolKind;
@@ -39,7 +39,14 @@ pub enum CompletionContext {
     None,
 }
 
+/// Hard cap on the number of completion results returned to the client (UX contract: ~1000). The
+/// single source of truth; `workspace.rs` references this so the cap and the truncation point agree.
+pub const RESULT_CAP: usize = 1000;
+
 /// A single in-scope completion candidate. Carries no byte range (a completion is not a target).
+/// Stage C extends this with the per-candidate facts ranking/snippets/auto-import need; all the new
+/// fields default so the existing constructors (`new`/`keyword`) still compile, and locals/params/
+/// keywords/same-file members keep the defaults (never carry an `import_path`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ScopeCompletion {
     pub label: String,
@@ -47,15 +54,261 @@ pub struct ScopeCompletion {
     pub kind: SymbolKind,
     /// True for Kotlin keyword entries; the LSP layer maps these to `CompletionItemKind::KEYWORD`.
     pub is_keyword: bool,
+    /// Volatile (project) vs Durable (library), for the project-first ranking tiebreak.
+    pub tier: Tier,
+    /// Value-parameter count for the snippet shape (functions only; `None` for non-functions).
+    pub arity: Option<u8>,
+    /// Declaring package, for `detail` + auto-import + the package collision tiebreak.
+    pub package: String,
+    /// Enclosing type name for a member, for `detail`.
+    pub container: Option<String>,
+    /// The fully-qualified import path to insert if this symbol is not yet visible; `None` when it
+    /// is already visible (local/param/same-file/same-package/imported) or non-importable
+    /// (keyword/local/member).
+    pub import_path: Option<String>,
 }
 
 impl ScopeCompletion {
     pub fn new(label: impl Into<String>, kind: SymbolKind) -> Self {
-        ScopeCompletion { label: label.into(), kind, is_keyword: false }
+        ScopeCompletion {
+            label: label.into(),
+            kind,
+            is_keyword: false,
+            tier: Tier::Volatile,
+            arity: None,
+            package: String::new(),
+            container: None,
+            import_path: None,
+        }
     }
 
     pub fn keyword(label: impl Into<String>) -> Self {
-        ScopeCompletion { label: label.into(), kind: SymbolKind::Object, is_keyword: true }
+        ScopeCompletion {
+            label: label.into(),
+            kind: SymbolKind::Object,
+            is_keyword: true,
+            tier: Tier::Volatile,
+            arity: None,
+            package: String::new(),
+            container: None,
+            import_path: None,
+        }
+    }
+}
+
+/// A fully-shaped, LSP-independent completion item. Stage C produces these from `ScopeCompletion`s
+/// and `lsp.rs` maps them 1:1 to `CompletionItem`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapedItem {
+    pub label: String,
+    pub sort_text: String,
+    /// Equals `label`; set so the client filters on exactly what we ranked.
+    pub filter_text: String,
+    /// Mapped to `CompletionItemKind` in `lsp.rs` (the single mapping site).
+    pub kind: SymbolKind,
+    /// Carried through to the `KEYWORD` mapping.
+    pub is_keyword: bool,
+    /// Snippet (`name($0)`/`name()$0`) or plain name.
+    pub insert_text: String,
+    /// True => `insertTextFormat = Snippet`.
+    pub is_snippet: bool,
+    pub detail: Option<String>,
+    pub auto_import: Option<ImportEdit>,
+}
+
+/// A zero-width insertion of one import line at column 0 of `line` (0-based). The text is the bare
+/// `import a.b.C` line (no trailing newline; the LSP layer appends it).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ImportEdit {
+    pub line: u32,
+    pub text: String,
+}
+
+/// The polished, ordered, capped completion result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ShapedCompletions {
+    pub items: Vec<ShapedItem>,
+    pub is_incomplete: bool,
+}
+
+/// Where a new `import` line should be anchored when the file has no existing imports: the 0-based
+/// line at which to insert. (After the `package` line if present, else line 0.)
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ImportAnchor {
+    pub line: u32,
+}
+
+/// Match tiers (lowest sorts first; `sort_text` is ascending). There is no fuzzy tier: candidates
+/// are already prefix-filtered upstream, so this only separates a case-sensitive prefix hit from a
+/// case-insensitive one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum MatchTier {
+    /// Case-sensitive `name.starts_with(prefix)`.
+    ExactPrefix,
+    /// Case-insensitive `starts_with` (and not an exact-prefix hit).
+    CiPrefix,
+}
+
+impl MatchTier {
+    fn digit(self) -> char {
+        match self {
+            MatchTier::ExactPrefix => '0',
+            MatchTier::CiPrefix => '1',
+        }
+    }
+}
+
+/// Classify `name` against the typed `prefix`; `None` means drop. An empty prefix is an exact
+/// prefix of every name (so bare `.`/Ctrl-Space shows the whole assembled set).
+fn match_tier(prefix: &str, name: &str) -> Option<MatchTier> {
+    if name.starts_with(prefix) {
+        return Some(MatchTier::ExactPrefix);
+    }
+    if name.to_lowercase().starts_with(&prefix.to_lowercase()) {
+        return Some(MatchTier::CiPrefix);
+    }
+    None
+}
+
+/// The delimiter-free, lexicographically-monotone `sortText`. Clients sort `sortText` as opaque
+/// byte strings, so it MUST contain no literal space (ASCII `0x20` sorts before `'0'` `0x30`,
+/// which would corrupt ordering). Template:
+/// `{match_tier_digit}{visibility_digit}{name_len:04}{name_lower}{package}`.
+fn sort_text(tier: MatchTier, c: &ScopeCompletion) -> String {
+    let visibility_digit = match c.tier {
+        Tier::Volatile => '0',
+        Tier::Durable => '1',
+    };
+    let name_len = c.label.chars().count().min(9999);
+    format!(
+        "{}{}{:04}{}{}",
+        tier.digit(),
+        visibility_digit,
+        name_len,
+        c.label.to_lowercase(),
+        c.package,
+    )
+}
+
+/// Build the snippet/plain `insert_text` for a candidate, returning `(text, is_snippet)`.
+/// - A `Function` with `arity == Some(0)` → `name()$0` (cursor after the empty parens).
+/// - A `Function` with `arity == Some(n>0)` or `arity == None` → `name($0)` (cursor inside parens).
+/// - Every non-function and every keyword → plain `name`.
+/// - `ctx == Import` → always plain (you do not snippet inside an import path).
+/// - `!snippets_supported` → always plain bare name (a non-snippet client never sees a `$0`).
+fn insert_text(
+    c: &ScopeCompletion,
+    ctx: CompletionContext,
+    snippets_supported: bool,
+) -> (String, bool) {
+    let snippetable = snippets_supported
+        && ctx != CompletionContext::Import
+        && !c.is_keyword
+        && c.kind == SymbolKind::Function;
+    if snippetable {
+        if c.arity == Some(0) {
+            return (format!("{}()$0", c.label), true);
+        }
+        return (format!("{}($0)", c.label), true);
+    }
+    (c.label.clone(), false)
+}
+
+/// A short, compiler-free origin line from indexed fields only: `{kind_keyword} {label}` then
+/// ` in {container}` when present and ` ({package})` when non-empty. `None` for keywords.
+fn detail(c: &ScopeCompletion) -> Option<String> {
+    if c.is_keyword {
+        return None;
+    }
+    let kw = match c.kind {
+        SymbolKind::Function => "fun",
+        SymbolKind::Property => "val",
+        SymbolKind::Class => "class",
+        SymbolKind::Interface => "interface",
+        SymbolKind::Object => "object",
+        SymbolKind::EnumClass => "enum",
+        SymbolKind::EnumEntry => "entry",
+        SymbolKind::Parameter => "param",
+        SymbolKind::TypeParameter => "type",
+        SymbolKind::LocalVariable => "val",
+    };
+    let mut s = format!("{} {}", kw, c.label);
+    if let Some(container) = &c.container {
+        s.push_str(&format!(" in {container}"));
+    }
+    if !c.package.is_empty() {
+        s.push_str(&format!(" ({})", c.package));
+    }
+    Some(s)
+}
+
+/// Stage C entry point: rank, cap, and shape the assembled candidates against the typed `prefix`.
+/// `snippets_supported` comes from the client capability; `ctx` lets us suppress snippets/auto-import
+/// in `Import` context (defence in depth — the caller already declines `Import`, but `shape` must be
+/// correct in isolation). Auto-import resolution (the import line) is the caller's job; `shape`
+/// preserves each candidate's `import_path` so the workspace layer can resolve it.
+///
+/// Ranking is encoded entirely in `sort_text` (match tier → tier → name-length → alphabetical →
+/// package), so sorting the shaped items by `sort_text` ascending is the whole order. The cap is
+/// applied AFTER the sort so the best survive; `is_incomplete` flags truncation.
+pub fn shape(
+    ctx: CompletionContext,
+    prefix: &str,
+    candidates: Vec<ScopeCompletion>,
+    snippets_supported: bool,
+) -> ShapedCompletions {
+    let mut items: Vec<ShapedItem> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        let Some(tier) = match_tier(prefix, &c.label) else {
+            continue;
+        };
+        let sort = sort_text(tier, &c);
+        let (text, is_snippet) = insert_text(&c, ctx, snippets_supported);
+        let det = detail(&c);
+        // Suppress auto-import inside an import path (defence in depth); the line is resolved later
+        // by the workspace layer from `import_path`.
+        let auto_import = if ctx == CompletionContext::Import {
+            None
+        } else {
+            c.import_path.map(|path| ImportEdit { line: 0, text: format!("import {path}") })
+        };
+        items.push(ShapedItem {
+            filter_text: c.label.clone(),
+            label: c.label,
+            sort_text: sort,
+            kind: c.kind,
+            is_keyword: c.is_keyword,
+            insert_text: text,
+            is_snippet,
+            detail: det,
+            auto_import,
+        });
+    }
+    items.sort_by(|a, b| a.sort_text.cmp(&b.sort_text));
+    let is_incomplete = items.len() > RESULT_CAP;
+    items.truncate(RESULT_CAP);
+    ShapedCompletions { items, is_incomplete }
+}
+
+/// Resolve the alphabetically-correct insertion line for a new `import {fqn}` given the file's
+/// existing imports (sorted `(path, row)` pairs) and the anchor (used when there are no imports).
+/// Keeps imports sorted: the new line takes the row of the first existing import whose path sorts
+/// at-or-after `fqn`, or (if `fqn` sorts after every import) one past the last import's row.
+pub fn resolve_import_line(fqn: &str, sorted_imports: &[(String, u32)], anchor: ImportAnchor) -> u32 {
+    if sorted_imports.is_empty() {
+        return anchor.line;
+    }
+    match sorted_imports.binary_search_by(|(p, _)| p.as_str().cmp(fqn)) {
+        // Exact match (already imported, shouldn't normally happen) or insertion point.
+        Ok(i) => sorted_imports[i].1,
+        Err(i) => {
+            if i < sorted_imports.len() {
+                sorted_imports[i].1
+            } else {
+                // Sorts after every existing import: one line past the last import.
+                sorted_imports[sorted_imports.len() - 1].1 + 1
+            }
+        }
     }
 }
 
@@ -797,5 +1050,176 @@ mod tests {
         let filtered: Vec<String> =
             assemble_members(&idx, "Dog", "ba").into_iter().map(|c| c.label).collect();
         assert_eq!(filtered, vec!["bark".to_string()]);
+    }
+
+    // ----- Stage C: pure shape() ranking/snippet/detail/auto-import -----
+
+    fn cand(label: &str, kind: SymbolKind) -> ScopeCompletion {
+        ScopeCompletion::new(label, kind)
+    }
+
+    /// Assert the emitted `sort_text` byte strings are monotone non-decreasing (catches any
+    /// accidental delimiter/space).
+    fn assert_sort_monotone(shaped: &ShapedCompletions) {
+        for w in shaped.items.windows(2) {
+            assert!(
+                w[0].sort_text <= w[1].sort_text,
+                "sort_text not monotone: {:?} > {:?}",
+                w[0].sort_text,
+                w[1].sort_text
+            );
+        }
+    }
+
+    #[test]
+    fn shape_match_tier_and_monotone_sort() {
+        let cands = vec![
+            cand("greet", SymbolKind::Function),
+            cand("greeting", SymbolKind::Property),
+            cand("abgreet", SymbolKind::Function),
+        ];
+        let out = shape(CompletionContext::ScopeName, "gr", cands, true);
+        let labels: Vec<&str> = out.items.iter().map(|i| i.label.as_str()).collect();
+        // `abgreet` does not start with `gr` (case-insensitively either) -> dropped.
+        assert!(!labels.contains(&"abgreet"), "non-prefix candidate must be dropped: {labels:?}");
+        // Both `greet` and `greeting` are exact-prefix hits; shorter `greet` precedes `greeting`.
+        let gi = labels.iter().position(|l| *l == "greet").unwrap();
+        let gti = labels.iter().position(|l| *l == "greeting").unwrap();
+        assert!(gi < gti, "shorter `greet` before `greeting`: {labels:?}");
+        assert_sort_monotone(&out);
+    }
+
+    #[test]
+    fn shape_case_insensitive_prefix_after_exact() {
+        // `Green` (exact) and `green` matched against prefix `Gr`: exact-prefix `Green` outranks the
+        // case-insensitive `green`.
+        let cands = vec![cand("green", SymbolKind::Property), cand("Green", SymbolKind::Class)];
+        let out = shape(CompletionContext::ScopeName, "Gr", cands, true);
+        let labels: Vec<&str> = out.items.iter().map(|i| i.label.as_str()).collect();
+        assert_eq!(labels, vec!["Green", "green"], "exact-prefix tier before ci-prefix");
+        assert_sort_monotone(&out);
+    }
+
+    #[test]
+    fn shape_project_before_library() {
+        let mut proj = cand("foo", SymbolKind::Function);
+        proj.tier = Tier::Volatile;
+        let mut lib = cand("foo", SymbolKind::Function);
+        lib.tier = Tier::Durable;
+        let out = shape(CompletionContext::ScopeName, "f", vec![lib, proj], true);
+        // Volatile's sort_text must sort before Durable's.
+        assert_eq!(out.items.len(), 2);
+        assert!(
+            out.items[0].sort_text < out.items[1].sort_text,
+            "project should outrank library"
+        );
+    }
+
+    #[test]
+    fn shape_snippet_rules() {
+        let mut zero = cand("f", SymbolKind::Function);
+        zero.arity = Some(0);
+        let mut one = cand("g", SymbolKind::Function);
+        one.arity = Some(1);
+        let mut unknown = cand("h", SymbolKind::Function);
+        unknown.arity = None;
+        let prop = cand("p", SymbolKind::Property);
+        let class = cand("C", SymbolKind::Class);
+        let obj = cand("O", SymbolKind::Object);
+        let out = shape(
+            CompletionContext::ScopeName,
+            "",
+            vec![zero, one, unknown, prop, class, obj],
+            true,
+        );
+        let by = |label: &str| out.items.iter().find(|i| i.label == label).unwrap().clone();
+        assert_eq!((by("f").insert_text.as_str(), by("f").is_snippet), ("f()$0", true));
+        assert_eq!((by("g").insert_text.as_str(), by("g").is_snippet), ("g($0)", true));
+        assert_eq!((by("h").insert_text.as_str(), by("h").is_snippet), ("h($0)", true));
+        assert_eq!((by("p").insert_text.as_str(), by("p").is_snippet), ("p", false));
+        assert_eq!((by("C").insert_text.as_str(), by("C").is_snippet), ("C", false));
+        assert_eq!((by("O").insert_text.as_str(), by("O").is_snippet), ("O", false));
+    }
+
+    #[test]
+    fn shape_snippet_suppression() {
+        let mut f = cand("f", SymbolKind::Function);
+        f.arity = Some(2);
+        // No snippet support -> bare name, no `$0`.
+        let out = shape(CompletionContext::ScopeName, "", vec![f.clone()], false);
+        assert_eq!(out.items[0].insert_text, "f");
+        assert!(!out.items[0].is_snippet);
+        assert!(!out.items[0].insert_text.contains("$0"));
+        // Import context -> plain regardless of arity (even with snippet support).
+        let out = shape(CompletionContext::Import, "", vec![f], true);
+        assert_eq!(out.items[0].insert_text, "f");
+        assert!(!out.items[0].is_snippet);
+    }
+
+    #[test]
+    fn shape_detail_string() {
+        let mut member = cand("greet", SymbolKind::Function);
+        member.container = Some("Greeter".into());
+        member.package = "demo".into();
+        let out = shape(CompletionContext::ScopeName, "gr", vec![member], true);
+        assert_eq!(out.items[0].detail.as_deref(), Some("fun greet in Greeter (demo)"));
+        // A keyword has no detail.
+        let kw = ScopeCompletion::keyword("while");
+        let out = shape(CompletionContext::ScopeName, "wh", vec![kw], true);
+        assert_eq!(out.items[0].detail, None);
+    }
+
+    #[test]
+    fn shape_cap_and_incomplete() {
+        // Build more than RESULT_CAP candidates; the cap drops the lowest-ranked.
+        let mut cands = Vec::new();
+        for i in 0..(RESULT_CAP + 50) {
+            cands.push(cand(&format!("f{i:05}"), SymbolKind::Property));
+        }
+        let out = shape(CompletionContext::ScopeName, "f", cands, true);
+        assert_eq!(out.items.len(), RESULT_CAP);
+        assert!(out.is_incomplete, "truncation must flag incomplete");
+        assert_sort_monotone(&out);
+    }
+
+    #[test]
+    fn shape_package_collision_tiebreak() {
+        let mut a = cand("Foo", SymbolKind::Class);
+        a.package = "a".into();
+        let mut b = cand("Foo", SymbolKind::Class);
+        b.package = "b".into();
+        // Pass in reverse order; ranking must put package `a` before `b`.
+        let out = shape(CompletionContext::ScopeName, "Fo", vec![b, a], true);
+        assert_eq!(out.items.len(), 2);
+        // Both share label/tier/length; only the trailing package differs.
+        assert!(out.items[0].sort_text < out.items[1].sort_text);
+        assert!(out.items[0].sort_text.ends_with('a'));
+        assert!(out.items[1].sort_text.ends_with('b'));
+    }
+
+    #[test]
+    fn shape_auto_import_carried() {
+        let mut c = cand("Helper", SymbolKind::Class);
+        c.import_path = Some("lib.Helper".into());
+        let out = shape(CompletionContext::ScopeName, "He", vec![c.clone()], true);
+        let imp = out.items[0].auto_import.as_ref().expect("auto_import present");
+        assert_eq!(imp.text, "import lib.Helper");
+        // Import context suppresses auto-import.
+        let out = shape(CompletionContext::Import, "He", vec![c], true);
+        assert_eq!(out.items[0].auto_import, None);
+    }
+
+    #[test]
+    fn resolve_import_line_keeps_sorted() {
+        let imports = vec![("a.A".to_string(), 1u32), ("c.C".to_string(), 2u32)];
+        let anchor = ImportAnchor { line: 1 };
+        // `b.B` sorts between `a.A` (row 1) and `c.C` (row 2) -> takes c.C's row (2), pushing it down.
+        assert_eq!(resolve_import_line("b.B", &imports, anchor), 2);
+        // `z.Z` sorts after everything -> one past the last import row.
+        assert_eq!(resolve_import_line("z.Z", &imports, anchor), 3);
+        // Before everything -> the first import row.
+        assert_eq!(resolve_import_line("0.A", &imports, anchor), 1);
+        // No imports -> the anchor line.
+        assert_eq!(resolve_import_line("b.B", &[], ImportAnchor { line: 5 }), 5);
     }
 }

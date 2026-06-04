@@ -72,7 +72,7 @@ fn symcache_dir() -> PathBuf {
 /// non-self-describing, so a layout shift (e.g. adding `supertypes`/`ext_receiver`) makes old
 /// `.bin` caches deserialize wrong; folding this tag into the fingerprint forces a one-time
 /// re-parse instead of relying on the corrupt-cache fallback (which only logs a warning).
-const SYMCACHE_VERSION: &[u8] = b"v2";
+const SYMCACHE_VERSION: &[u8] = b"v3";
 
 /// A cheap, stat-only fingerprint of a resolved jar (path + mtime + size). Published jars are
 /// immutable, so this is a stable cache key without reading the jar's contents; any content change

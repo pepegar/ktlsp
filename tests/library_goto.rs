@@ -183,8 +183,9 @@ fn member_completion_into_indexed_library() {
 
     let dot = src.rfind("b.").unwrap() + "b.".len();
     let labels: std::collections::HashSet<String> = ws
-        .complete(&key, dot)
+        .complete(&key, dot, true)
         .expect("member completion should resolve the library type")
+        .items
         .into_iter()
         .map(|c| c.label)
         .collect();

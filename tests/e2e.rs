@@ -7,13 +7,34 @@ use tower_lsp_server::{LanguageServer, LspService};
 
 use ktlsp::lsp::Backend;
 
+/// `InitializeParams` advertising snippet support in the client capabilities, so the server emits
+/// `name($0)` snippets. (`InitializeParams::default()` omits it -> plain inserts.)
+fn snippet_capable_params() -> InitializeParams {
+    InitializeParams {
+        capabilities: ClientCapabilities {
+            text_document: Some(TextDocumentClientCapabilities {
+                completion: Some(CompletionClientCapabilities {
+                    completion_item: Some(CompletionItemCapability {
+                        snippet_support: Some(true),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn initialize_open_and_goto_definition() {
     let (service, _socket) = LspService::new(Backend::new);
     let backend = service.inner();
 
-    // initialize advertises definition support
-    let init = backend.initialize(InitializeParams::default()).await.unwrap();
+    // initialize advertises definition support (with snippet support so dot completion snippets).
+    let init = backend.initialize(snippet_capable_params()).await.unwrap();
     assert!(
         init.capabilities.definition_provider.is_some(),
         "server must advertise definition support"
@@ -154,10 +175,141 @@ async fn initialize_open_and_goto_definition() {
         CompletionResponse::Array(items) => items,
         CompletionResponse::List(list) => list.items,
     };
+    let open = member_items
+        .iter()
+        .find(|i| i.label == "open")
+        .unwrap_or_else(|| panic!("member completion must offer `open`: {member_items:?}"));
+    // `open` is a zero-arg function -> a snippet `open()$0` with SNIPPET format and kind FUNCTION.
+    assert_eq!(open.kind, Some(CompletionItemKind::FUNCTION));
+    assert_eq!(open.insert_text_format, Some(InsertTextFormat::SNIPPET));
+    assert_eq!(open.insert_text.as_deref(), Some("open()$0"));
+
+    assert!(backend.shutdown().await.is_ok());
+}
+
+/// A client WITHOUT snippet support: completion items insert the bare name and never leak a `$0`.
+#[tokio::test]
+async fn completion_without_snippet_support_is_plain() {
+    let (service, _socket) = LspService::new(Backend::new);
+    let backend = service.inner();
+
+    // `InitializeParams::default()` omits `snippetSupport`.
+    backend.initialize(InitializeParams::default()).await.unwrap();
+    backend.initialized(InitializedParams {}).await;
+
+    let uri: Uri = "file:///tmp/ktlsp_e2e/NoSnippet.kt".parse().unwrap();
+    let text = "class Box {\n    fun open() {}\n}\nfun main() {\n    val b = Box()\n    b.\n}\n";
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "kotlin".into(),
+                version: 1,
+                text: text.into(),
+            },
+        })
+        .await;
+
+    let dot_line = text.lines().position(|l| l.trim() == "b.").unwrap() as u32;
+    let dot_col = text
+        .lines()
+        .nth(dot_line as usize)
+        .unwrap()
+        .find("b.")
+        .map(|c| c + "b.".len())
+        .unwrap() as u32;
+    let comp = backend
+        .completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: dot_line, character: dot_col },
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("member completion present");
+    let items = match comp {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    let open = items.iter().find(|i| i.label == "open").expect("`open` present");
+    assert_eq!(open.insert_text_format, Some(InsertTextFormat::PLAIN_TEXT));
+    assert_eq!(open.insert_text.as_deref(), Some("open"));
     assert!(
-        member_items.iter().any(|i| i.label == "open"),
-        "member completion must offer `open`: {member_items:?}"
+        !open.insert_text.as_deref().unwrap_or("").contains("$0"),
+        "no $0 may leak to a non-snippet client"
     );
+
+    assert!(backend.shutdown().await.is_ok());
+}
+
+/// Auto-import canary: a buffer referencing an unimported, indexed type yields an item carrying an
+/// `additionalTextEdits` insert whose `new_text` begins with `import `.
+#[tokio::test]
+async fn completion_auto_import_edit() {
+    let (service, _socket) = LspService::new(Backend::new);
+    let backend = service.inner();
+    backend.initialize(snippet_capable_params()).await.unwrap();
+    backend.initialized(InitializedParams {}).await;
+
+    // A library type in another package, opened so it is indexed.
+    let lib_uri: Uri = "file:///tmp/ktlsp_e2e/Helper.kt".parse().unwrap();
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: lib_uri,
+                language_id: "kotlin".into(),
+                version: 1,
+                text: "package lib\nclass HelperXyz\n".into(),
+            },
+        })
+        .await;
+
+    let uri: Uri = "file:///tmp/ktlsp_e2e/AutoImport.kt".parse().unwrap();
+    let text = "package demo\nfun main() { HelperX }\n";
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "kotlin".into(),
+                version: 1,
+                text: text.into(),
+            },
+        })
+        .await;
+
+    // Cursor right after `HelperX` on line 1.
+    let col = (text.lines().nth(1).unwrap().find("HelperX").unwrap() + "HelperX".len()) as u32;
+    let comp = backend
+        .completion(CompletionParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 1, character: col },
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("completion present");
+    let items = match comp {
+        CompletionResponse::Array(items) => items,
+        CompletionResponse::List(list) => list.items,
+    };
+    let helper = items
+        .iter()
+        .find(|i| i.label == "HelperXyz")
+        .unwrap_or_else(|| panic!("HelperXyz offered: {items:?}"));
+    let edits = helper
+        .additional_text_edits
+        .as_ref()
+        .expect("auto-import additionalTextEdits present");
+    assert!(edits[0].new_text.starts_with("import "), "edit must insert an import: {edits:?}");
+    assert!(edits[0].new_text.contains("lib.HelperXyz"));
 
     assert!(backend.shutdown().await.is_ok());
 }

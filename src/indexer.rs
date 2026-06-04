@@ -122,6 +122,48 @@ fn push_ext(
     });
 }
 
+/// Push a `Function` symbol, stamping `ext_receiver` and `arity` (the count of value parameters,
+/// saturated at `u8::MAX`). `arity` drives the Stage C snippet shape (`name()$0` vs `name($0)`).
+fn push_function(
+    out: &mut Vec<IndexedSymbol>,
+    decl: Node,
+    name_node: Node,
+    src: &str,
+    package: &str,
+    container: Option<&str>,
+    ext_receiver: Option<&str>,
+) {
+    out.push(IndexedSymbol {
+        ext_receiver: ext_receiver.map(str::to_string),
+        arity: Some(value_param_count(decl)),
+        ..IndexedSymbol::new(
+            node_text(name_node, src),
+            SymbolKind::Function,
+            package,
+            container.map(str::to_string),
+            name_node.start_byte(),
+            name_node.end_byte(),
+        )
+    });
+}
+
+/// The number of value parameters on a `function_declaration`: the `parameter` named children of
+/// its `function_value_parameters` node (saturated at `u8::MAX`). Returns `0` when there is no
+/// `function_value_parameters` child (treated as zero-arg). Verified via `examples/dump`: a
+/// zero-arg `fun potato()` has an empty `function_value_parameters`; `fun add(a, b)` has two
+/// `parameter` children.
+fn value_param_count(decl: Node) -> u8 {
+    let Some(params) = child_of_kind(decl, "function_value_parameters") else {
+        return 0;
+    };
+    let mut cursor = params.walk();
+    let n = params
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "parameter")
+        .count();
+    n.min(u8::MAX as usize) as u8
+}
+
 /// Push a type declaration's name with its `supertypes`.
 fn push_type(
     out: &mut Vec<IndexedSymbol>,
@@ -253,7 +295,7 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
                     // different shape, but `extension_receiver` keys off the `name:` boundary so it
                     // is correct either way. We record it unconditionally.
                     let recv = extension_receiver(child, src);
-                    push_ext(out, name, src, SymbolKind::Function, package, container, recv.as_deref());
+                    push_function(out, child, name, src, package, container, recv.as_deref());
                 }
                 // Do NOT recurse into the body: it only contains locals.
             }
@@ -318,6 +360,19 @@ object Reg { fun add() {} }
         assert_eq!(greet.package, "app");
         let helper = syms.iter().find(|s| s.name == "helper").unwrap();
         assert_eq!(helper.container, None);
+    }
+
+    #[test]
+    fn function_arity_recorded() {
+        let src = "fun potato() = 3\nfun add(a: Int, b: Int) = a + b\nval notAFn = 1\n";
+        let syms = index(src);
+        let potato = syms.iter().find(|s| s.name == "potato").unwrap();
+        assert_eq!(potato.arity, Some(0), "zero-arg function");
+        let add = syms.iter().find(|s| s.name == "add").unwrap();
+        assert_eq!(add.arity, Some(2), "two-arg function");
+        // A non-function carries no arity.
+        let prop = syms.iter().find(|s| s.name == "notAFn").unwrap();
+        assert_eq!(prop.arity, None);
     }
 
     #[test]

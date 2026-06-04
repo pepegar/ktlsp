@@ -111,6 +111,78 @@ do
   end
 end
 
+-- ---- Stage C: member completion after `g.` offers Greeter members with a function snippet ----
+do
+  -- Position the cursor right after the `.` in `g.greet()` (the start of the `greet` selector).
+  local l, c = find("g.greet()", "greet")
+  check("found g.greet() for member completion", l ~= nil)
+  if l then
+    local res = request("textDocument/completion", {
+      textDocument = { uri = uri },
+      position = { line = l, character = c },
+    })
+    local items = res and (res.items or res) or {}
+    local has_greet, has_potato = false, false
+    local potato_item = nil
+    for _, item in ipairs(items) do
+      if item.label == "greet" then has_greet = true end
+      if item.label == "potato" then
+        has_potato = true
+        potato_item = item
+      end
+    end
+    check("member completion offers `greet`", has_greet, "got " .. #items .. " items")
+    check("member completion offers `potato`", has_potato, "got " .. #items .. " items")
+    if potato_item then
+      -- `potato` is a zero-arg function: SNIPPET format (2), insertText `potato()$0`, kind FUNCTION (3).
+      check("  potato insertTextFormat == Snippet (2)", potato_item.insertTextFormat == 2, tostring(potato_item.insertTextFormat))
+      check("  potato insertText == potato()$0", potato_item.insertText ~= nil and potato_item.insertText:match("potato%(%)%$0") ~= nil, potato_item.insertText)
+      check("  potato kind == Function (3)", potato_item.kind == 3, tostring(potato_item.kind))
+    end
+  end
+end
+
+-- ---- Stage C: an unimported, indexed type is offered WITH an auto-import additionalTextEdits ----
+do
+  -- `Decorator` is declared in dev/sample/Decor.kt under package `widgets` (no import in Main.kt),
+  -- and referenced unimported below; completion must carry an `import widgets.Decorator` edit.
+  local n0 = vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, n0, n0, false, {
+    "",
+    "fun usesDecorator() { Decorat }",
+  })
+  vim.wait(800)
+  local l, c = find("fun usesDecorator() { Decorat }", "Decorat")
+  check("found Decorat reference for auto-import", l ~= nil)
+  if l then
+    -- The cross-file `Decorator` symbol comes from the background project scan, which races with
+    -- this request; poll the completion until it warms up (or time out).
+    local decorator_item = nil
+    local last_count = 0
+    vim.wait(8000, function()
+      local res = request("textDocument/completion", {
+        textDocument = { uri = uri },
+        position = { line = l, character = c + #"Decorat" },
+      })
+      local items = res and (res.items or res) or {}
+      last_count = #items
+      for _, item in ipairs(items) do
+        if item.label == "Decorator" then
+          decorator_item = item
+          return true
+        end
+      end
+      return false
+    end, 200)
+    check("completion offers `Decorator`", decorator_item ~= nil, "got " .. last_count .. " items")
+    if decorator_item then
+      local edits = decorator_item.additionalTextEdits
+      local ok = edits ~= nil and edits[1] ~= nil and edits[1].newText ~= nil and edits[1].newText:match("^import ") ~= nil
+      check("  Decorator carries an `import ` additionalTextEdit", ok, edits and edits[1] and edits[1].newText)
+    end
+  end
+end
+
 -- ---- S6: member access `g.greet()` resolves into Greeter.kt via the receiver's inferred type ----
 do
   local l, c = find("g.greet()", "greet")
