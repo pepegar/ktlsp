@@ -910,3 +910,16 @@ fn member_completion_via_unannotated_constructor_body() {
                  //- Main.kt\npackage app\nfun main() {\n    val b = makeBar()\n    b.des/*^*/\n}\n";
     check_contains(input, &["describe"]);
 }
+
+#[test]
+fn smart_cast_when_compound_subject_does_not_narrow_wrong_var() {
+    // `when (w.type) { is Button -> w. }` narrows `w.type`, NOT `w` — so `w` (a Holder) must not be
+    // offered Button's members. (Adversarial-review safety case: a compound when-subject wraps the
+    // receiver in a navigation_expression, so the narrowing never fires on the bare variable.)
+    let input = "//- lib.kt\npackage app\n\
+                 class Button {\n    fun click() {}\n}\n\
+                 class Holder {\n    val typeTag: Int = 0\n}\n\
+                 //- Main.kt\npackage app\nfun t(w: Holder) {\n    when (w.typeTag) {\n        is Button -> w.t/*^*/\n    }\n}\n";
+    check_contains(input, &["typeTag"]); // w is still Holder
+    check_excludes(input, &["click"]); // must NOT leak Button's member
+}
