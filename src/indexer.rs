@@ -333,12 +333,33 @@ fn return_type_of(decl: Node, src: &str) -> Option<TypeRef> {
         if after_params {
             match child.kind() {
                 "user_type" | "nullable_type" => return type_ref_from(child, src),
-                "function_body" => return None,
+                // No explicit annotation: best-effort single-expression-body inference (Stage 6).
+                "function_body" => return expr_body_type(child, src),
                 _ => {}
             }
         }
     }
     None
+}
+
+/// Stage 6: a single-expression function body `= Foo(...)` yields a best-effort return type of the
+/// constructor's simple name. Gated on an UPPERCASE-led callee (Kotlin's type-naming convention) so
+/// a lowercase function call (`= helper()`, whose return type we can't know here) is NOT mistaken
+/// for a type — keeping the no-wrong-completion contract. Block bodies `{ ... }` are not inferred.
+fn expr_body_type(body: Node, src: &str) -> Option<TypeRef> {
+    let expr = body.named_child(0)?;
+    if expr.kind() != "call_expression" {
+        return None;
+    }
+    let callee = expr.named_child(0)?;
+    if callee.kind() != "identifier" {
+        return None;
+    }
+    let name = node_text(callee, src);
+    name.chars()
+        .next()
+        .map_or(false, |c| c.is_uppercase())
+        .then(|| TypeRef::simple(name))
 }
 
 /// A `variable_declaration`'s (or `parameter`'s) declared type (`val x: T` / `x: T` -> `T`): the
@@ -615,5 +636,20 @@ object Reg { fun add() {} }
         let syms = index(src);
         let f = syms.iter().find(|s| s.name == "f").unwrap();
         assert_eq!(f.return_type.as_ref().map(|t| t.name.as_str()), Some("C"));
+    }
+
+    #[test]
+    fn single_expression_constructor_body_infers_return_type() {
+        // Stage 6: `fun make() = Foo()` (no annotation) infers Foo from the constructor body...
+        let src = "fun make() = Foo()\nfun helper() = compute()\nfun lit() = 3\n";
+        let syms = index(src);
+        let make = syms.iter().find(|s| s.name == "make").unwrap();
+        assert_eq!(make.return_type.as_ref().map(|t| t.name.as_str()), Some("Foo"));
+        // ...but a lowercase function-call body is NOT treated as a type (could be a wrong guess).
+        let helper = syms.iter().find(|s| s.name == "helper").unwrap();
+        assert_eq!(helper.return_type, None);
+        // ...and a non-call body yields nothing.
+        let lit = syms.iter().find(|s| s.name == "lit").unwrap();
+        assert_eq!(lit.return_type, None);
     }
 }

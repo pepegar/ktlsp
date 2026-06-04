@@ -1,0 +1,119 @@
+---@diagnostic disable: undefined-global
+-- Live verification of ktlsp against the real Gradle project (dev/gradle-sample).
+local repo = "/Users/pepe/projects/github.com/pepegar/ktlsp"
+local root = repo .. "/dev/gradle-sample"
+local bin = repo .. "/target/release/ktlsp"
+local probe = root .. "/src/main/kotlin/com/example/fixture/_Probe.kt"
+
+vim.cmd("edit " .. probe)
+local buf = vim.api.nvim_get_current_buf()
+vim.bo[buf].filetype = "kotlin"
+local id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = root })
+vim.wait(10000, function()
+  local c = vim.lsp.get_client_by_id(id)
+  return c and c.server_capabilities ~= nil
+end, 50)
+
+local function lines() return vim.api.nvim_buf_get_lines(buf, 0, -1, false) end
+local function find_line(needle)
+  for i, l in ipairs(lines()) do
+    if l:find(needle, 1, true) then return i - 1, l end
+  end
+end
+local function complete_labels(line, char)
+  local r = vim.lsp.buf_request_sync(buf, "textDocument/completion",
+    { textDocument = { uri = vim.uri_from_bufnr(buf) },
+      position = { line = line, character = char },
+      context = { triggerKind = 1 } }, 4000) or {}
+  local labels = {}
+  for _, v in pairs(r) do
+    local items = v.result and (v.result.items or v.result) or {}
+    for _, it in ipairs(items) do labels[it.label] = true end
+  end
+  return labels
+end
+local function labels_after(needle)
+  local line, l = find_line(needle)
+  if not line then return {}, false end
+  return complete_labels(line, #l), true
+end
+
+local results = {}
+local function check(desc, needle, expected)
+  local labels, found = labels_after(needle)
+  if not found then results[#results + 1] = "FAIL  " .. desc .. " (probe line not found)"; return false end
+  local ok = labels[expected] == true
+  results[#results + 1] = (ok and "PASS  " or "FAIL  ") .. desc .. "  (expect `" .. expected .. "`)"
+  return ok
+end
+
+-- 1) Wait for the project scan to warm (project-local completion resolves).
+vim.wait(20000, function()
+  local labels = labels_after("    g.gr")
+  return labels["greet"] == true
+end, 300)
+
+-- Project-local inference (no library download needed).
+check("member completion on a local (BasicGreeter)", "    g.gr", "greet")
+check("function return-type inference (greeterFor -> Greeter)", '    greeterFor("en").gr', "greet")
+check("companion/static access (BasicGreeter.default)", "    BasicGreeter.def", "default")
+check("chained call (default() -> BasicGreeter)", "    BasicGreeter.default().sal", "salutation")
+
+-- 2) Wait for library indexing (first run downloads stdlib+serialization+coroutines+okio sources).
+local lib_ready = vim.wait(180000, function()
+  local labels = labels_after("    s.upper")
+  return labels["uppercase"] == true
+end, 2000)
+
+if lib_ready then
+  check("stdlib String member completion (\"hello\".upper)", "    s.upper", "uppercase")
+else
+  results[#results + 1] = "FAIL  stdlib String completion (library index timed out)"
+end
+
+-- 3) Goto-definition into the kotlin-stdlib sources jar (goto on the `String` return type).
+do
+  local line, l = find_line("_probeStdlibType(): String")
+  local desc = "goto-definition into stdlib (`String` -> extracted sources)"
+  if line then
+    local col = l:find("String", 1, true) - 1
+    local r = vim.lsp.buf_request_sync(buf, "textDocument/definition",
+      { textDocument = { uri = vim.uri_from_bufnr(buf) }, position = { line = line, character = col } }, 4000) or {}
+    local uri = nil
+    for _, v in pairs(r) do
+      local res = v.result
+      if res then
+        if res.uri then uri = res.uri elseif res[1] then uri = res[1].uri or (res[1].targetUri) end
+      end
+    end
+    local ok = uri ~= nil and (uri:find("ktlsp/extracted", 1, true) ~= nil or uri:find("kotlin", 1, true) ~= nil)
+    results[#results + 1] = (ok and "PASS  " or "FAIL  ") .. desc .. "  (-> " .. tostring(uri) .. ")"
+  else
+    results[#results + 1] = "FAIL  " .. desc .. " (probe line not found)"
+  end
+end
+
+-- 4) Goto-definition on a project type (BasicGreeter -> Greetings.kt).
+do
+  local line, l = find_line("    val g = BasicGreeter()")
+  local desc = "goto-definition on a project type (BasicGreeter)"
+  if line then
+    local col = l:find("BasicGreeter", 1, true) - 1
+    local r = vim.lsp.buf_request_sync(buf, "textDocument/definition",
+      { textDocument = { uri = vim.uri_from_bufnr(buf) }, position = { line = line, character = col } }, 4000) or {}
+    local uri = nil
+    for _, v in pairs(r) do
+      local res = v.result
+      if res then if res.uri then uri = res.uri elseif res[1] then uri = res[1].uri or res[1].targetUri end end
+    end
+    local ok = uri ~= nil and uri:find("Greetings.kt", 1, true) ~= nil
+    results[#results + 1] = (ok and "PASS  " or "FAIL  ") .. desc .. "  (-> " .. tostring(uri) .. ")"
+  else
+    results[#results + 1] = "FAIL  " .. desc
+  end
+end
+
+print("\n===== ktlsp live verification (dev/gradle-sample) =====")
+for _, r in ipairs(results) do print(r) end
+print("======================================================")
+os.exit(0)

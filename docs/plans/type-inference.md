@@ -1,10 +1,20 @@
 ---
 topic: type-inference
 date: 2026-06-04
-status: design — for review (incorporates an adversarial feasibility/coherence/scope review pass)
+status: implemented (Stages 0a, 0b, 1, 2, 3, 4, 5, 6) — verified live against dev/gradle-sample
 ---
 
 # Type Inference for Completion & Goto
+
+> **Implementation status (2026-06-05).** All staged work landed: 0a literals, 0b stdlib
+> auto-index, 1 return/property types in the index, 2 the unified `infer()` + `Type` model (deleting
+> `resolve_type_package`), 3 nullability (`?.`/`?:`/`!!`), 4 flow typing (`is`/`when`/`as` smart
+> casts + `it`-based scope functions), 5 single-type-variable generics, 6 single-expression
+> constructor-body inference. Verified end-to-end through headless Neovim against the real Gradle
+> fixture (`dev/nvim_gradle_live.lua`): project member/return-type/companion/chained completion,
+> stdlib `String` completion, and goto into the downloaded kotlin-stdlib sources all pass.
+> Deferred (documented §8): multi-parameter generic substitution (`Map<K,V>`), argument-based
+> inference (`listOf(x)`), and implicit-receiver scope functions (`with`/`apply`/`run` bare members).
 
 This document is the architecture for replacing ktlsp's ad-hoc, string-based receiver-type
 guessing with one real (but deliberately lightweight) type-inference layer. It is the "fix it for

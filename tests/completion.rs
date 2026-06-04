@@ -896,3 +896,17 @@ fn generic_list_element_completion() {
                  //- Main.kt\npackage app\nimport kotlin.collections.List\nfun f(xs: List<Widget>) {\n    xs.first().ren/*^*/\n}\n";
     check_contains(input, &["render"]);
 }
+
+// --------------------------------------------------------------------------------------------
+// Stage 6: single-expression constructor-body return-type inference
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn member_completion_via_unannotated_constructor_body() {
+    // `fun makeBar() = Bar()` has no return annotation; the constructor body infers Bar.
+    let input = "//- lib.kt\npackage app\n\
+                 class Bar {\n    fun describe() {}\n}\n\
+                 fun makeBar() = Bar()\n\
+                 //- Main.kt\npackage app\nfun main() {\n    val b = makeBar()\n    b.des/*^*/\n}\n";
+    check_contains(input, &["describe"]);
+}
