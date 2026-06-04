@@ -226,13 +226,15 @@ impl Workspace {
         let tree = self.parser.parse(&synthetic);
         let receiver = complete::navigation_receiver_at(&tree, syn_offset)?;
         let ty = resolve::infer_receiver_type(&self.index, receiver, &synthetic)?;
+        // Which package's `ty` does this file mean? (disambiguates same-named types across packages)
+        let ty_pkg = resolve::resolve_type_package(&self.index, &tree, &synthetic, &ty);
 
         let pkg = package_of(&tree, &synthetic);
         let imports = imports_of(&tree, &synthetic);
         let vis = Visibility::new(&pkg, &imports);
         let layout = import_layout(&tree, &synthetic);
 
-        let candidates = self.member_candidates(&ty, &prefix, &vis);
+        let candidates = self.member_candidates(&ty, ty_pkg, &prefix, &vis);
         // Silent omission: an inferable type with zero matching members is treated as no result.
         if candidates.is_empty() {
             return None;
@@ -246,21 +248,36 @@ impl Workspace {
     /// candidate carries `tier`/`arity`/`package`/`container` from its `Entry`. Instance/inherited
     /// members never carry `import_path` (reached through an in-scope receiver); an extension that is
     /// not yet visible (per `vis`) carries its OWN FQN as `import_path` so it can be auto-imported.
-    fn member_candidates(&self, ty: &str, prefix: &str, vis: &Visibility) -> Vec<ScopeCompletion> {
+    fn member_candidates(
+        &self,
+        ty: &str,
+        ty_pkg: Option<String>,
+        prefix: &str,
+        vis: &Visibility,
+    ) -> Vec<ScopeCompletion> {
         let mut out: Vec<ScopeCompletion> = Vec::new();
         let mut seen: std::collections::HashSet<(String, SymbolKind)> = std::collections::HashSet::new();
-        let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut frontier: Vec<(String, usize)> = vec![(ty.to_string(), 0)];
-        while let Some((cur, depth)) = frontier.pop() {
-            if !visited.insert(cur.clone()) || depth > SUPERTYPE_DEPTH_CAP {
+        // The frontier tracks (type name, resolved package) so a same-named type in another package
+        // can't contribute its members. `None` package means "don't filter" (ambiguous/unknown).
+        let mut visited: std::collections::HashSet<(String, Option<String>)> = std::collections::HashSet::new();
+        let mut frontier: Vec<(String, Option<String>, usize)> = vec![(ty.to_string(), ty_pkg, 0)];
+        while let Some((cur, cur_pkg, depth)) = frontier.pop() {
+            if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > SUPERTYPE_DEPTH_CAP {
                 continue;
             }
             for e in self.index.members_of(&cur) {
+                // Skip members of a same-named type in a different package.
+                if let Some(p) = &cur_pkg {
+                    if &e.sym.package != p {
+                        continue;
+                    }
+                }
                 push_member_candidate(&mut out, &mut seen, e, prefix, None);
             }
             for e in self.index.extensions_for(&cur) {
                 // An unimported extension is offered WITH its own FQN as an auto-import; a visible
                 // one (same package / explicitly imported / wildcard / default-import) gets none.
+                // (Extensions are matched by receiver simple-name + visibility — best-effort.)
                 let import_path = if vis.is_visible(&e.sym.package, &e.sym.name) {
                     None
                 } else {
@@ -268,8 +285,22 @@ impl Workspace {
                 };
                 push_member_candidate(&mut out, &mut seen, e, prefix, import_path);
             }
-            for sup in self.index.supertypes_of(&cur) {
-                frontier.push((sup, depth + 1));
+            for sup in self.index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
+                // Resolve the supertype's package: prefer a same-package supertype (the common case);
+                // otherwise leave it unfiltered (None) rather than guess.
+                let sup_pkg = match &cur_pkg {
+                    Some(p)
+                        if self
+                            .index
+                            .lookup_by_name(&sup)
+                            .iter()
+                            .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
+                    {
+                        Some(p.clone())
+                    }
+                    _ => None,
+                };
+                frontier.push((sup, sup_pkg, depth + 1));
             }
         }
         out.truncate(MAX_COMPLETIONS);

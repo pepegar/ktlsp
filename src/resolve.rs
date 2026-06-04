@@ -83,7 +83,7 @@ pub fn goto(index: &Index, file: &str, src: &str, tree: &Tree, offset: usize) ->
 
     // Member access: infer the receiver's type and filter members by it (S6), else best-effort.
     if uk == UseKind::MemberSelector {
-        return resolve_member(index, ident, name, src);
+        return resolve_member(index, ident, name, src, tree);
     }
     if let Some(def) = definition_self(ident, file) {
         return vec![def];
@@ -145,16 +145,22 @@ fn local_decl<'t>(
 // Member resolution (S6): type-directed where the receiver's type is inferable, else unique-only.
 // ---------------------------------------------------------------------------------------------
 
-fn resolve_member(index: &Index, selector: Node, name: &str, src: &str) -> Vec<Def> {
+fn resolve_member(index: &Index, selector: Node, name: &str, src: &str, tree: &Tree) -> Vec<Def> {
     // `selector` is the `.member` identifier; its parent is the navigation_expression.
     if let Some(nav) = selector.parent() {
         if nav.kind() == "navigation_expression" {
             if let Some(receiver) = nav.named_child(0) {
                 if let Some(ty) = infer_type(index, receiver, src) {
+                    // Disambiguate same-named types across packages: resolve which `ty` this file
+                    // means, then filter members by that package too (not just the simple name).
+                    let ty_pkg = resolve_type_package(index, tree, src, &ty);
                     let hits: Vec<Def> = index
                         .lookup_by_name(name)
                         .iter()
-                        .filter(|e| e.sym.container.as_deref() == Some(ty.as_str()))
+                        .filter(|e| {
+                            e.sym.container.as_deref() == Some(ty.as_str())
+                                && ty_pkg.as_deref().map_or(true, |p| e.sym.package == p)
+                        })
                         .map(to_def)
                         .collect();
                     if !hits.is_empty() {
@@ -170,6 +176,60 @@ fn resolve_member(index: &Index, selector: Node, name: &str, src: &str) -> Vec<D
         vec![to_def(&candidates[0])]
     } else {
         Vec::new()
+    }
+}
+
+/// Resolve a simple type name to the *package* of the type it refers to in this file's context,
+/// so same-named types in different packages can be told apart. Uses the same visibility precedence
+/// as cross-file resolution: alias/explicit import > same package > a single wildcard-imported match
+/// > a single Kotlin default-import match. Returns the sole candidate's package when there is only
+/// one type by that name, and `None` when the choice is genuinely ambiguous (callers then don't
+/// filter by package — best-effort rather than dropping results).
+pub fn resolve_type_package(index: &Index, tree: &Tree, src: &str, name: &str) -> Option<String> {
+    let candidates: Vec<&Entry> = index
+        .lookup_by_name(name)
+        .iter()
+        .filter(|e| e.sym.kind.is_type_like())
+        .collect();
+    match candidates.as_slice() {
+        [] => None,
+        [only] => Some(only.sym.package.clone()),
+        _ => {
+            let imports = imports_of(tree, src);
+            let current_pkg = package_of(tree, src);
+            // alias / explicit import that binds this name
+            for imp in &imports {
+                let binds = imp.alias.as_deref() == Some(name)
+                    || (!imp.wildcard && imp.local_name() == Some(name));
+                if binds {
+                    let pkg = imp.package();
+                    if candidates.iter().any(|e| e.sym.package == pkg) {
+                        return Some(pkg);
+                    }
+                }
+            }
+            // same package as the current file
+            if candidates.iter().any(|e| e.sym.package == current_pkg) {
+                return Some(current_pkg);
+            }
+            // a single wildcard-imported package
+            let star: Vec<String> = imports.iter().filter(|i| i.wildcard).map(|i| i.package()).collect();
+            let starred: Vec<&Entry> =
+                candidates.iter().copied().filter(|e| star.contains(&e.sym.package)).collect();
+            if let [one] = starred.as_slice() {
+                return Some(one.sym.package.clone());
+            }
+            // a single default-import package
+            let defaulted: Vec<&Entry> = candidates
+                .iter()
+                .copied()
+                .filter(|e| is_default_import_pkg(&e.sym.package))
+                .collect();
+            if let [one] = defaulted.as_slice() {
+                return Some(one.sym.package.clone());
+            }
+            None
+        }
     }
 }
 

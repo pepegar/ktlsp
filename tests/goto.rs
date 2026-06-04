@@ -310,6 +310,17 @@ fn member_selector_unknown_receiver_type_stays_ambiguous() {
     );
 }
 
+#[test]
+fn member_selector_disambiguates_same_name_by_package() {
+    // Two `Greeter` types in different packages; `g: demo.Greeter` -> member goto resolves to demo's
+    // member only, not the same-named member of `other.Greeter`.
+    check(
+        "//- demo/G.kt\npackage demo\nclass Greeter {\n    fun /*def*/wave() {}\n}\n\
+         //- other/G.kt\npackage other\nclass Greeter {\n    fun wave() {}\n}\n\
+         //- Main.kt\npackage demo\nfun main() {\n    val g = Greeter()\n    g./*^*/wave()\n}\n",
+    );
+}
+
 // --------------------------------------------------------------------------------------------
 // Negative / robustness
 // --------------------------------------------------------------------------------------------

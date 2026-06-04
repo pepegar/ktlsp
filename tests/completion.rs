@@ -718,3 +718,14 @@ fn silent_omission_non_completion_positions() {
     assert!(shaped("fun main() {\n    // gr/*^*/\n}\n").is_none());
     assert!(shaped("fun main() {\n    val n = 12/*^*/\n}\n").is_none());
 }
+
+#[test]
+fn member_completion_disambiguates_same_name_by_package() {
+    // Two `Greeter` classes in different packages; the receiver resolves to the same-package one,
+    // so only its members are offered — not the other package's same-named class's.
+    let input = "//- demo/G.kt\npackage demo\nclass Greeter {\n    fun greetDemo() {}\n}\n\
+                 //- other/G.kt\npackage other\nclass Greeter {\n    fun greetOther() {}\n}\n\
+                 //- Main.kt\npackage demo\nfun main() {\n    val g = Greeter()\n    g.gr/*^*/\n}\n";
+    check_contains(input, &["greetDemo"]);
+    check_excludes(input, &["greetOther"]);
+}

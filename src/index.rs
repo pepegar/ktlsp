@@ -168,9 +168,21 @@ impl Index {
     /// type's `sym.supertypes` (the first `is_type_like` entry wins — simple names rarely collide).
     /// Returns empty if the type is unknown or has no supertypes.
     pub fn supertypes_of(&self, type_name: &str) -> Vec<String> {
+        self.supertypes_of_in(type_name, None)
+    }
+
+    /// Like `supertypes_of`, but for the type named `type_name` in a specific `package` (when
+    /// known) — so two same-named types in different packages don't share a supertype list.
+    /// With `package == None`, the first `is_type_like` entry wins (old behavior).
+    pub fn supertypes_of_in(&self, type_name: &str, package: Option<&str>) -> Vec<String> {
         self.by_name
             .get(type_name)
-            .and_then(|entries| entries.iter().find(|e| e.sym.kind.is_type_like()))
+            .and_then(|entries| {
+                entries.iter().find(|e| {
+                    e.sym.kind.is_type_like()
+                        && package.map_or(true, |p| e.sym.package == p)
+                })
+            })
             .map(|e| e.sym.supertypes.clone())
             .unwrap_or_default()
     }
