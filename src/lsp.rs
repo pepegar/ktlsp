@@ -5,7 +5,7 @@
 //! URI <-> path exactly once at this boundary and never re-deriving identity from the filesystem
 //! mid-request. Byte ranges from the core are converted to LSP positions via `LineIndex` here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -14,6 +14,7 @@ use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
+use crate::compile::CompileDiagnostic;
 use crate::complete::ShapedItem;
 use crate::diagnostics::Severity;
 use crate::symbol::{Def, SymbolKind};
@@ -37,6 +38,14 @@ pub struct Backend {
     /// Per-document edit counter for debouncing diagnostics: each `did_open`/`did_change` bumps the
     /// counter; a scheduled recompute only publishes if the counter still matches (else superseded).
     doc_versions: Arc<Mutex<HashMap<String, u64>>>,
+    /// Compiler diagnostics from the last gradle run, keyed by canonical file key. Stored (line/col
+    /// native) so every publish can send the union of these and the freshly-computed fast
+    /// diagnostics — `publish_diagnostics` is last-writer-wins per URI, so neither source may publish
+    /// alone.
+    compile_diags: Arc<Mutex<HashMap<String, Vec<CompileDiagnostic>>>>,
+    /// File keys that carried compile diagnostics after the last *executed* run, so the next executed
+    /// run can clear the ones that recovered.
+    last_compile_keys: Arc<Mutex<HashSet<String>>>,
 }
 
 impl Backend {
@@ -48,6 +57,8 @@ impl Backend {
             snippets_supported: Mutex::new(false),
             compile_enabled: Mutex::new(false),
             doc_versions: Arc::new(Mutex::new(HashMap::new())),
+            compile_diags: Arc::new(Mutex::new(HashMap::new())),
+            last_compile_keys: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 
@@ -61,6 +72,7 @@ impl Backend {
             *n
         };
         let ws = self.ws.clone();
+        let compile_diags = self.compile_diags.clone();
         let client = self.client.clone();
         let versions = self.doc_versions.clone();
         tokio::spawn(async move {
@@ -69,22 +81,7 @@ impl Backend {
             if versions.lock().unwrap().get(&key).copied() != Some(version) {
                 return;
             }
-            // Compute + convert under the lock (never held across the publish await).
-            let items = {
-                let mut ws = ws.lock().unwrap();
-                let text = match ws.doc_text(&key) {
-                    Some(t) => t,
-                    None => return,
-                };
-                let line_index = LineIndex::new(&text);
-                ws.diagnostics(&key)
-                    .iter()
-                    .map(|d| to_lsp_diagnostic(&line_index, &text, d))
-                    .collect::<Vec<_>>()
-            };
-            if let Some(uri) = key_to_uri(&key) {
-                client.publish_diagnostics(uri, items, None).await;
-            }
+            publish_merged(&ws, &compile_diags, &client, &key).await;
         });
     }
 }
@@ -291,10 +288,10 @@ impl LanguageServer for Backend {
         if let Some(key) = uri_to_key(&params.text_document.uri) {
             self.ws.lock().unwrap().close(&key);
             self.doc_versions.lock().unwrap().remove(&key);
-            // Clear any diagnostics the client is showing for the now-closed buffer.
-            if let Some(uri) = key_to_uri(&key) {
-                self.client.publish_diagnostics(uri, Vec::new(), None).await;
-            }
+            // Republish rather than clear: compile diagnostics are owned by the compile lifecycle
+            // (R8), not by buffer open/close, so a closed-but-still-broken file keeps showing them
+            // (mapped from disk). With no compile entry this publishes empty, matching prior behavior.
+            publish_merged(&self.ws, &self.compile_diags, &self.client, &key).await;
         }
     }
 
@@ -449,15 +446,80 @@ fn to_lsp_diagnostic(
             start: Position { line: sl, character: sc },
             end: Position { line: el, character: ec },
         },
-        severity: Some(match d.severity {
-            Severity::Error => DiagnosticSeverity::ERROR,
-            Severity::Warning => DiagnosticSeverity::WARNING,
-            Severity::Hint => DiagnosticSeverity::HINT,
-        }),
+        severity: Some(severity_to_lsp(d.severity)),
         source: Some("ktlsp".into()),
         message: d.message.clone(),
         ..Default::default()
     }
+}
+
+/// The single `Severity` -> `DiagnosticSeverity` mapping.
+fn severity_to_lsp(severity: Severity) -> DiagnosticSeverity {
+    match severity {
+        Severity::Error => DiagnosticSeverity::ERROR,
+        Severity::Warning => DiagnosticSeverity::WARNING,
+        Severity::Hint => DiagnosticSeverity::HINT,
+    }
+}
+
+/// Convert a compiler diagnostic (1-based line/col) into an LSP `Diagnostic`. Best-effort mapping:
+/// `(line-1, col-1)` is treated as a UTF-16 offset (exact for ASCII; precise non-ASCII column
+/// mapping is deferred), the range runs to end-of-line, and the source is tagged `ktlsp (gradle)` so
+/// it's distinguishable from the fast tree-sitter source.
+fn to_lsp_compile_diagnostic(line_index: &LineIndex, text: &str, cd: &CompileDiagnostic) -> Diagnostic {
+    let line0 = cd.line.saturating_sub(1);
+    let eol = line_index.offset(text, line0, u32::MAX);
+    let (_, end_col) = line_index.position(text, eol);
+    let start_col = cd.col.saturating_sub(1).min(end_col);
+    let end_col = end_col.max(start_col + 1);
+    Diagnostic {
+        range: Range {
+            start: Position { line: line0, character: start_col },
+            end: Position { line: line0, character: end_col },
+        },
+        severity: Some(severity_to_lsp(cd.severity)),
+        source: Some("ktlsp (gradle)".into()),
+        message: cd.message.clone(),
+        ..Default::default()
+    }
+}
+
+/// Publish the union of fast (tree-sitter) and stored compile diagnostics for `key` — the single
+/// publish site, shared by the change path, `did_close`, and the compile worker. Computes under the
+/// locks and drops them before the publish `.await` (the never-hold-across-await rule). A free
+/// function (not a `&self` method) so the spawned tasks that own only the cloned `Arc`s can call it.
+async fn publish_merged(
+    ws: &Arc<Mutex<Workspace>>,
+    compile_diags: &Arc<Mutex<HashMap<String, Vec<CompileDiagnostic>>>>,
+    client: &Client,
+    key: &str,
+) {
+    let uri = match key_to_uri(key) {
+        Some(u) => u,
+        None => return,
+    };
+    let items = {
+        let mut ws = ws.lock().unwrap();
+        match ws.doc_text(key) {
+            Some(text) => {
+                let line_index = LineIndex::new(&text);
+                let mut items: Vec<Diagnostic> = ws
+                    .diagnostics(key)
+                    .iter()
+                    .map(|d| to_lsp_diagnostic(&line_index, &text, d))
+                    .collect();
+                if let Some(compile) = compile_diags.lock().unwrap().get(key) {
+                    items.extend(
+                        compile.iter().map(|cd| to_lsp_compile_diagnostic(&line_index, &text, cd)),
+                    );
+                }
+                items
+            }
+            // No text on disk/buffer (deleted file): clear by publishing nothing.
+            None => Vec::new(),
+        }
+    };
+    client.publish_diagnostics(uri, items, None).await;
 }
 
 /// Convert a core `Def` (file key + byte range) into an LSP `Location`, reading the target file's
@@ -501,5 +563,23 @@ mod tests {
         assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": "true" } }))));
         assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": 1 } }))));
         assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": false } }))));
+    }
+
+    #[test]
+    fn compile_diagnostic_maps_1based_to_0based_range() {
+        let text = "fun main() {\n    val x = bar()\n}\n";
+        let li = LineIndex::new(text);
+        let cd = CompileDiagnostic {
+            path: "/x/A.kt".into(),
+            line: 2,
+            col: 13,
+            severity: Severity::Error,
+            message: "Unresolved reference: bar".into(),
+        };
+        let d = to_lsp_compile_diagnostic(&li, text, &cd);
+        assert_eq!(d.range.start, Position { line: 1, character: 12 });
+        assert_eq!(d.range.end, Position { line: 1, character: 17 }); // to end of "    val x = bar()"
+        assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(d.source.as_deref(), Some("ktlsp (gradle)"));
     }
 }
