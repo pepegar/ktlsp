@@ -141,7 +141,9 @@ What to expect when enabled:
 - **Per-workspace trust.** The first save in a project prompts before running its `gradlew` (it
   executes the project's build scripts). The decision is remembered in
   `~/.cache/ktlsp/trusted_roots` (delete that file to reset). An untrusted project never spawns a
-  build.
+  build. **Non-interactive/headless clients** that can't answer the `window/showMessageRequest`
+  prompt can pre-authorize a project by appending its canonical path (`realpath <root>`) as a line to
+  `~/.cache/ktlsp/trusted_roots` before starting the server.
 - **Cold-start latency.** A cold gradle daemon can take 30s–2min for the first diagnostics; a
   "compiling…" status is logged while a run is in flight. On-save only — never per keystroke.
 - **`compileKotlin` coverage only (spike).** Errors surface for the main JVM source set. Saving a

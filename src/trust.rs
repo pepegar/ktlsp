@@ -55,8 +55,12 @@ fn trust_in(file: &Path, root: &Path) {
         let _ = std::fs::create_dir_all(parent);
     }
     let body = set.into_iter().collect::<Vec<_>>().join("\n");
-    if let Err(e) = std::fs::write(file, body) {
-        tracing::warn!("failed to persist workspace trust: {e}");
+    // Write to a sibling temp file then rename, so a crash or concurrent writer can't truncate the
+    // trust store to a partial state.
+    let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp, body).and_then(|_| std::fs::rename(&tmp, file)).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        tracing::warn!("failed to persist workspace trust");
     }
 }
 
@@ -80,7 +84,6 @@ mod tests {
 
         assert!(!is_trusted_in(&file, &root));
         trust_in(&file, &root);
-        // A fresh read (simulating restart) still sees it.
         assert!(is_trusted_in(&file, &root));
 
         std::fs::remove_dir_all(&dir).unwrap();
@@ -109,7 +112,6 @@ mod tests {
         let root = dir.join("proj");
         std::fs::create_dir_all(&root).unwrap();
         trust_in(&file, &root);
-        // A path with a redundant `.` canonicalizes to the same key.
         let dotted = root.join(".");
         assert!(is_trusted_in(&file, &dotted));
         std::fs::remove_dir_all(&dir).unwrap();

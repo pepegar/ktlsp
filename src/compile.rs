@@ -247,27 +247,53 @@ fn parse_legacy(rest: &str, severity: Severity) -> Option<CompileDiagnostic> {
     })
 }
 
-/// Modern form: `file:///abs/Foo.kt:line:col message` (scheme optional; Windows drive aware). The
-/// trailing `:line:col` is taken from the right so a path-internal or message colon is preserved.
+/// Modern form: `file:///abs/Foo.kt:line:col message` (scheme optional; Windows drive aware). Strips
+/// the `file://` scheme *before* locating the `:line:col` boundary, so a path containing spaces isn't
+/// truncated by a naive whitespace split.
 fn parse_modern(rest: &str, severity: Severity) -> Option<CompileDiagnostic> {
-    let (loc, message) = match rest.split_once(char::is_whitespace) {
-        Some((l, m)) => (l, m.trim()),
-        None => (rest, ""),
-    };
-    let loc = loc.trim_end_matches(':');
-    let loc = strip_file_scheme(loc);
-
-    let (rest_loc, col_str) = loc.rsplit_once(':')?;
-    let (path, line_str) = rest_loc.rsplit_once(':')?;
-    let line = line_str.parse().ok()?;
-    let col = col_str.parse().ok()?;
+    let s = strip_file_scheme(rest);
+    let (path, line, col, after) = find_line_col(s)?;
+    let message = s[after..].trim_start_matches(':').trim().to_string();
     Some(CompileDiagnostic {
         path: path.to_string(),
         line,
         col,
         severity,
-        message: message.to_string(),
+        message,
     })
+}
+
+/// Locate the first `:<line>:<col>` boundary (two colon-separated integer runs, ending at
+/// whitespace / `:` / end). On a unix path there are no colons before it; a Windows `C:` drive's
+/// colon isn't followed by digits, so it's skipped. Returns `(path, line, col, byte-after-col)`.
+fn find_line_col(s: &str) -> Option<(&str, u32, u32, usize)> {
+    let b = s.as_bytes();
+    let digits = |mut k: usize| {
+        let start = k;
+        while k < b.len() && b[k].is_ascii_digit() {
+            k += 1;
+        }
+        (start, k)
+    };
+    for i in 0..b.len() {
+        if b[i] != b':' {
+            continue;
+        }
+        let (ls, le) = digits(i + 1);
+        if le == ls || le >= b.len() || b[le] != b':' {
+            continue;
+        }
+        let (cs, ce) = digits(le + 1);
+        if ce == cs {
+            continue;
+        }
+        if ce == b.len() || b[ce] == b' ' || b[ce] == b'\t' || b[ce] == b':' {
+            let line = s[ls..le].parse().ok()?;
+            let col = s[cs..ce].parse().ok()?;
+            return Some((&s[..i], line, col, ce));
+        }
+    }
+    None
 }
 
 /// Strip a leading `file://` scheme, and the slash a `file:///C:/...` URL puts before a drive letter.
@@ -287,15 +313,18 @@ fn parse_line_col(s: &str) -> Option<(u32, u32)> {
     Some((l.trim().parse().ok()?, c.trim().parse().ok()?))
 }
 
-/// Remove ANSI CSI escape sequences (`\x1b[ ... <final>`) so colored build output parses cleanly and
-/// no escapes leak into diagnostic messages.
+/// Remove ANSI escape sequences (CSI `\x1b[ … <final>` and OSC `\x1b] … BEL|ST`) so colored build
+/// output parses cleanly and no escape bytes leak into diagnostic messages.
 fn strip_ansi(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut chars = input.chars();
     while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip "[" then parameter/intermediate bytes up to and including the final byte (@-~).
-            if let Some('[') = chars.clone().next() {
+        if c != '\x1b' {
+            out.push(c);
+            continue;
+        }
+        match chars.clone().next() {
+            Some('[') => {
                 chars.next();
                 for f in chars.by_ref() {
                     if ('@'..='~').contains(&f) {
@@ -303,9 +332,20 @@ fn strip_ansi(input: &str) -> String {
                     }
                 }
             }
-            continue;
+            Some(']') => {
+                chars.next();
+                while let Some(f) = chars.next() {
+                    if f == '\x07' {
+                        break;
+                    }
+                    if f == '\x1b' {
+                        chars.next();
+                        break;
+                    }
+                }
+            }
+            _ => {}
         }
-        out.push(c);
     }
     out
 }
@@ -361,6 +401,24 @@ mod tests {
         assert!(!parse_output("> Task :app:compileKotlin UP-TO-DATE\n", "compileKotlin").executed);
         assert!(!parse_output("> Task :compileKotlin NO-SOURCE\n", "compileKotlin").executed);
         assert!(!parse_output("> Task :compileKotlin FROM-CACHE\n", "compileKotlin").executed);
+        assert!(!parse_output("> Task :compileKotlin SKIPPED\n", "compileKotlin").executed);
+    }
+
+    #[test]
+    fn path_with_spaces_preserved() {
+        let d = diags("e: file:///my path/A.kt:2:3 oops: x\n");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].path, "/my path/A.kt");
+        assert_eq!(d[0].line, 2);
+        assert_eq!(d[0].col, 3);
+        assert_eq!(d[0].message, "oops: x");
+    }
+
+    #[test]
+    fn osc_sequence_stripped() {
+        let d = diags("\x1b]0;window title\x07e: file:///a/A.kt:1:1 boom\n");
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].message, "boom");
     }
 
     #[test]

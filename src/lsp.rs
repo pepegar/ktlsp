@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Notify;
+use tokio::sync::watch;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
@@ -47,11 +47,10 @@ pub struct Backend {
     /// File keys that carried compile diagnostics after the last *executed* run, so the next executed
     /// run can clear the ones that recovered.
     last_compile_keys: Arc<Mutex<HashSet<String>>>,
-    /// Latest save generation for the compile worker. Each save bumps it; the worker reruns until the
-    /// generation it ran for is the latest, so the final save always gets a completed, published run.
-    compile_gen: Arc<Mutex<u64>>,
-    /// Wakes the compile worker when a new save lands.
-    compile_notify: Arc<Notify>,
+    /// Save generation for the compile worker, over a watch channel. Each save bumps it; the worker
+    /// reruns whenever a newer generation arrived during a run and otherwise waits for the next
+    /// change — so the final save always gets a completed run with no spurious extra runs.
+    compile_tx: watch::Sender<u64>,
     /// The most recently saved file key (for the coverage notice).
     last_saved: Arc<Mutex<Option<String>>>,
     /// Whether the long-lived compile worker has been spawned (lazily, on first trusted save).
@@ -73,8 +72,7 @@ impl Backend {
             doc_versions: Arc::new(Mutex::new(HashMap::new())),
             compile_diags: Arc::new(Mutex::new(HashMap::new())),
             last_compile_keys: Arc::new(Mutex::new(HashSet::new())),
-            compile_gen: Arc::new(Mutex::new(0)),
-            compile_notify: Arc::new(Notify::new()),
+            compile_tx: watch::channel(0).0,
             last_saved: Arc::new(Mutex::new(None)),
             worker_started: Mutex::new(false),
             asked_roots: Arc::new(Mutex::new(HashSet::new())),
@@ -112,7 +110,13 @@ impl Backend {
         if crate::trust::is_trusted(root) {
             return true;
         }
-        let key = root.to_string_lossy().into_owned();
+        // Canonical key so a symlinked/relative form of the same root isn't re-prompted (matches
+        // trust::is_trusted's canonicalization).
+        let key = root
+            .canonicalize()
+            .unwrap_or_else(|_| root.to_path_buf())
+            .to_string_lossy()
+            .into_owned();
         {
             let mut asked = self.asked_roots.lock().unwrap();
             if !asked.insert(key) {
@@ -158,14 +162,13 @@ impl Backend {
         let ws = self.ws.clone();
         let compile_diags = self.compile_diags.clone();
         let last_compile_keys = self.last_compile_keys.clone();
-        let compile_gen = self.compile_gen.clone();
-        let notify = self.compile_notify.clone();
+        let mut rx = self.compile_tx.subscribe();
         let last_saved = self.last_saved.clone();
         let coverage_notified = self.coverage_notified.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
             loop {
-                let generation = *compile_gen.lock().unwrap();
+                rx.borrow_and_update();
                 client.log_message(MessageType::INFO, "ktlsp: compiling…").await;
                 let run_root = root.clone();
                 let outcome = tokio::task::spawn_blocking(move || {
@@ -175,7 +178,7 @@ impl Backend {
                 .unwrap_or_default();
 
                 // A newer save arrived while we were running: rerun for it, don't publish stale output.
-                if *compile_gen.lock().unwrap() != generation {
+                if rx.has_changed().unwrap_or(false) {
                     continue;
                 }
 
@@ -184,19 +187,20 @@ impl Backend {
                 client.log_message(MessageType::INFO, format!("ktlsp: compile done ({summary})")).await;
                 maybe_notify_coverage(&last_saved, &coverage_notified, &client).await;
 
-                // Nothing newer pending — wait for the next save.
-                if *compile_gen.lock().unwrap() == generation {
-                    notify.notified().await;
+                // Wait for the next save (a strictly newer generation). Err => sender dropped: stop.
+                if rx.changed().await.is_err() {
+                    break;
                 }
             }
         });
     }
 
-    /// Record the saved file, bump the generation, and wake the worker.
+    /// Record the saved file and bump the generation, waking the worker (which coalesces to the
+    /// latest). Triggered before the worker is started on the first save; the watch channel retains
+    /// the latest value, so a fresh subscriber still sees it.
     fn trigger_compile(&self, key: String) {
         *self.last_saved.lock().unwrap() = Some(key);
-        *self.compile_gen.lock().unwrap() += 1;
-        self.compile_notify.notify_one();
+        self.compile_tx.send_modify(|g| *g += 1);
     }
 }
 
@@ -435,8 +439,10 @@ impl LanguageServer for Backend {
         if !self.ensure_trusted(&root).await {
             return;
         }
-        self.start_worker_once(root);
+        // Trigger before (lazily) starting the worker: the watch channel retains the latest
+        // generation, so a worker that subscribes afterward still sees this save and runs once.
         self.trigger_compile(key);
+        self.start_worker_once(root);
     }
 
     async fn goto_definition(
@@ -642,26 +648,31 @@ async fn publish_merged(
         Some(u) => u,
         None => return,
     };
-    let items = {
+    // Acquire ws and compile_diags one at a time (never nested) so there is no lock-ordering hazard.
+    let (text, fast) = {
         let mut ws = ws.lock().unwrap();
         match ws.doc_text(key) {
             Some(text) => {
-                let line_index = LineIndex::new(&text);
-                let mut items: Vec<Diagnostic> = ws
-                    .diagnostics(key)
-                    .iter()
-                    .map(|d| to_lsp_diagnostic(&line_index, &text, d))
-                    .collect();
-                if let Some(compile) = compile_diags.lock().unwrap().get(key) {
-                    items.extend(
-                        compile.iter().map(|cd| to_lsp_compile_diagnostic(&line_index, &text, cd)),
-                    );
-                }
-                items
+                let fast = ws.diagnostics(key);
+                (Some(text), fast)
             }
-            // No text on disk/buffer (deleted file): clear by publishing nothing.
-            None => Vec::new(),
+            None => (None, Vec::new()),
         }
+    };
+    let items = match text {
+        Some(text) => {
+            let line_index = LineIndex::new(&text);
+            let mut items: Vec<Diagnostic> =
+                fast.iter().map(|d| to_lsp_diagnostic(&line_index, &text, d)).collect();
+            if let Some(compile) = compile_diags.lock().unwrap().get(key) {
+                items.extend(
+                    compile.iter().map(|cd| to_lsp_compile_diagnostic(&line_index, &text, cd)),
+                );
+            }
+            items
+        }
+        // No text on disk/buffer (deleted file): clear by publishing nothing.
+        None => Vec::new(),
     };
     client.publish_diagnostics(uri, items, None).await;
 }
@@ -707,25 +718,29 @@ fn apply_outcome(
     grouped: HashMap<String, Vec<CompileDiagnostic>>,
     executed: bool,
 ) -> HashSet<String> {
+    // A non-executed run (UP-TO-DATE / nothing compiled) carries no information: never mutate the
+    // store or clear — neither add nor overwrite (R8).
+    if !executed {
+        return HashSet::new();
+    }
     let new_keys: HashSet<String> = grouped.keys().cloned().collect();
     let mut republish = new_keys.clone();
     for (key, diags) in grouped {
         store.insert(key, diags);
     }
-    if executed {
-        for recovered in last_keys.difference(&new_keys).cloned().collect::<Vec<_>>() {
-            store.remove(&recovered);
-            republish.insert(recovered);
-        }
-        *last_keys = new_keys;
+    for recovered in last_keys.difference(&new_keys).cloned().collect::<Vec<_>>() {
+        store.remove(&recovered);
+        republish.insert(recovered);
     }
+    *last_keys = new_keys;
     republish
 }
 
-/// Canonicalize `path` and return its string key iff it lies under `canon_root`.
+/// Canonicalize `path` and return its string key iff it lies under `canon_root`. A path that can't
+/// be canonicalized (doesn't resolve on disk) is dropped — it has no business passing the workspace
+/// boundary guard, and `..`-bearing raw paths must never slip through.
 fn canonical_under(path: &str, canon_root: &Path) -> Option<String> {
-    let p = Path::new(path);
-    let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    let canon = Path::new(path).canonicalize().ok()?;
     canon.starts_with(canon_root).then(|| canon.to_string_lossy().into_owned())
 }
 
@@ -829,7 +844,7 @@ mod tests {
         };
         let d = to_lsp_compile_diagnostic(&li, text, &cd);
         assert_eq!(d.range.start, Position { line: 1, character: 12 });
-        assert_eq!(d.range.end, Position { line: 1, character: 17 }); // to end of "    val x = bar()"
+        assert_eq!(d.range.end, Position { line: 1, character: 17 });
         assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(d.source.as_deref(), Some("ktlsp (gradle)"));
     }
@@ -872,6 +887,36 @@ mod tests {
         assert!(store.contains_key("A"), "UP-TO-DATE run carries no info; retain prior diagnostics");
         assert_eq!(last, ["A".to_string()].into_iter().collect());
         assert!(republish.is_empty());
+    }
+
+    #[test]
+    fn non_executed_run_never_mutates_store_even_with_diagnostics() {
+        let mut store: HashMap<String, Vec<CompileDiagnostic>> = HashMap::new();
+        store.insert("A".into(), vec![cd("A")]);
+        let mut last: HashSet<String> = ["A".to_string()].into_iter().collect();
+
+        let grouped = HashMap::from([("B".to_string(), vec![cd("B")])]);
+        let republish = apply_outcome(&mut store, &mut last, grouped, false);
+
+        assert!(!store.contains_key("B"), "a non-executed run must not add entries");
+        assert!(store.contains_key("A"));
+        assert!(republish.is_empty());
+    }
+
+    #[test]
+    fn canonical_under_drops_paths_outside_root() {
+        let dir = std::env::temp_dir().join(format!("ktlsp_cu_{}", std::process::id()));
+        let inside = dir.join("src");
+        std::fs::create_dir_all(&inside).unwrap();
+        let canon_root = dir.canonicalize().unwrap();
+        let f = inside.join("A.kt");
+        std::fs::write(&f, "x").unwrap();
+
+        assert!(canonical_under(f.to_str().unwrap(), &canon_root).is_some());
+        // A path that does not resolve on disk is dropped, not raw-fallback-accepted.
+        assert!(canonical_under("/etc/passwd", &canon_root).is_none());
+        assert!(canonical_under(&format!("{}/../../etc/passwd", inside.display()), &canon_root).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
