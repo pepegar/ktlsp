@@ -414,6 +414,21 @@ impl Workspace {
         Some((prefix, items, layout))
     }
 
+    /// `textDocument/publishDiagnostics` source: name-based, high-confidence diagnostics for `key`,
+    /// over the cached tree for an open buffer (or a one-off parse from disk). Byte-range based; the
+    /// LSP layer converts to positions and severities.
+    pub fn diagnostics(&mut self, key: &str) -> Vec<crate::diagnostics::Diagnostic> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return crate::diagnostics::compute(&doc.text, &doc.tree);
+        }
+        let text = match self.doc_text(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        crate::diagnostics::compute(&text, &tree)
+    }
+
     /// `textDocument/references`: all usage sites (as `Def` locations) of the symbol at `offset`.
     /// Goto-grade precision: every candidate usage of the name is re-resolved and kept only if it
     /// resolves to the same definition as the cursor. Optionally includes the declaration site.

@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod complete;
 pub mod coords;
 pub mod deps;
+pub mod diagnostics;
 pub mod index;
 pub mod indexer;
 pub mod infer;

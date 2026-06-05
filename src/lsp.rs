@@ -5,17 +5,24 @@
 //! URI <-> path exactly once at this boundary and never re-deriving identity from the filesystem
 //! mid-request. Byte ranges from the core are converted to LSP positions via `LineIndex` here.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
 use crate::complete::ShapedItem;
+use crate::diagnostics::Severity;
 use crate::symbol::{Def, SymbolKind};
 use crate::text::LineIndex;
 use crate::workspace::Workspace;
+
+/// Debounce window for diagnostics: the server is FULL-sync (a keystroke is a whole-doc change), so
+/// we coalesce rapid edits before recomputing.
+const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(300);
 
 pub struct Backend {
     client: Client,
@@ -24,6 +31,9 @@ pub struct Backend {
     /// Whether the client advertised snippet support in `initialize`. Set once; gates whether
     /// completion items insert `name($0)` snippets or plain bare names.
     snippets_supported: Mutex<bool>,
+    /// Per-document edit counter for debouncing diagnostics: each `did_open`/`did_change` bumps the
+    /// counter; a scheduled recompute only publishes if the counter still matches (else superseded).
+    doc_versions: Arc<Mutex<HashMap<String, u64>>>,
 }
 
 impl Backend {
@@ -33,7 +43,45 @@ impl Backend {
             ws: Arc::new(Mutex::new(Workspace::new())),
             root: Mutex::new(None),
             snippets_supported: Mutex::new(false),
+            doc_versions: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Bump `key`'s version and schedule a debounced diagnostics recompute. Off the request path; the
+    /// task discards itself if a newer edit lands during the debounce window.
+    fn schedule_diagnostics(&self, key: String) {
+        let version = {
+            let mut versions = self.doc_versions.lock().unwrap();
+            let n = versions.entry(key.clone()).or_insert(0);
+            *n += 1;
+            *n
+        };
+        let ws = self.ws.clone();
+        let client = self.client.clone();
+        let versions = self.doc_versions.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(DIAGNOSTIC_DEBOUNCE).await;
+            // Superseded by a newer edit? Discard.
+            if versions.lock().unwrap().get(&key).copied() != Some(version) {
+                return;
+            }
+            // Compute + convert under the lock (never held across the publish await).
+            let items = {
+                let mut ws = ws.lock().unwrap();
+                let text = match ws.doc_text(&key) {
+                    Some(t) => t,
+                    None => return,
+                };
+                let line_index = LineIndex::new(&text);
+                ws.diagnostics(&key)
+                    .iter()
+                    .map(|d| to_lsp_diagnostic(&line_index, &text, d))
+                    .collect::<Vec<_>>()
+            };
+            if let Some(uri) = key_to_uri(&key) {
+                client.publish_diagnostics(uri, items, None).await;
+            }
+        });
     }
 }
 
@@ -204,7 +252,8 @@ impl LanguageServer for Backend {
     async fn did_open(&self, params: DidOpenTextDocumentParams) {
         let doc = params.text_document;
         if let Some(key) = uri_to_key(&doc.uri) {
-            self.ws.lock().unwrap().open(key, doc.text);
+            self.ws.lock().unwrap().open(key.clone(), doc.text);
+            self.schedule_diagnostics(key);
         }
     }
 
@@ -213,6 +262,7 @@ impl LanguageServer for Backend {
         if let Some(key) = uri_to_key(&params.text_document.uri) {
             if let Some(change) = params.content_changes.into_iter().last() {
                 self.ws.lock().unwrap().change(&key, change.text);
+                self.schedule_diagnostics(key);
             }
         }
     }
@@ -220,6 +270,11 @@ impl LanguageServer for Backend {
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         if let Some(key) = uri_to_key(&params.text_document.uri) {
             self.ws.lock().unwrap().close(&key);
+            self.doc_versions.lock().unwrap().remove(&key);
+            // Clear any diagnostics the client is showing for the now-closed buffer.
+            if let Some(uri) = key_to_uri(&key) {
+                self.client.publish_diagnostics(uri, Vec::new(), None).await;
+            }
         }
     }
 
@@ -356,6 +411,30 @@ fn to_completion_item(it: ShapedItem) -> CompletionItem {
                 new_text: format!("{}\n", imp.text),
             }]
         }),
+        ..Default::default()
+    }
+}
+
+/// Convert a core byte-range `Diagnostic` into an LSP `Diagnostic`, mapping byte offsets to UTF-16
+/// positions (the only place this conversion happens for diagnostics) and the severity enum.
+fn to_lsp_diagnostic(
+    line_index: &LineIndex,
+    text: &str,
+    d: &crate::diagnostics::Diagnostic,
+) -> Diagnostic {
+    let (sl, sc) = line_index.position(text, d.start_byte);
+    let (el, ec) = line_index.position(text, d.end_byte);
+    Diagnostic {
+        range: Range {
+            start: Position { line: sl, character: sc },
+            end: Position { line: el, character: ec },
+        },
+        severity: Some(match d.severity {
+            Severity::Warning => DiagnosticSeverity::WARNING,
+            Severity::Hint => DiagnosticSeverity::HINT,
+        }),
+        source: Some("ktlsp".into()),
+        message: d.message.clone(),
         ..Default::default()
     }
 }

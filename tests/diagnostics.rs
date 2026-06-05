@@ -1,0 +1,65 @@
+//! Diagnostics tests through the real `Workspace` (parse -> index -> diagnostics), no LSP/async.
+//! Mirrors the completion/goto harness style. The silent-omission contract is INVERTED here: a
+//! diagnostic must only fire when provably correct, so the negative tests (no false positives) matter
+//! most.
+
+use ktlsp::diagnostics::Diagnostic;
+use ktlsp::workspace::Workspace;
+
+fn diagnostics(src: &str) -> Vec<Diagnostic> {
+    let mut ws = Workspace::new();
+    ws.open("Main.kt".to_string(), src.to_string());
+    ws.diagnostics("Main.kt")
+}
+
+fn messages(src: &str) -> Vec<String> {
+    diagnostics(src).into_iter().map(|d| d.message).collect()
+}
+
+#[test]
+fn unused_import_is_flagged() {
+    let m = messages("import a.b.Unused\nfun main() {}\n");
+    assert_eq!(m.len(), 1, "expected one unused-import diagnostic, got {m:?}");
+    assert!(m[0].contains("Unused"));
+}
+
+#[test]
+fn used_import_is_clean() {
+    assert!(diagnostics("import a.b.Helper\nfun main() { Helper() }\n").is_empty());
+}
+
+#[test]
+fn wildcard_import_is_never_flagged() {
+    assert!(diagnostics("import a.b.*\nfun main() {}\n").is_empty());
+}
+
+#[test]
+fn import_used_only_in_a_type_position_is_clean() {
+    // `Helper` appears as a type annotation, which is still a usage.
+    assert!(diagnostics("import a.b.Helper\nfun f(x: Helper) {}\n").is_empty());
+}
+
+#[test]
+fn only_the_unused_one_of_several_imports_is_flagged() {
+    let m = messages("import a.b.Used\nimport a.b.Unused\nfun main() { Used() }\n");
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Unused"));
+}
+
+#[test]
+fn error_recovered_file_suppresses_diagnostics() {
+    // A file that fails to parse cleanly (ERROR node) must produce NO diagnostics — an ERROR-recovered
+    // tree is provably partial, so "unused" can't be trusted.
+    let d = diagnostics("import a.b.Unused\nfun broken( { )\n");
+    assert!(d.is_empty(), "diagnostics must be suppressed on a non-clean parse, got {d:?}");
+}
+
+#[test]
+fn diagnostic_range_points_at_the_import() {
+    let src = "import a.b.Unused\nfun main() {}\n";
+    let d = diagnostics(src);
+    assert_eq!(d.len(), 1);
+    // The range should cover the import line (starts at byte 0).
+    assert_eq!(d[0].start_byte, 0);
+    assert!(&src[d[0].start_byte..d[0].end_byte].contains("import a.b.Unused"));
+}
