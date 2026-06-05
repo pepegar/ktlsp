@@ -17,6 +17,7 @@ pub mod java;
 pub mod lsp;
 pub mod parser;
 pub mod resolve;
+pub mod solve;
 pub mod symbol;
 pub mod text;
 pub mod types;

@@ -12,13 +12,14 @@
 //! lives here — it is why a `Type` carries a resolved `package`, replacing the old post-hoc
 //! `resolve_type_package` band-aid.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Tree};
 
 use crate::index::Index;
 use crate::parser::{child_of_kind, first_ident, imports_of, node_text, package_of, Import};
 use crate::resolve::{self, UseKind};
+use crate::solve;
 use crate::symbol::SymbolKind;
 use crate::types::{Type, TypeRef};
 
@@ -532,9 +533,29 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
             if !index.lookup_type(cname).is_empty() {
                 return resolve_type_name(index, cname, ctx, false);
             }
-            // Free function call -> its declared return type.
-            if let Some(tr) = index.return_type_of(cname, None, None) {
-                return resolve_type_ref(index, &tr, ctx, depth);
+            // Free function call.
+            if let Some((ret_tr, type_params, params)) = free_function_sig(index, cname) {
+                if type_params.is_empty() {
+                    return resolve_type_ref(index, &ret_tr, ctx, depth);
+                }
+                // Generic free function (`fun <T> listOf(vararg e: T): List<T>`): unify the formal
+                // parameter types against the synthesized argument types, then substitute the bindings
+                // through the declared return type (`List<T>` with `T := Foo` -> `List<Foo>`).
+                let tset: HashSet<String> = type_params.into_iter().collect();
+                let args = synth_arg_types(index, node, src, ctx, depth);
+                let mut subst: HashMap<String, Type> = HashMap::new();
+                for (i, p) in params.iter().enumerate() {
+                    if let Some(a) = args.get(i) {
+                        solve::unify_into(p, a, &tset, &mut subst);
+                    }
+                }
+                // Vararg / extra args: unify the remaining args against the last formal param.
+                if let Some(last) = params.last() {
+                    for a in args.iter().skip(params.len()) {
+                        solve::unify_into(last, a, &tset, &mut subst);
+                    }
+                }
+                return resolve_with_subst(index, &ret_tr, ctx, &tset, &subst, depth);
             }
             Type::Unknown
         }
@@ -547,6 +568,78 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
             member_type(index, &recv_ty, node_text(sel, src), true, Some(value_arg_count(node)), ctx, depth)
         }
         _ => Type::Unknown,
+    }
+}
+
+/// The signature of a free (top-level) function named `name`, for generic call inference:
+/// `(return type, formal type-parameter names, value-parameter types)`. The first top-level function
+/// with a recorded return type wins (overload-by-args is U9's concern). Cloned to keep lifetimes simple.
+fn free_function_sig(index: &Index, name: &str) -> Option<(TypeRef, Vec<String>, Vec<TypeRef>)> {
+    index
+        .lookup_by_name(name)
+        .iter()
+        .find(|e| {
+            e.sym.kind == SymbolKind::Function
+                && e.sym.container.is_none()
+                && e.sym.return_type.is_some()
+        })
+        .map(|e| {
+            (
+                e.sym.return_type.clone().unwrap(),
+                e.sym.type_params.clone(),
+                e.sym.params.clone(),
+            )
+        })
+}
+
+/// The synthesized (bottom-up) types of a call's value arguments, in order. Each `value_argument`'s
+/// value expression is its last named child (`name = expr` -> `expr`; bare `expr` -> `expr`).
+fn synth_arg_types(index: &Index, call: Node, src: &str, ctx: &FileCtx, depth: usize) -> Vec<Type> {
+    let mut out = Vec::new();
+    let Some(va) = child_of_kind(call, "value_arguments") else {
+        return out;
+    };
+    let mut cursor = va.walk();
+    for arg in va.named_children(&mut cursor) {
+        if arg.kind() != "value_argument" {
+            continue;
+        }
+        let n = arg.named_child_count();
+        let t = (n > 0)
+            .then(|| arg.named_child(n - 1))
+            .flatten()
+            .map_or(Type::Unknown, |e| infer_depth(index, e, src, ctx, depth + 1));
+        out.push(t);
+    }
+    out
+}
+
+/// Like `resolve_type_ref`, but a name in `tparams` resolves to its binding in `subst` (or `Unknown`
+/// when unbound — never a wrong guess) instead of being looked up as a concrete type.
+fn resolve_with_subst(
+    index: &Index,
+    tr: &TypeRef,
+    ctx: &FileCtx,
+    tparams: &HashSet<String>,
+    subst: &HashMap<String, Type>,
+    depth: usize,
+) -> Type {
+    if tparams.contains(&tr.name) {
+        return subst.get(&tr.name).cloned().unwrap_or(Type::Unknown);
+    }
+    let args = if depth > MAX_DEPTH {
+        Vec::new()
+    } else {
+        tr.args
+            .iter()
+            .map(|a| resolve_with_subst(index, a, ctx, tparams, subst, depth + 1))
+            .collect()
+    };
+    Type::Class {
+        name: tr.name.clone(),
+        package: resolve_package(index, &tr.name, ctx),
+        nullable: tr.nullable,
+        args,
     }
 }
 

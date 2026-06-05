@@ -1063,3 +1063,32 @@ fn overload_conflicting_returns_same_arity_is_unknown() {
                  //- Main.kt\npackage app\nfun f(r: R) {\n    r.pick(1).o/*^*/\n}\n";
     check_none(input);
 }
+
+// --------------------------------------------------------------------------------------------
+// Gradual checker U7: argument-based generic inference (one-shot unifier)
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn generic_arg_inference_list_of() {
+    // listOf(Foo()) infers List<Foo>; .first() then yields Foo.
+    let input = "//- coll.kt\npackage kotlin.collections\nclass List<E> {\n    fun first(): E = TODO()\n}\nfun <T> listOf(vararg e: T): List<T> = TODO()\n\
+                 //- app.kt\npackage app\nclass Widget {\n    fun render() {}\n}\n\
+                 //- Main.kt\npackage app\nimport kotlin.collections.listOf\nfun f() {\n    listOf(Widget()).first().ren/*^*/\n}\n";
+    check_contains(input, &["render"]);
+}
+
+#[test]
+fn generic_arg_inference_unbound_is_unknown() {
+    // A generic call with no argument to bind the type variable -> List<Unknown> -> first() Unknown.
+    let input = "//- coll.kt\npackage kotlin.collections\nclass List<E> {\n    fun first(): E = TODO()\n}\nfun <T> emptyList(): List<T> = TODO()\n\
+                 //- Main.kt\npackage app\nimport kotlin.collections.emptyList\nfun f() {\n    emptyList().first().any/*^*/\n}\n";
+    check_none(input);
+}
+
+#[test]
+fn non_generic_free_function_still_resolves() {
+    // Regression: a non-generic free function's return type is unaffected by the generic path.
+    let input = "//- lib.kt\npackage app\nclass Bar {\n    fun describe() {}\n}\nfun makeBar(): Bar = Bar()\n\
+                 //- Main.kt\npackage app\nfun f() {\n    makeBar().des/*^*/\n}\n";
+    check_contains(input, &["describe"]);
+}
