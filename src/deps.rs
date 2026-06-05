@@ -96,7 +96,7 @@ pub fn is_gradle_project(root: &Path) -> bool {
 }
 
 /// ktlsp's cache root (`~/.cache/ktlsp`, or under the temp dir if HOME is unset).
-fn cache_home() -> PathBuf {
+pub fn cache_home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)

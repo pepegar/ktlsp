@@ -22,5 +22,6 @@ pub mod resolve;
 pub mod solve;
 pub mod symbol;
 pub mod text;
+pub mod trust;
 pub mod types;
 pub mod workspace;
