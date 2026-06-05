@@ -136,7 +136,80 @@ fn narrowed_type_name(ident: Node, name: &str, src: &str) -> Option<String> {
         }
         cur = n.parent();
     }
+    // Fallback: a preceding `if (name !is T) <return/throw/break/continue>` narrows the rest of the
+    // block to T. Ancestor (if/when/&&) narrowing above takes precedence when both apply.
+    early_return_narrowing(ident, name, src)
+}
+
+/// `if (name !is T) <terminating>` earlier in the same block narrows `name` to `T` for every
+/// statement after it (the only way to reach them is if the `!is` was false). Bounded
+/// preceding-sibling scan — no CFG. Stability-gated from the guard position.
+fn early_return_narrowing(ident: Node, name: &str, src: &str) -> Option<String> {
+    let (block, stmt) = enclosing_block_and_stmt(ident)?;
+    let mut cursor = block.walk();
+    let mut best: Option<(String, usize)> = None; // (narrowed type, guard start byte); latest wins
+    for child in block.named_children(&mut cursor) {
+        if child.start_byte() >= stmt.start_byte() {
+            break; // only statements strictly before the one containing the use
+        }
+        if child.kind() == "if_expression" {
+            if let Some(t) = terminating_guard_narrows(child, name, src) {
+                best = Some((t, child.start_byte()));
+            }
+        }
+    }
+    let (narrowed, guard_start) = best?;
+    if !is_stable_for_narrowing(ident, name, guard_start, src) {
+        return None;
+    }
+    Some(narrowed)
+}
+
+/// The (`block`, direct-child statement) pair enclosing `ident` — the statement is the block child
+/// the use sits within, so preceding siblings can be scanned.
+fn enclosing_block_and_stmt<'t>(ident: Node<'t>) -> Option<(Node<'t>, Node<'t>)> {
+    let mut node = ident;
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "block" {
+            return Some((parent, node));
+        }
+        node = parent;
+    }
     None
+}
+
+/// An `if_expression` of the form `if (name !is T) <terminating>` → narrows the fallthrough to `T`.
+fn terminating_guard_narrows(if_expr: Node, name: &str, src: &str) -> Option<String> {
+    let cond = if_expr.child_by_field_name("condition")?;
+    let then_branch = if_expr.named_child(1)?;
+    if !is_terminating(then_branch, src) {
+        return None;
+    }
+    negated_guard_type_name(cond, name, src)
+}
+
+/// A statement that exits the enclosing block: `return`/`throw` (their own node kinds) or
+/// `break`/`continue` (which parse as plain `identifier`s), or a block wrapping a single such.
+fn is_terminating(node: Node, src: &str) -> bool {
+    match node.kind() {
+        "return_expression" | "throw_expression" => true,
+        "identifier" => matches!(node_text(node, src), "break" | "continue"),
+        "block" => node.named_child(0).is_some_and(|c| is_terminating(c, src)),
+        _ => false,
+    }
+}
+
+/// The type `name` is narrowed to when the *negation* of `guard` holds — i.e. `name !is T` (a
+/// negated `is_expression`) → `T`. Only the bare `!is` form (no `&&`/`||` De Morgan).
+fn negated_guard_type_name(guard: Node, name: &str, src: &str) -> Option<String> {
+    if guard.kind() != "is_expression" || !has_child_token(guard, "!is") {
+        return None;
+    }
+    let left = guard.child_by_field_name("left")?;
+    if node_text(left, src) != name {
+        return None;
+    }
+    type_node_simple_name(guard.child_by_field_name("right")?, src)
 }
 
 /// Narrowing from `if (<guard on name>) <then>`: the guard may be a bare `name is T` OR a `&&`

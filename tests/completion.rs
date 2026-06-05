@@ -988,3 +988,38 @@ fn smart_cast_or_does_not_narrow_then_branch() {
                  //- Main.kt\npackage app\nfun f(x: Any, ok: Boolean) {\n    if (x is Dog || ok) {\n        x.ba/*^*/\n    }\n}\n";
     check_none(input);
 }
+
+// --------------------------------------------------------------------------------------------
+// Gradual checker U3: early-return narrowing
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn early_return_is_narrowing() {
+    // `if (x !is Dog) return` narrows x to Dog for the rest of the block.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    if (x !is Dog) return\n    x.ba/*^*/\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn early_throw_is_narrowing() {
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    if (x !is Dog) throw RuntimeException()\n    x.ba/*^*/\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn no_narrowing_before_the_guard() {
+    // Before the guard line, x is not yet narrowed.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    x.ba/*^*/\n    if (x !is Dog) return\n}\n";
+    check_none(input);
+}
+
+#[test]
+fn no_narrowing_without_terminating_statement() {
+    // `if (x !is Dog) {}` (no return/throw) does NOT narrow the following statements.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    if (x !is Dog) {}\n    x.ba/*^*/\n}\n";
+    check_none(input);
+}
