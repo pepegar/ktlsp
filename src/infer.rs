@@ -391,48 +391,91 @@ const ELEMENT_LAMBDA_OPS: &[&str] = &[
     "associateWith", "takeWhile", "dropWhile", "partition", "indexOfFirst", "single", "singleOrNull",
 ];
 
-/// The type of `it` inside the trailing lambda of a scope/collection call:
-/// - `recv.let { … }` / `recv.also { … }` → `it` is `recv`'s type.
-/// - `recv.map { … }` / `filter`/`forEach`/… (see `ELEMENT_LAMBDA_OPS`) → `it` is `recv`'s single
-///   element type (`List<Foo>` → `Foo`), when the receiver has exactly one type argument.
+/// The type of a lambda parameter `name` (implicit `it` OR a named param like `{ user -> … }`) inside
+/// the trailing lambda of a scope/collection call:
+/// - `recv.let { … }` / `recv.also { … }` → the parameter is `recv`'s type.
+/// - `recv.map { … }` / `filter`/`forEach`/… (see `ELEMENT_LAMBDA_OPS`) → the parameter is `recv`'s
+///   single element type (`List<Foo>` → `Foo`), when the receiver has exactly one type argument.
 ///
-/// `it` binds to the innermost lambda, so we stop at the first `lambda_literal`.
-fn it_receiver_type(
+/// Implicit `it` binds to the innermost lambda; a named parameter binds to whichever enclosing lambda
+/// declares it (so we walk outward until that lambda is found).
+fn lambda_param_type(
     index: &Index,
     ident: Node,
+    name: &str,
     src: &str,
     ctx: &FileCtx,
     depth: usize,
 ) -> Option<Type> {
+    let implicit = name == "it";
     let mut cur = ident.parent();
     while let Some(n) = cur {
         if n.kind() == "lambda_literal" {
-            let call = n.parent()?.parent()?; // lambda_literal -> annotated_lambda -> call_expression
-            if call.kind() != "call_expression" {
-                return None;
+            let is_this_lambdas_param = implicit || lambda_declares_param(n, name, src);
+            if is_this_lambdas_param {
+                return lambda_receiver_or_element(index, n, src, ctx, depth);
             }
-            let callee = call.named_child(0)?;
-            if callee.kind() != "navigation_expression" {
-                return None;
+            if implicit {
+                return None; // `it` belongs to the innermost lambda; if it's not the op, no type
             }
-            let sel = node_text(callee.named_child(1)?, src);
-            let recv = callee.named_child(0)?;
-            let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
-            return if sel == "let" || sel == "also" {
-                recv_ty.name().is_some().then_some(recv_ty)
-            } else if ELEMENT_LAMBDA_OPS.contains(&sel) {
-                // `it` is the receiver's single element type (e.g. List<Foo> -> Foo).
-                match recv_ty.args() {
-                    [elem] if elem.name().is_some() => Some(elem.clone()),
-                    _ => None,
-                }
-            } else {
-                None
-            };
+            // a named parameter not declared here — keep walking outward to its declaring lambda
         }
         cur = n.parent();
     }
     None
+}
+
+/// Whether `lambda` declares a value parameter named `name` (in its `lambda_parameters`).
+fn lambda_declares_param(lambda: Node, name: &str, src: &str) -> bool {
+    let Some(lp) = child_of_kind(lambda, "lambda_parameters") else {
+        return false;
+    };
+    let mut cursor = lp.walk();
+    for c in lp.named_children(&mut cursor) {
+        let matched = match c.kind() {
+            "identifier" => node_text(c, src) == name,
+            // a destructured/annotated param wraps the binder in a variable_declaration
+            "variable_declaration" => first_ident(c).is_some_and(|id| node_text(id, src) == name),
+            _ => false,
+        };
+        if matched {
+            return true;
+        }
+    }
+    false
+}
+
+/// Given a `lambda_literal` that is the trailing lambda of a `recv.op { … }` call, the type its
+/// parameter takes: the receiver type for `let`/`also`, or the receiver's single element type for an
+/// `ELEMENT_LAMBDA_OPS` op (`map`/`filter`/…). `None` for any other shape.
+fn lambda_receiver_or_element(
+    index: &Index,
+    lambda: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    let call = lambda.parent()?.parent()?; // lambda_literal -> annotated_lambda -> call_expression
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let callee = call.named_child(0)?;
+    if callee.kind() != "navigation_expression" {
+        return None;
+    }
+    let sel = node_text(callee.named_child(1)?, src);
+    let recv = callee.named_child(0)?;
+    let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
+    if sel == "let" || sel == "also" {
+        recv_ty.name().is_some().then_some(recv_ty)
+    } else if ELEMENT_LAMBDA_OPS.contains(&sel) {
+        match recv_ty.args() {
+            [elem] if elem.name().is_some() => Some(elem.clone()),
+            _ => None,
+        }
+    } else {
+        None
+    }
 }
 
 /// Whether `node` has a direct (possibly anonymous) child token equal to `token`. Operators like
@@ -458,11 +501,10 @@ fn infer_identifier(index: &Index, ident: Node, src: &str, ctx: &FileCtx, depth:
     if name == "true" || name == "false" {
         return resolve_type_name(index, "Boolean", ctx, false);
     }
-    // `it` inside a `let`/`also` lambda is the call receiver's type.
-    if name == "it" {
-        if let Some(t) = it_receiver_type(index, ident, src, ctx, depth) {
-            return t;
-        }
+    // A lambda parameter (implicit `it` OR a named param) of a scope/collection call takes the
+    // receiver's (or element's) type.
+    if let Some(t) = lambda_param_type(index, ident, name, src, ctx, depth) {
+        return t;
     }
     // A smart cast from an enclosing `if (name is T)` / `when(name){ is T -> }` overrides the
     // declared type within the narrowed region.

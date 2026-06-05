@@ -94,8 +94,10 @@ local function ensure_open(path)
   vim.cmd("edit " .. path)
   local b = vim.api.nvim_get_current_buf()
   vim.bo[b].filetype = "kotlin"
-  id = id or vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = root })
-  vim.lsp.buf_attach_client(b, id)
+  -- Call vim.lsp.start EVERY time: it dedups to the one running client AND attaches+didOpens the
+  -- CURRENT buffer. (buf_attach_client alone does not reliably send didOpen, so non-first files
+  -- never reached the server.)
+  id = vim.lsp.start({ name = "ktlsp", cmd = { bin }, root_dir = root })
   return b
 end
 
@@ -117,7 +119,7 @@ end
 local function complete_labels(b, line, char)
   local r = vim.lsp.buf_request_sync(b, "textDocument/completion",
     { textDocument = { uri = vim.uri_from_bufnr(b) }, position = { line = line, character = char },
-      context = { triggerKind = 1 } }, 5000) or {}
+      context = { triggerKind = 1 } }, 2000) or {}
   local labs = {}
   for _, v in pairs(r) do
     local items = v.result and (v.result.items or v.result) or {}
@@ -126,26 +128,38 @@ local function complete_labels(b, line, char)
   return labs
 end
 
--- Warm up: wait for the library index (poll a known stdlib completion).
-local sbuf = ensure_open(files.S)
-vim.wait(150000, function()
-  local ln, l = find_line(sbuf, "sx1.upper")
+-- Open EVERY probe file up front so all buffers are didOpen'd and the project is fully indexed.
+for _, p in pairs(files) do ensure_open(p) end
+-- ONE combined, bounded warm-up: return as soon as a representative completion in EVERY category is
+-- ready (project + each library index asynchronously). Single 200s cap — no stacked waits.
+local function ready(fkey, marker, label)
+  local b = ensure_open(files[fkey])
+  local ln, _, c = find_line(b, marker)
   if not ln then return false end
-  return complete_labels(sbuf, ln, #l)["uppercase"] == true
+  return complete_labels(b, ln, (c - 1) + #marker)[label] == true
+end
+vim.wait(200000, function()
+  return ready("P", "basic.salu", "salutation")     -- project scan
+    and ready("S", "sx1.upper", "uppercase")        -- kotlin-stdlib
+    and ready("O", "bufW.writeUtf", "writeUtf8")    -- okio
+    and ready("R", "userVal.ema", "email")          -- serialization (User data class)
+    and ready("C", "jobValue.isAct", "isActive")    -- coroutines
 end, 2000)
 
 local stats = {} -- per category {pass, fail}
 local fails = {}
 local function bump(cat, ok) stats[cat] = stats[cat] or {0,0}; if ok then stats[cat][1]=stats[cat][1]+1 else stats[cat][2]=stats[cat][2]+1 end end
 
--- completion
+-- completion. NOTE: the cursor must land at the END OF THE SELECTOR, not the end of the line — many
+-- probe lines have trailing `// comments`, and requesting completion inside a comment yields nothing.
 for _, chk in ipairs(COMPL) do
   local b = ensure_open(files[chk[1]])
-  local ln, l = find_line(b, chk[2])
+  local ln, l, c = find_line(b, chk[2])
   local ok = false
   local observed = "line-not-found"
   if ln then
-    local labs = complete_labels(b, ln, #l)
+    local char = (c - 1) + #chk[2] -- 0-based position right after the matched selector
+    local labs = complete_labels(b, ln, char)
     ok = labs[chk[3]] == true
     if not ok then
       local s = {}
@@ -165,7 +179,15 @@ for _, g in ipairs(GOTO) do
   local ok = false
   local uri = "line-not-found"
   if ln then
-    local col = l:find(g[3], 1, true)
+    -- Use the LAST occurrence of the token on the line: the type USAGE (e.g. `= SpanishGreeter()`),
+    -- not the same name embedded in the function/val name (`fun probeUsesSpanishGreeter`).
+    local col
+    local from = 1
+    while true do
+      local s = l:find(g[3], from, true)
+      if not s then break end
+      col = s; from = s + 1
+    end
     if col then
       col = col - 1
       local r = vim.lsp.buf_request_sync(b, "textDocument/definition",

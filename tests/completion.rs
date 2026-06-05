@@ -1189,3 +1189,19 @@ fn data_class_property_via_chain_and_element() {
                  //- Main.kt\npackage app\nimport kotlin.collections.listOf\nfun f() {\n    listOf(User(\"x\")).first().ema/*^*/\n}\n";
     check_contains(input, &["email"]);
 }
+
+#[test]
+fn named_lambda_param_element_type() {
+    // `xs.map { user -> user.<member> }` — named param `user` takes the element type.
+    let input = "//- coll.kt\npackage kotlin.collections\nclass List<E>\nfun <T> List<T>.map(f: (T) -> Unit) {}\n\
+                 //- app.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nimport kotlin.collections.map\nfun f(xs: List<Foo>) {\n    xs.map { item ->\n        item.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn named_lambda_param_in_let() {
+    let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\nfun makeFoo(): Foo = Foo()\n\
+                 //- Main.kt\npackage app\nfun f() {\n    makeFoo().let { result ->\n        result.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
