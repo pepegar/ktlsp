@@ -952,3 +952,39 @@ fn smart_cast_var_reassigned_is_not_narrowed() {
                  //- Main.kt\npackage app\nfun f(p: Any, other: Any) {\n    var w: Any = p\n    if (w is Dog) {\n        w = other\n        w.ba/*^*/\n    }\n}\n";
     check_none(input);
 }
+
+// --------------------------------------------------------------------------------------------
+// Gradual checker U2: smart-cast narrowing through && (compound if + short-circuit)
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn smart_cast_compound_if_condition_leading() {
+    // `if (x is Dog && cond)` narrows x in the then-branch.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any, ok: Boolean) {\n    if (x is Dog && ok) {\n        x.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn smart_cast_compound_if_condition_trailing() {
+    // `if (cond && x is Dog)` also narrows (either conjunct may carry the guard).
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any, ok: Boolean) {\n    if (ok && x is Dog) {\n        x.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn smart_cast_and_short_circuit() {
+    // `x is Dog && x.bark` narrows x in the right operand of `&&`.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark(): Boolean = true\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any) {\n    val ok = x is Dog && x.ba/*^*/\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn smart_cast_or_does_not_narrow_then_branch() {
+    // `if (x is Dog || cond)` must NOT narrow — x isn't guaranteed Dog in the then-branch.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(x: Any, ok: Boolean) {\n    if (x is Dog || ok) {\n        x.ba/*^*/\n    }\n}\n";
+    check_none(input);
+}

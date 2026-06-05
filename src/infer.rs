@@ -126,6 +126,12 @@ fn narrowed_type_name(ident: Node, name: &str, src: &str) -> Option<String> {
                     return Some(t);
                 }
             }
+            // `x is T && <…x…>`: the right operand of `&&` runs only when the left conjunct is true.
+            "binary_expression" => {
+                if let Some(t) = and_short_circuit_narrowing(n, ident, name, src) {
+                    return Some(t);
+                }
+            }
             _ => {}
         }
         cur = n.parent();
@@ -133,17 +139,12 @@ fn narrowed_type_name(ident: Node, name: &str, src: &str) -> Option<String> {
     None
 }
 
-/// Narrowing from `if (name is T) <then>`: only inside the then-branch, only for the positive `is`.
+/// Narrowing from `if (<guard on name>) <then>`: the guard may be a bare `name is T` OR a `&&`
+/// compound containing one (`if (name is T && cond)` / `if (cond && name is T)`). Only the then-branch
+/// is narrowed, only for the positive `is`, only for a stable binding.
 fn if_narrowing(if_expr: Node, ident: Node, name: &str, src: &str) -> Option<String> {
     let cond = if_expr.child_by_field_name("condition")?;
-    if cond.kind() != "is_expression" || has_child_token(cond, "!is") {
-        return None; // not an `is` test, or a negated one (narrows the else-branch, not here)
-    }
-    let left = cond.child_by_field_name("left")?;
-    if node_text(left, src) != name {
-        return None;
-    }
-    let right = cond.child_by_field_name("right")?;
+    let narrowed = guard_type_name(cond, name, src)?;
     // The then-branch is the named child right after the condition (index 1); the else (if any) is
     // index 2. Only narrow when `ident` is within the then-branch.
     let then_branch = if_expr.named_child(1)?;
@@ -153,7 +154,49 @@ fn if_narrowing(if_expr: Node, ident: Node, name: &str, src: &str) -> Option<Str
     if !is_stable_for_narrowing(ident, name, cond.start_byte(), src) {
         return None;
     }
-    type_node_simple_name(right, src)
+    Some(narrowed)
+}
+
+/// If boolean `guard` proves `name is T` — directly (`name is T`), through `&&` conjuncts
+/// (`a && name is T && b`), or through parentheses — return the narrowed simple type name. Positive
+/// `is` only; `!is` and other operators do not narrow here.
+fn guard_type_name(guard: Node, name: &str, src: &str) -> Option<String> {
+    match guard.kind() {
+        "is_expression" => {
+            if has_child_token(guard, "!is") {
+                return None;
+            }
+            let left = guard.child_by_field_name("left")?;
+            if node_text(left, src) != name {
+                return None;
+            }
+            type_node_simple_name(guard.child_by_field_name("right")?, src)
+        }
+        "binary_expression" if has_child_token(guard, "&&") => guard
+            .child_by_field_name("left")
+            .and_then(|l| guard_type_name(l, name, src))
+            .or_else(|| guard.child_by_field_name("right").and_then(|r| guard_type_name(r, name, src))),
+        "parenthesized_expression" => guard.named_child(0).and_then(|n| guard_type_name(n, name, src)),
+        _ => None,
+    }
+}
+
+/// `<guard on name> && <…name…>`: within the right operand of `&&`, narrow `name` when the left
+/// operand proves `name is T` (the left conjunct is true before the right runs). Stability-gated.
+fn and_short_circuit_narrowing(be: Node, ident: Node, name: &str, src: &str) -> Option<String> {
+    if !has_child_token(be, "&&") {
+        return None;
+    }
+    let left = be.child_by_field_name("left")?;
+    let right = be.child_by_field_name("right")?;
+    if ident.start_byte() < right.start_byte() || ident.end_byte() > right.end_byte() {
+        return None;
+    }
+    let narrowed = guard_type_name(left, name, src)?;
+    if !is_stable_for_narrowing(ident, name, be.start_byte(), src) {
+        return None;
+    }
+    Some(narrowed)
 }
 
 /// Narrowing from a `when(name) { is T -> <body> }` entry: only when the when-subject is the bare
