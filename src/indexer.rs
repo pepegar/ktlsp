@@ -416,6 +416,51 @@ pub(crate) fn value_type_of(var_decl: Node, src: &str) -> Option<TypeRef> {
     None
 }
 
+/// Whether `node` has a direct (possibly anonymous) child token equal to `token` — for detecting the
+/// `val`/`var` keyword on a `class_parameter` (anonymous tokens, invisible to `named_children`).
+fn has_child_token(node: Node, token: &str) -> bool {
+    let mut cursor = node.walk();
+    for c in node.children(&mut cursor) {
+        if !c.is_named() && c.kind() == token {
+            return true;
+        }
+    }
+    false
+}
+
+/// Index a class's primary-constructor `val`/`var` parameters as `Property` members of the class.
+/// A `class_parameter` with a `val`/`var` keyword IS a property (the data-class case); a plain
+/// parameter (no keyword) is just a constructor argument and is not indexed. Shape (verified via
+/// `examples/dump`): `class_declaration > primary_constructor > class_parameters > class_parameter`,
+/// with the `val`/`var` as an anonymous token child of `class_parameter`.
+fn push_ctor_properties(
+    out: &mut Vec<IndexedSymbol>,
+    class_decl: Node,
+    src: &str,
+    package: &str,
+    container: &str,
+) {
+    let Some(pc) = child_of_kind(class_decl, "primary_constructor") else {
+        return;
+    };
+    let Some(cps) = child_of_kind(pc, "class_parameters") else {
+        return;
+    };
+    let mut cursor = cps.walk();
+    for cp in cps.named_children(&mut cursor) {
+        if cp.kind() != "class_parameter" {
+            continue;
+        }
+        if !has_child_token(cp, "val") && !has_child_token(cp, "var") {
+            continue; // a plain parameter, not a property
+        }
+        if let Some(id) = first_ident(cp) {
+            let vt = value_type_of(cp, src);
+            push_ext(out, id, src, SymbolKind::Property, package, Some(container), None, vt);
+        }
+    }
+}
+
 /// First descendant of `node` (depth-first) with the given kind.
 fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
@@ -441,6 +486,10 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
                     let tps = type_params_of(child, src);
                     push_type(out, name, src, kind, package, container, sts, tps);
                     let cname = node_text(name, src).to_string();
+                    // Primary-constructor `val`/`var` parameters ARE properties of the class (this is
+                    // every data-class property). Index them as members; plain params (no val/var) are
+                    // not members and stay unindexed.
+                    push_ctor_properties(out, child, src, package, &cname);
                     let mut c2 = child.walk();
                     for body in child.named_children(&mut c2) {
                         if matches!(body.kind(), "class_body" | "enum_class_body") {
@@ -530,14 +579,32 @@ object Reg { fun add() {} }
         assert!(got.contains(&"TOP"));
         assert!(got.contains(&"Reg"));
         assert!(got.contains(&"add"));
-        // Constructor params and locals are NOT indexed cross-file.
-        assert!(!got.contains(&"name"));
+        // A primary-constructor `val` IS a property member of the class (data-class case).
+        assert!(got.contains(&"name"));
+        let name = syms.iter().find(|s| s.name == "name").unwrap();
+        assert_eq!(name.kind, SymbolKind::Property);
+        assert_eq!(name.container.as_deref(), Some("Greeter"));
+        assert_eq!(name.value_type.as_ref().map(|t| t.name.as_str()), Some("String"));
         // members carry their container
         let greet = syms.iter().find(|s| s.name == "greet").unwrap();
         assert_eq!(greet.container.as_deref(), Some("Greeter"));
         assert_eq!(greet.package, "app");
         let helper = syms.iter().find(|s| s.name == "helper").unwrap();
         assert_eq!(helper.container, None);
+    }
+
+    #[test]
+    fn constructor_val_var_are_properties_plain_params_are_not() {
+        let src = "data class P(val pid: Long, var pname: String, plainArg: Int)\n";
+        let syms = index(src);
+        let got = names(&syms);
+        assert!(got.contains(&"pid"), "val ctor param is a property");
+        assert!(got.contains(&"pname"), "var ctor param is a property");
+        assert!(!got.contains(&"plainArg"), "a plain ctor param (no val/var) is NOT a member");
+        let pid = syms.iter().find(|s| s.name == "pid").unwrap();
+        assert_eq!(pid.kind, SymbolKind::Property);
+        assert_eq!(pid.container.as_deref(), Some("P"));
+        assert_eq!(pid.value_type.as_ref().map(|t| t.name.as_str()), Some("Long"));
     }
 
     #[test]

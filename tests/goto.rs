@@ -381,3 +381,12 @@ fn member_goto_inherited_via_supertype() {
          //- Main.kt\npackage app\nfun main() {\n    val x = Button()\n    x./*^*/render()\n}\n",
     );
 }
+
+#[test]
+fn goto_data_class_property() {
+    // goto on a data-class property usage resolves to the constructor `val` declaration.
+    check(
+        "//- lib.kt\npackage app\ndata class User(val /*def*/email: String)\n\
+         //- Main.kt\npackage app\nfun f(u: User) {\n    u./*^*/email\n}\n",
+    );
+}

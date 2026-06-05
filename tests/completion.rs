@@ -1153,3 +1153,39 @@ fn overload_unknown_argument_does_not_misresolve() {
                  //- Main.kt\npackage app\nfun f(r: R, mystery: Whatever) {\n    r.pick(mystery).o/*^*/\n}\n";
     check_none(input);
 }
+
+// --------------------------------------------------------------------------------------------
+// Constructor / data-class property completion (found by the comprehensive Gradle verification)
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn data_class_property_completion() {
+    let input = "//- lib.kt\npackage app\ndata class User(val id: Long, val email: String, var active: Boolean)\n\
+                 //- Main.kt\npackage app\nfun f() {\n    val u = User(1L, \"a@b\", true)\n    u.ema/*^*/\n}\n";
+    check_contains(input, &["email"]);
+}
+
+#[test]
+fn constructor_property_on_regular_class() {
+    let input = "//- lib.kt\npackage app\nclass Box(val width: Int, val height: Int)\n\
+                 //- Main.kt\npackage app\nfun f(b: Box) {\n    b.wid/*^*/\n}\n";
+    check_contains(input, &["width"]);
+}
+
+#[test]
+fn plain_constructor_param_is_not_a_member() {
+    // A constructor param WITHOUT val/var is not a property -> not offered as a member.
+    let input = "//- lib.kt\npackage app\nclass C(plainArg: Int) {\n    fun real() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(c: C) {\n    c./*^*/\n}\n";
+    check_contains(input, &["real"]);
+    check_excludes(input, &["plainArg"]);
+}
+
+#[test]
+fn data_class_property_via_chain_and_element() {
+    // listOf(User).first().<property> — element type + constructor-property member.
+    let input = "//- lib.kt\npackage kotlin.collections\nclass List<E> {\n    fun first(): E = TODO()\n}\nfun <T> listOf(vararg e: T): List<T> = TODO()\n\
+                 //- app.kt\npackage app\ndata class User(val email: String)\n\
+                 //- Main.kt\npackage app\nimport kotlin.collections.listOf\nfun f() {\n    listOf(User(\"x\")).first().ema/*^*/\n}\n";
+    check_contains(input, &["email"]);
+}
