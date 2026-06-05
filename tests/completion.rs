@@ -1023,3 +1023,43 @@ fn no_narrowing_without_terminating_statement() {
                  //- Main.kt\npackage app\nfun f(x: Any) {\n    if (x !is Dog) {}\n    x.ba/*^*/\n}\n";
     check_none(input);
 }
+
+// --------------------------------------------------------------------------------------------
+// Gradual checker U4: overload partition (member > extension) + arity disambiguation
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn overload_member_wins_over_extension() {
+    // A member and a same-named extension both return-typed: the member group wins (its return type
+    // drives the next member access), even though the extension is also applicable.
+    let input = "//- lib.kt\npackage app\n\
+                 class A {\n    fun bar() {}\n}\n\
+                 class B {\n    fun baz() {}\n}\n\
+                 class R {\n    fun member(): A = A()\n}\n\
+                 fun R.member(): B = B()\n\
+                 //- Main.kt\npackage app\nfun f(r: R) {\n    r.member().ba/*^*/\n}\n";
+    check_contains(input, &["bar"]); // member -> A -> bar
+    check_excludes(input, &["baz"]); // extension -> B -> baz must NOT win
+}
+
+#[test]
+fn overload_arity_disambiguates_return_type() {
+    // Two overloads of different arity and return type; the call's arg count selects the right one.
+    let input = "//- lib.kt\npackage app\n\
+                 class One {\n    fun one() {}\n}\n\
+                 class Two {\n    fun two() {}\n}\n\
+                 class R {\n    fun pick(): One = One()\n    fun pick(a: Int, b: Int): Two = Two()\n}\n\
+                 //- Main.kt\npackage app\nfun f(r: R) {\n    r.pick(1, 2).tw/*^*/\n}\n";
+    check_contains(input, &["two"]); // 2-arg overload -> Two -> two
+}
+
+#[test]
+fn overload_conflicting_returns_same_arity_is_unknown() {
+    // Two same-arity overloads with different return types and no disambiguator -> Unknown (silent).
+    let input = "//- lib.kt\npackage app\n\
+                 class One {\n    fun one() {}\n}\n\
+                 class Two {\n    fun two() {}\n}\n\
+                 class R {\n    fun pick(a: Int): One = One()\n    fun pick(a: String): Two = Two()\n}\n\
+                 //- Main.kt\npackage app\nfun f(r: R) {\n    r.pick(1).o/*^*/\n}\n";
+    check_none(input);
+}

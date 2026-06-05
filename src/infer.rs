@@ -544,10 +544,25 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
                 return Type::Unknown;
             };
             let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
-            member_type(index, &recv_ty, node_text(sel, src), true, ctx, depth)
+            member_type(index, &recv_ty, node_text(sel, src), true, Some(value_arg_count(node)), ctx, depth)
         }
         _ => Type::Unknown,
     }
+}
+
+/// The number of value arguments of a call: the `value_argument` children of its `value_arguments`
+/// node, plus one for a trailing `annotated_lambda` (`f(a) { … }` / `xs.map { … }`). Used for
+/// arity-based overload disambiguation.
+fn value_arg_count(call: Node) -> usize {
+    let mut n = 0;
+    if let Some(va) = child_of_kind(call, "value_arguments") {
+        let mut cursor = va.walk();
+        n += va.named_children(&mut cursor).filter(|x| x.kind() == "value_argument").count();
+    }
+    if child_of_kind(call, "annotated_lambda").is_some() {
+        n += 1;
+    }
+    n
 }
 
 /// A standalone `recv.prop` navigation (no call): infer recv, then the type of property `prop`.
@@ -556,18 +571,23 @@ fn infer_navigation(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: 
         return Type::Unknown;
     };
     let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
-    member_type(index, &recv_ty, node_text(sel, src), false, ctx, depth)
+    member_type(index, &recv_ty, node_text(sel, src), false, None, ctx, depth)
 }
 
-/// The type of member `name` accessed on receiver type `recv_ty`. Walks the receiver's supertype
-/// closure (bounded) and its extensions; `want_function` selects a function's `return_type`,
-/// otherwise a property's `value_type`. Members are package-filtered when the receiver package is
-/// known. Returns [`Type::Unknown`] if the member or its type can't be resolved.
+/// The type of member `name` accessed on receiver type `recv_ty`. Resolves overloads as a Kotlin-style
+/// **priority partition**: collect all matching candidates across the supertype closure tagged as
+/// members vs extensions; the **first non-empty group wins** (members before extensions, even over a
+/// more specific extension). For a function call, `arg_count` then prefers exact-arity candidates when
+/// any exist (never emptying the set). Finally, resolve each surviving candidate's type and return it
+/// only if they **all agree** — otherwise [`Type::Unknown`] (ambiguous → silent, never a wrong pick).
+/// `want_function` selects a function's `return_type`, else a property's `value_type`. Members are
+/// package-filtered when the receiver package is known.
 fn member_type(
     index: &Index,
     recv_ty: &Type,
     name: &str,
     want_function: bool,
+    arg_count: Option<usize>,
     ctx: &FileCtx,
     depth: usize,
 ) -> Type {
@@ -577,6 +597,8 @@ fn member_type(
     let root_pkg = recv_ty.package().map(str::to_string);
     let mut visited: HashSet<String> = HashSet::new();
     let mut frontier: Vec<(String, Option<String>, usize)> = vec![(root.to_string(), root_pkg, 0)];
+    let mut members: Vec<&crate::index::Entry> = Vec::new();
+    let mut extensions: Vec<&crate::index::Entry> = Vec::new();
     while let Some((cur, cur_pkg, d)) = frontier.pop() {
         if !visited.insert(cur.clone()) || d > SUPERTYPE_CAP {
             continue;
@@ -587,23 +609,13 @@ fn member_type(
                     continue;
                 }
             }
-            if e.sym.name == name {
-                if let Some(tr) = member_type_ref(e, want_function) {
-                    if let Some(sub) = substitute_type_var(recv_ty, tr, index) {
-                        return sub;
-                    }
-                    return resolve_type_ref(index, tr, ctx, depth + 1);
-                }
+            if e.sym.name == name && member_type_ref(e, want_function).is_some() {
+                members.push(e);
             }
         }
         for e in index.extensions_for(&cur) {
-            if e.sym.name == name {
-                if let Some(tr) = member_type_ref(e, want_function) {
-                    if let Some(sub) = substitute_type_var(recv_ty, tr, index) {
-                        return sub;
-                    }
-                    return resolve_type_ref(index, tr, ctx, depth + 1);
-                }
+            if e.sym.name == name && member_type_ref(e, want_function).is_some() {
+                extensions.push(e);
             }
         }
         for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
@@ -611,7 +623,39 @@ fn member_type(
             frontier.push((sup, sup_pkg, d + 1));
         }
     }
-    Type::Unknown
+
+    // Priority partition: members before extensions (first non-empty group wins).
+    let mut group = if !members.is_empty() { members } else { extensions };
+    if group.is_empty() {
+        return Type::Unknown;
+    }
+    // Arity disambiguation (function calls only): prefer exact-arity candidates when any exist; never
+    // empty the set (a vararg/default mismatch falls back to the whole group rather than dropping all).
+    if want_function {
+        if let Some(n) = arg_count {
+            let exact: Vec<&crate::index::Entry> =
+                group.iter().copied().filter(|e| e.sym.arity == Some(n as u8)).collect();
+            if !exact.is_empty() {
+                group = exact;
+            }
+        }
+    }
+    // Resolve each candidate's type; agree -> that type, disagree -> Unknown (ambiguous, stay silent).
+    let mut result: Option<Type> = None;
+    for e in group {
+        let tr = match member_type_ref(e, want_function) {
+            Some(tr) => tr,
+            None => continue,
+        };
+        let t = substitute_type_var(recv_ty, tr, index)
+            .unwrap_or_else(|| resolve_type_ref(index, tr, ctx, depth + 1));
+        match &result {
+            None => result = Some(t),
+            Some(prev) if *prev == t => {}
+            Some(_) => return Type::Unknown,
+        }
+    }
+    result.unwrap_or(Type::Unknown)
 }
 
 /// One-level generic substitution for a single type variable: a member whose declared type is a
