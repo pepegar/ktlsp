@@ -1092,3 +1092,32 @@ fn non_generic_free_function_still_resolves() {
                  //- Main.kt\npackage app\nfun f() {\n    makeBar().des/*^*/\n}\n";
     check_contains(input, &["describe"]);
 }
+
+// --------------------------------------------------------------------------------------------
+// Gradual checker U8: it-typing in collection lambdas (element type)
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn lambda_it_is_element_type_in_map() {
+    // `xs.map { it.<member> }` types `it` as the element type of xs: List<Foo>.
+    let input = "//- coll.kt\npackage kotlin.collections\nclass List<E>\nfun <T> List<T>.map(f: (T) -> Unit) {}\n\
+                 //- app.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nimport kotlin.collections.map\nfun f(xs: List<Foo>) {\n    xs.map {\n        it.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn lambda_it_element_type_in_filter() {
+    let input = "//- coll.kt\npackage kotlin.collections\nclass List<E>\nfun <T> List<T>.filter(f: (T) -> Boolean) {}\n\
+                 //- app.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nimport kotlin.collections.filter\nfun f(xs: List<Foo>) {\n    xs.filter {\n        it.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn lambda_it_in_let_is_whole_receiver() {
+    // Regression: let/also still give `it` the whole receiver type (not an element).
+    let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\nfun makeFoo(): Foo = Foo()\n\
+                 //- Main.kt\npackage app\nfun f() {\n    makeFoo().let {\n        it.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}

@@ -381,8 +381,22 @@ fn type_node_simple_name(node: Node, src: &str) -> Option<String> {
     last.map(|n| node_text(n, src).to_string())
 }
 
-/// If `it` sits inside the trailing lambda of a `recv.let { … }` / `recv.also { … }` call, its type
-/// is `recv`'s type. (`it` binds to the innermost lambda, so we stop at the first `lambda_literal`.)
+/// Collection transform/query operations whose lambda binds `it` to the receiver's ELEMENT type
+/// (`Iterable<T>.fn(… (T) -> …)`). For these, `it` is the receiver's single type argument. (`Map`
+/// ops bind `it` to an entry, not a single type arg — they're excluded by the single-arg guard.)
+const ELEMENT_LAMBDA_OPS: &[&str] = &[
+    "map", "mapNotNull", "mapIndexed", "filter", "filterNot", "filterNotNull", "forEach", "onEach",
+    "flatMap", "any", "all", "none", "find", "firstOrNull", "first", "last", "lastOrNull", "count",
+    "sumOf", "maxByOrNull", "minByOrNull", "sortedBy", "sortedByDescending", "groupBy", "associateBy",
+    "associateWith", "takeWhile", "dropWhile", "partition", "indexOfFirst", "single", "singleOrNull",
+];
+
+/// The type of `it` inside the trailing lambda of a scope/collection call:
+/// - `recv.let { … }` / `recv.also { … }` → `it` is `recv`'s type.
+/// - `recv.map { … }` / `filter`/`forEach`/… (see `ELEMENT_LAMBDA_OPS`) → `it` is `recv`'s single
+///   element type (`List<Foo>` → `Foo`), when the receiver has exactly one type argument.
+///
+/// `it` binds to the innermost lambda, so we stop at the first `lambda_literal`.
 fn it_receiver_type(
     index: &Index,
     ident: Node,
@@ -393,26 +407,28 @@ fn it_receiver_type(
     let mut cur = ident.parent();
     while let Some(n) = cur {
         if n.kind() == "lambda_literal" {
-            let annotated = n.parent()?;
-            let call = annotated.parent()?;
-            if call.kind() == "call_expression" {
-                if let Some(callee) = call.named_child(0) {
-                    if callee.kind() == "navigation_expression" {
-                        if let Some(sel) = callee.named_child(1) {
-                            let s = node_text(sel, src);
-                            if s == "let" || s == "also" {
-                                if let Some(recv) = callee.named_child(0) {
-                                    let t = infer_depth(index, recv, src, ctx, depth + 1);
-                                    if t.name().is_some() {
-                                        return Some(t);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
+            let call = n.parent()?.parent()?; // lambda_literal -> annotated_lambda -> call_expression
+            if call.kind() != "call_expression" {
+                return None;
             }
-            return None; // `it` belongs to this innermost lambda
+            let callee = call.named_child(0)?;
+            if callee.kind() != "navigation_expression" {
+                return None;
+            }
+            let sel = node_text(callee.named_child(1)?, src);
+            let recv = callee.named_child(0)?;
+            let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
+            return if sel == "let" || sel == "also" {
+                recv_ty.name().is_some().then_some(recv_ty)
+            } else if ELEMENT_LAMBDA_OPS.contains(&sel) {
+                // `it` is the receiver's single element type (e.g. List<Foo> -> Foo).
+                match recv_ty.args() {
+                    [elem] if elem.name().is_some() => Some(elem.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
         }
         cur = n.parent();
     }
