@@ -31,6 +31,9 @@ pub struct Backend {
     /// Whether the client advertised snippet support in `initialize`. Set once; gates whether
     /// completion items insert `name($0)` snippets or plain bare names.
     snippets_supported: Mutex<bool>,
+    /// Whether opt-in gradle compile diagnostics are enabled (`initialization_options`). Set once in
+    /// `initialize`; default off, so with it disabled ktlsp never spawns a JVM/gradle process.
+    compile_enabled: Mutex<bool>,
     /// Per-document edit counter for debouncing diagnostics: each `did_open`/`did_change` bumps the
     /// counter; a scheduled recompute only publishes if the counter still matches (else superseded).
     doc_versions: Arc<Mutex<HashMap<String, u64>>>,
@@ -43,6 +46,7 @@ impl Backend {
             ws: Arc::new(Mutex::new(Workspace::new())),
             root: Mutex::new(None),
             snippets_supported: Mutex::new(false),
+            compile_enabled: Mutex::new(false),
             doc_versions: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -149,6 +153,17 @@ fn key_to_uri(key: &str) -> Option<Uri> {
     Uri::from_file_path(key)
 }
 
+/// Whether `initialization_options.compile_diagnostics.enabled` is `true`. Default `false` (missing
+/// options, missing keys, or a non-bool value never enables — no coercion). Kept here, at the LSP
+/// boundary, so the `serde_json::Value` payload concern stays out of the pure core.
+fn compile_enabled_from(opts: &Option<serde_json::Value>) -> bool {
+    opts.as_ref()
+        .and_then(|v| v.get("compile_diagnostics"))
+        .and_then(|c| c.get("enabled"))
+        .and_then(|e| e.as_bool())
+        .unwrap_or(false)
+}
+
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Remember the workspace root so `initialized` can index it off the request path.
@@ -179,6 +194,11 @@ impl LanguageServer for Backend {
             .and_then(|ci| ci.snippet_support)
             .unwrap_or(false);
         *self.snippets_supported.lock().unwrap() = snippets;
+
+        // Opt-in gradle compile diagnostics (default off). Read once here so the rest of the server
+        // can gate cheaply without re-parsing the options payload.
+        *self.compile_enabled.lock().unwrap() =
+            compile_enabled_from(&params.initialization_options);
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -455,4 +475,31 @@ fn def_to_location(ws: &Workspace, d: &Def) -> Option<Location> {
             end: Position { line: el, character: ec },
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn compile_enabled_when_set_true() {
+        let opts = Some(json!({ "compile_diagnostics": { "enabled": true } }));
+        assert!(compile_enabled_from(&opts));
+    }
+
+    #[test]
+    fn compile_disabled_by_default() {
+        assert!(!compile_enabled_from(&None));
+        assert!(!compile_enabled_from(&Some(json!({}))));
+        assert!(!compile_enabled_from(&Some(json!({ "unrelated": 1 }))));
+        assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": {} }))));
+    }
+
+    #[test]
+    fn compile_enabled_no_coercion() {
+        assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": "true" } }))));
+        assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": 1 } }))));
+        assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": false } }))));
+    }
 }
