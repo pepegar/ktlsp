@@ -6,6 +6,7 @@
 
 pub mod artifacts;
 pub mod catalog;
+pub mod compile;
 pub mod complete;
 pub mod coords;
 pub mod deps;

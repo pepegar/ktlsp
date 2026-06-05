@@ -18,6 +18,7 @@ use crate::parser::{join_identifiers, node_text};
 /// Diagnostic severity, mapped to the LSP enum in `lsp.rs` (the only LSP-aware site).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Severity {
+    Error,
     Warning,
     Hint,
 }

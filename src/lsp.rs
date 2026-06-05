@@ -430,6 +430,7 @@ fn to_lsp_diagnostic(
             end: Position { line: el, character: ec },
         },
         severity: Some(match d.severity {
+            Severity::Error => DiagnosticSeverity::ERROR,
             Severity::Warning => DiagnosticSeverity::WARNING,
             Severity::Hint => DiagnosticSeverity::HINT,
         }),
