@@ -923,3 +923,32 @@ fn smart_cast_when_compound_subject_does_not_narrow_wrong_var() {
     check_contains(input, &["typeTag"]); // w is still Holder
     check_excludes(input, &["click"]); // must NOT leak Button's member
 }
+
+// --------------------------------------------------------------------------------------------
+// Gradual checker U1: smart-cast stability gate (var soundness)
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn smart_cast_val_local_narrows() {
+    // A `val` local is stable -> narrows like a parameter does.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(p: Any) {\n    val v: Any = p\n    if (v is Dog) {\n        v.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn smart_cast_var_local_narrows_when_not_reassigned() {
+    // A `var` local with no reassignment between check and use is stable -> narrows.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(p: Any) {\n    var w: Any = p\n    if (w is Dog) {\n        w.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bark"]);
+}
+
+#[test]
+fn smart_cast_var_reassigned_is_not_narrowed() {
+    // Reassigning the `var` between the check and the use makes the smart-cast unsound -> refuse to
+    // narrow (w stays Any, which has no members -> silent omission). This is the soundness fix.
+    let input = "//- lib.kt\npackage app\nclass Dog {\n    fun bark() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f(p: Any, other: Any) {\n    var w: Any = p\n    if (w is Dog) {\n        w = other\n        w.ba/*^*/\n    }\n}\n";
+    check_none(input);
+}

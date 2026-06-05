@@ -150,6 +150,9 @@ fn if_narrowing(if_expr: Node, ident: Node, name: &str, src: &str) -> Option<Str
     if ident.start_byte() < then_branch.start_byte() || ident.end_byte() > then_branch.end_byte() {
         return None;
     }
+    if !is_stable_for_narrowing(ident, name, cond.start_byte(), src) {
+        return None;
+    }
     type_node_simple_name(right, src)
 }
 
@@ -174,7 +177,73 @@ fn when_entry_narrowing(entry: Node, ident: Node, name: &str, src: &str) -> Opti
         return None;
     }
     let ut = child_of_kind(cond, "user_type")?;
+    if !is_stable_for_narrowing(ident, name, cond.start_byte(), src) {
+        return None;
+    }
     type_node_simple_name(ut, src)
+}
+
+/// Whether `name` (used at `ident`) is stable enough to smart-cast, given the narrowing check began at
+/// byte `check_start`. Kotlin only smart-casts stable values; narrowing an unstable one is unsound (a
+/// wrong type → wrong members). Rules: a parameter is always stable (params are immutable); a `val`
+/// local is stable; a `var` local is stable only if it is not reassigned textually between the check
+/// and the use; anything we can't resolve to a local/param (a member/property that might have a custom
+/// getter) is treated as not stable. Conservative by design — refusing to narrow falls back to the
+/// declared type, never a wrong one.
+fn is_stable_for_narrowing(ident: Node, name: &str, check_start: usize, src: &str) -> bool {
+    let Some((decl, kind)) = resolve::local_decl(ident, name, UseKind::Value, src) else {
+        return false;
+    };
+    match kind {
+        SymbolKind::Parameter => true,
+        SymbolKind::LocalVariable => {
+            // `val` vs `var`: decl is the binder identifier; go up to variable_declaration, then to
+            // property_declaration, and test the anonymous `val` token child.
+            let is_val = decl
+                .parent()
+                .and_then(|vd| vd.parent())
+                .filter(|p| p.kind() == "property_declaration")
+                .is_some_and(|p| has_child_token(p, "val"));
+            if is_val {
+                return true;
+            }
+            // `var`: stable only if not reassigned textually between the check and the use.
+            !reassigned_between(ident, name, check_start, ident.start_byte(), src)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `name` is the target of an `assignment` textually in the byte window `(lo, hi)` anywhere in
+/// the nearest enclosing function body / file. A conservative over-approximation of "reassigned
+/// between the check and the use" (no CFG): any textual reassignment in the window refuses narrowing.
+fn reassigned_between(ident: Node, name: &str, lo: usize, hi: usize, src: &str) -> bool {
+    let mut scope = ident;
+    while let Some(p) = scope.parent() {
+        scope = p;
+        if matches!(scope.kind(), "function_body" | "function_declaration" | "source_file") {
+            break;
+        }
+    }
+    has_assignment_to(scope, name, lo, hi, src)
+}
+
+fn has_assignment_to(node: Node, name: &str, lo: usize, hi: usize, src: &str) -> bool {
+    if node.kind() == "assignment" {
+        if let Some(left) = node.child_by_field_name("left") {
+            let s = node.start_byte();
+            if left.kind() == "identifier" && node_text(left, src) == name && s > lo && s < hi {
+                return true;
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for ch in node.named_children(&mut cursor) {
+        if has_assignment_to(ch, name, lo, hi, src) {
+            return true;
+        }
+    }
+    false
 }
 
 /// The simple name of a `user_type` / `nullable_type` node (last direct `identifier` child of the
