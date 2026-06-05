@@ -83,6 +83,16 @@ pub struct IndexedSymbol {
     /// the property has no explicit type annotation. Drives member-of-a-property inference.
     #[serde(default)]
     pub value_type: Option<TypeRef>,
+    /// For a `Function`: the declared types of its value parameters, in declaration order (one entry
+    /// per parameter; a parameter without an annotation gets `TypeRef::default()`). Used for
+    /// argument-type overload disambiguation. Empty for non-functions. `#[serde(default)]`.
+    #[serde(default)]
+    pub params: Vec<TypeRef>,
+    /// For a generic `Function` or type (`fun <T, R>` / `class Box<T>`): the declared formal
+    /// type-parameter names. Used to tell a type variable from a concrete type during generic
+    /// substitution. Empty for non-generic declarations. `#[serde(default)]`.
+    #[serde(default)]
+    pub type_params: Vec<String>,
 }
 
 impl IndexedSymbol {
@@ -108,6 +118,8 @@ impl IndexedSymbol {
             arity: None,
             return_type: None,
             value_type: None,
+            params: Vec::new(),
+            type_params: Vec::new(),
         }
     }
 }

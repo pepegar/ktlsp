@@ -144,6 +144,8 @@ fn push_function(
         ext_receiver: ext_receiver.map(str::to_string),
         arity: Some(value_param_count(decl)),
         return_type: return_type_of(decl, src),
+        params: param_types_of(decl, src),
+        type_params: type_params_of(decl, src),
         ..IndexedSymbol::new(
             node_text(name_node, src),
             SymbolKind::Function,
@@ -172,7 +174,7 @@ fn value_param_count(decl: Node) -> u8 {
     n.min(u8::MAX as usize) as u8
 }
 
-/// Push a type declaration's name with its `supertypes`.
+/// Push a type declaration's name with its `supertypes` and formal `type_params`.
 fn push_type(
     out: &mut Vec<IndexedSymbol>,
     name_node: Node,
@@ -181,9 +183,11 @@ fn push_type(
     package: &str,
     container: Option<&str>,
     supertypes: Vec<String>,
+    type_params: Vec<String>,
 ) {
     out.push(IndexedSymbol {
         supertypes,
+        type_params,
         ..IndexedSymbol::new(
             node_text(name_node, src),
             kind,
@@ -193,6 +197,42 @@ fn push_type(
             name_node.end_byte(),
         )
     });
+}
+
+/// The formal type-parameter names of a `function_declaration` / `class_declaration` (the `<T, R>`):
+/// the first `identifier` of each `type_parameter` under the `type_parameters` child. Empty when the
+/// declaration is non-generic. Verified via `examples/dump`.
+fn type_params_of(decl: Node, src: &str) -> Vec<String> {
+    let Some(tps) = child_of_kind(decl, "type_parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = tps.walk();
+    for tp in tps.named_children(&mut cursor) {
+        if tp.kind() == "type_parameter" {
+            if let Some(id) = first_ident(tp) {
+                out.push(node_text(id, src).to_string());
+            }
+        }
+    }
+    out
+}
+
+/// The declared types of a `function_declaration`'s value parameters, in order (one [`TypeRef`] per
+/// `parameter`; an unannotated parameter — rare for named functions — gets `TypeRef::default()` to
+/// preserve positional alignment). Empty when there is no `function_value_parameters` child.
+fn param_types_of(decl: Node, src: &str) -> Vec<TypeRef> {
+    let Some(params) = child_of_kind(decl, "function_value_parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = params.walk();
+    for p in params.named_children(&mut cursor) {
+        if p.kind() == "parameter" {
+            out.push(value_type_of(p, src).unwrap_or_default());
+        }
+    }
+    out
 }
 
 /// The simple names of a `class_declaration`/`object_declaration`'s declared supertypes
@@ -398,7 +438,8 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
                 let kind = class_kind(child);
                 if let Some(name) = name_field(child) {
                     let sts = supertypes_of(child, src);
-                    push_type(out, name, src, kind, package, container, sts);
+                    let tps = type_params_of(child, src);
+                    push_type(out, name, src, kind, package, container, sts, tps);
                     let cname = node_text(name, src).to_string();
                     let mut c2 = child.walk();
                     for body in child.named_children(&mut c2) {
@@ -411,7 +452,8 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
             "object_declaration" => {
                 if let Some(name) = name_field(child) {
                     let sts = supertypes_of(child, src);
-                    push_type(out, name, src, SymbolKind::Object, package, container, sts);
+                    // Objects can't be generic -> no type parameters.
+                    push_type(out, name, src, SymbolKind::Object, package, container, sts, Vec::new());
                     let cname = node_text(name, src).to_string();
                     if let Some(body) = child_of_kind(child, "class_body") {
                         walk(body, src, package, Some(&cname), out);
@@ -651,5 +693,41 @@ object Reg { fun add() {} }
         // ...and a non-call body yields nothing.
         let lit = syms.iter().find(|s| s.name == "lit").unwrap();
         assert_eq!(lit.return_type, None);
+    }
+
+    #[test]
+    fn parameter_types_recorded_in_order() {
+        let src = "fun f(a: Int, b: String, c: List<Foo>?): R = x\n";
+        let syms = index(src);
+        let f = syms.iter().find(|s| s.name == "f").unwrap();
+        let names: Vec<&str> = f.params.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(names, vec!["Int", "String", "List"]);
+        assert!(f.params[2].nullable, "c: List<Foo>? is nullable");
+        assert_eq!(f.params[2].args.iter().map(|a| a.name.as_str()).collect::<Vec<_>>(), vec!["Foo"]);
+    }
+
+    #[test]
+    fn function_type_params_recorded() {
+        let src = "fun <A, B> combine(a: A, b: B): A = a\n";
+        let syms = index(src);
+        let f = syms.iter().find(|s| s.name == "combine").unwrap();
+        assert_eq!(f.type_params, vec!["A".to_string(), "B".to_string()]);
+    }
+
+    #[test]
+    fn class_type_params_recorded() {
+        let src = "class Box<T>(val value: T)\nclass Plain\n";
+        let syms = index(src);
+        let boxc = syms.iter().find(|s| s.name == "Box").unwrap();
+        assert_eq!(boxc.type_params, vec!["T".to_string()]);
+        let plain = syms.iter().find(|s| s.name == "Plain").unwrap();
+        assert!(plain.type_params.is_empty());
+    }
+
+    #[test]
+    fn non_function_has_no_params() {
+        let src = "val x: Int = 1\nclass C\n";
+        let syms = index(src);
+        assert!(syms.iter().find(|s| s.name == "x").unwrap().params.is_empty());
     }
 }
