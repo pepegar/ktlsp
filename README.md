@@ -33,6 +33,37 @@ cargo install --path .
 cargo build --release   # -> target/release/ktlsp
 ```
 
+### Nix flake
+
+ktlsp is packaged as a flake. Run it directly:
+
+```sh
+nix run github:pepegar/ktlsp        # starts the LSP on stdio
+nix build github:pepegar/ktlsp      # -> ./result/bin/ktlsp
+```
+
+Use it from another flake — either pull the package or apply the overlay:
+
+```nix
+{
+  inputs.ktlsp.url = "github:pepegar/ktlsp";
+
+  outputs = { self, nixpkgs, ktlsp }:
+    let system = "x86_64-linux"; in {
+      # Option A — reference the package directly:
+      #   ktlsp.packages.${system}.default
+
+      # Option B — apply the overlay so `pkgs.ktlsp` is available everywhere:
+      #   pkgs = import nixpkgs { inherit system; overlays = [ ktlsp.overlays.default ]; };
+      #   then use pkgs.ktlsp (e.g. in home-manager, a devShell, environment.systemPackages, …)
+    };
+}
+```
+
+Outputs: `packages.<system>.default` (the `ktlsp` binary), `apps.<system>.default` (`nix run`),
+`overlays.default` (adds `pkgs.ktlsp`), `devShells.default` (Rust toolchain), and `checks`
+(`nix flake check` builds + runs the test suite). Built for x86_64/aarch64 Linux and Darwin.
+
 ## Editor setup
 
 `ktlsp` speaks LSP over stdio. Point your editor's LSP client at the `ktlsp` binary for Kotlin
