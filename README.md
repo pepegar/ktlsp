@@ -118,6 +118,39 @@ definition, so results are at the same best-effort precision as goto (a shadowed
 scope is excluded). The declaration itself is included when the client asks. Rename and call
 hierarchy are natural follow-ons on the same index.
 
+## Compile diagnostics (opt-in, off by default)
+
+ktlsp's tree-sitter core can't produce sound type errors, so genuine compile errors come from the
+real compiler: an **opt-in** feature shells out to `./gradlew compileKotlin` **on save** and
+publishes the compiler's `e:`/`w:` output as diagnostics (tagged source `ktlsp (gradle)`,
+alongside the fast tree-sitter ones). It runs entirely off the request path, so goto / references /
+completion stay sub-millisecond and JVM-free.
+
+**With the flag off, ktlsp is byte-for-byte unchanged — no JVM, no gradle, no save handler.** Enable
+it through `initializationOptions`:
+
+```lua
+vim.lsp.start({
+  name = "ktlsp", cmd = { "ktlsp" }, root_dir = root,
+  init_options = { compile_diagnostics = { enabled = true } },
+})
+```
+
+What to expect when enabled:
+
+- **Per-workspace trust.** The first save in a project prompts before running its `gradlew` (it
+  executes the project's build scripts). The decision is remembered in
+  `~/.cache/ktlsp/trusted_roots` (delete that file to reset). An untrusted project never spawns a
+  build.
+- **Cold-start latency.** A cold gradle daemon can take 30s–2min for the first diagnostics; a
+  "compiling…" status is logged while a run is in flight. On-save only — never per keystroke.
+- **`compileKotlin` coverage only (spike).** Errors surface for the main JVM source set. Saving a
+  test / Android / KMP source the task doesn't compile triggers a one-time notice rather than a
+  misleading "no errors." Module-aware task routing is deferred.
+
+This is a deliberately bounded experiment behind a stable seam; a future iteration may resolve the
+classpath once and invoke `kotlinc`/the compile daemon for lower latency.
+
 ## Limitations (by design)
 
 These are deliberate and documented, not bugs:

@@ -135,6 +135,66 @@ do
   results[#results + 1] = (found and "PASS  " or "FAIL  ") .. desc .. ("  (%d diagnostic(s) total)"):format(count)
 end
 
+-- 7) Opt-in gradle compile diagnostics (env-gated: real gradle is slow, so the fast probes above
+--    don't pay for it). Run with `KTLSP_LIVE_COMPILE=1`. Uses its own client with the feature
+--    enabled via initializationOptions, and pre-seeds workspace trust so no prompt blocks the
+--    headless run.
+if os.getenv("KTLSP_LIVE_COMPILE") then
+  local desc = "gradle compile diagnostic (ktlsp (gradle) ERROR on a broken file)"
+  -- Pre-seed trust: write the canonical root into ~/.cache/ktlsp/trusted_roots.
+  local home = os.getenv("HOME")
+  local canon = vim.loop.fs_realpath(root) or root
+  local trust_path = home .. "/.cache/ktlsp/trusted_roots"
+  vim.fn.mkdir(home .. "/.cache/ktlsp", "p")
+  local tf = io.open(trust_path, "a")
+  if tf then tf:write(canon .. "\n"); tf:close() end
+
+  -- A throwaway source with a deliberate unresolved reference (compiled by compileKotlin).
+  local broken = root .. "/src/main/kotlin/com/example/fixture/_CompileProbe.kt"
+  local function write(path, body)
+    local f = io.open(path, "w"); if f then f:write(body); f:close() end
+  end
+  write(broken, "package com.example.fixture\nval broken: Int = thisDoesNotResolve\n")
+
+  vim.cmd("edit " .. broken)
+  local cbuf = vim.api.nvim_get_current_buf()
+  vim.bo[cbuf].filetype = "kotlin"
+  local cid = vim.lsp.start({
+    name = "ktlsp-compile",
+    cmd = { bin },
+    root_dir = root,
+    init_options = { compile_diagnostics = { enabled = true } },
+  })
+  vim.wait(10000, function()
+    local c = vim.lsp.get_client_by_id(cid)
+    return c and c.server_capabilities ~= nil
+  end, 50)
+  vim.cmd("write")
+
+  -- Gradle is multi-second (cold daemon much more); poll generously for an error from our source.
+  local function has_gradle_error()
+    for _, d in ipairs(vim.diagnostic.get(cbuf)) do
+      if d.source == "ktlsp (gradle)" and d.severity == vim.diagnostic.severity.ERROR then
+        return true
+      end
+    end
+    return false
+  end
+  local appeared = vim.wait(180000, has_gradle_error, 1000)
+  results[#results + 1] = (appeared and "PASS  " or "FAIL  ") .. desc
+
+  -- Fix it and confirm the diagnostic clears after a recompile.
+  if appeared then
+    write(broken, "package com.example.fixture\nval ok: Int = 1\n")
+    vim.cmd("edit! " .. broken)
+    vim.cmd("write")
+    local cleared = vim.wait(180000, function() return not has_gradle_error() end, 1000)
+    results[#results + 1] = (cleared and "PASS  " or "FAIL  ") .. "gradle diagnostic clears after fix+recompile"
+  end
+
+  os.remove(broken)
+end
+
 print("\n===== ktlsp live verification (dev/gradle-sample) =====")
 for _, r in ipairs(results) do print(r) end
 print("======================================================")
