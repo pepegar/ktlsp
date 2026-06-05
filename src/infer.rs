@@ -389,6 +389,7 @@ const ELEMENT_LAMBDA_OPS: &[&str] = &[
     "flatMap", "any", "all", "none", "find", "firstOrNull", "first", "last", "lastOrNull", "count",
     "sumOf", "maxByOrNull", "minByOrNull", "sortedBy", "sortedByDescending", "groupBy", "associateBy",
     "associateWith", "takeWhile", "dropWhile", "partition", "indexOfFirst", "single", "singleOrNull",
+    "collect", "collectIndexed", "forEachIndexed", "fold", "reduce", "maxOf", "minOf", "withIndex",
 ];
 
 /// The type of a lambda parameter `name` (implicit `it` OR a named param like `{ user -> … }`) inside
