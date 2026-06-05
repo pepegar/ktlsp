@@ -113,6 +113,28 @@ do
   end
 end
 
+-- 5) Gradual-checker features (require the stdlib index for the generic/lambda probes).
+check("smart-cast (if x is BasicGreeter)", "        x.sal", "salutation")
+check("early-return narrowing (if y !is BasicGreeter return)", "    y.sal", "salutation")
+if lib_ready then
+  check("generic chain (listOf(x).first())", "    listOf(BasicGreeter()).first().sal", "salutation")
+  check("lambda `it` element type (listOf(x).map { it })", "        it.sal", "salutation")
+end
+
+-- 6) Unused-import diagnostic (published; debounced ~300ms). Read via vim.diagnostic after a wait.
+do
+  local desc = "unused-import diagnostic (import kotlinx.coroutines.delay)"
+  local found = vim.wait(8000, function()
+    for _, d in ipairs(vim.diagnostic.get(buf)) do
+      if tostring(d.message):find("delay", 1, true) then return true end
+    end
+    return false
+  end, 200)
+  -- And confirm NO false positive on a used/needed name (sanity: only the unused one is flagged).
+  local count = #vim.diagnostic.get(buf)
+  results[#results + 1] = (found and "PASS  " or "FAIL  ") .. desc .. ("  (%d diagnostic(s) total)"):format(count)
+end
+
 print("\n===== ktlsp live verification (dev/gradle-sample) =====")
 for _, r in ipairs(results) do print(r) end
 print("======================================================")

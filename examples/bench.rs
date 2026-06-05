@@ -41,6 +41,20 @@ fn time_goto(ws: &mut Workspace, key: &str, offset: usize, iters: usize) -> (u12
     (total / iters as u128, median(samples))
 }
 
+fn time_complete(ws: &mut Workspace, key: &str, offset: usize, iters: usize) -> (u128, u128) {
+    for _ in 0..50 {
+        let _ = ws.complete(key, offset, true);
+    }
+    let mut samples = Vec::with_capacity(iters);
+    for _ in 0..iters {
+        let t = Instant::now();
+        let _ = ws.complete(key, offset, true);
+        samples.push(t.elapsed().as_nanos());
+    }
+    let total: u128 = samples.iter().sum();
+    (total / iters as u128, median(samples))
+}
+
 fn main() {
     let mut ws = Workspace::new();
 
@@ -94,6 +108,41 @@ fn main() {
             "  goto stdlib symbol   : avg {:>6.1}µs  median {:>6.1}µs",
             avg_b as f64 / 1000.0,
             med_b as f64 / 1000.0
+        );
+        println!();
+    }
+
+    // --- inference hot path: member completion on a chained-generic and a smart-cast receiver ---
+    // (the member-selector path that the gradual-checker work deepened; the canary for regressions).
+    {
+        let key = "bench:///Infer.kt".to_string();
+        let src = concat!(
+            "package app\n",
+            "class A { fun b(): B = B() }\n",
+            "class B { fun c(): C = C() }\n",
+            "class C { fun hello() {} }\n",
+            "fun probe(x: Any) {\n",
+            "    val a = A()\n",
+            "    a.b().c().hel\n",
+            "    if (x is C) { x.hel }\n",
+            "}\n",
+        )
+        .to_string();
+        ws.open(key.clone(), src.clone());
+        let off_chain = src.find("a.b().c().hel").unwrap() + "a.b().c().hel".len();
+        let off_cast = src.rfind("x.hel").unwrap() + "x.hel".len();
+        let (avg_c, med_c) = time_complete(&mut ws, &key, off_chain, iters);
+        let (avg_s, med_s) = time_complete(&mut ws, &key, off_cast, iters);
+        println!("--- inference (member completion) ---");
+        println!(
+            "  chained-generic recv : avg {:>6.1}µs  median {:>6.1}µs",
+            avg_c as f64 / 1000.0,
+            med_c as f64 / 1000.0
+        );
+        println!(
+            "  smart-cast recv      : avg {:>6.1}µs  median {:>6.1}µs",
+            avg_s as f64 / 1000.0,
+            med_s as f64 / 1000.0
         );
         println!();
     }
