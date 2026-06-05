@@ -11,7 +11,23 @@
 //! resolution + `kotlinc`/compile-daemon must preserve the `(root, task) -> CompileOutcome`
 //! signature so the merge store and publish plumbing stay untouched.
 
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
 use crate::diagnostics::Severity;
+
+/// The compile task the spike runs. Overridable later; module-aware routing is deferred.
+pub const DEFAULT_COMPILE_TASK: &str = "compileKotlin";
+
+/// Hard wall-clock ceiling for one gradle run. A hung/hostile build is killed at the deadline so it
+/// can't pin the per-root worker forever.
+const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Maximum captured output per stream before we stop reading (a runaway build must not be buffered
+/// unboundedly). The hard timeout is the primary guard; this caps memory.
+const MAX_OUTPUT_BYTES: usize = 10 * 1024 * 1024;
 
 /// One compiler diagnostic over a file at a 1-based (line, column), exactly as the compiler reports
 /// it. Converted to an `ls_types::Diagnostic` (and 0-based UTF-16 positions) at the LSP boundary.
@@ -54,6 +70,133 @@ pub fn parse_output(output: &str, task: &str) -> CompileOutcome {
     }
 
     CompileOutcome { diagnostics, executed }
+}
+
+/// Run the project's gradle compile `task` in `root` and parse the result. The single Option-1 swap
+/// point — preserve the `(root, task) -> CompileOutcome` signature. Degrades to an empty,
+/// `executed:false` outcome on any failure; never panics, never fabricates a diagnostic.
+///
+/// Blocking (process IO); the caller runs it under `spawn_blocking`. A hard timeout kills a build
+/// that overruns `COMPILE_TIMEOUT`.
+pub fn run_gradle_compile(root: &Path, task: &str) -> CompileOutcome {
+    if !crate::deps::is_gradle_project(root) {
+        return CompileOutcome::default();
+    }
+    let program = match resolve_gradle(root) {
+        Some(p) => p,
+        None => {
+            tracing::warn!("no gradle wrapper or `gradle` on PATH for {}", root.display());
+            return CompileOutcome::default();
+        }
+    };
+    tracing::info!("compile: {} {task} in {}", program.display(), root.display());
+
+    let child = Command::new(&program)
+        .arg(task)
+        .arg("--console=plain")
+        .arg("--continue")
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("failed to spawn gradle: {e}");
+            return CompileOutcome::default();
+        }
+    };
+
+    // Drain both pipes on threads (so a full pipe buffer can't deadlock the kill path), each capped.
+    let out = child.stdout.take().map(drain_capped);
+    let err = child.stderr.take().map(drain_capped);
+
+    let timed_out = wait_with_timeout(&mut child, COMPILE_TIMEOUT);
+    let status = child.wait().ok();
+    if timed_out {
+        tracing::warn!("gradle compile timed out after {}s; killed", COMPILE_TIMEOUT.as_secs());
+    }
+
+    let mut text = out.and_then(|h| h.join().ok()).unwrap_or_default();
+    text.push('\n');
+    if let Some(h) = err {
+        if let Ok(e) = h.join() {
+            text.push_str(&e);
+        }
+    }
+
+    let outcome = parse_output(&text, task);
+    let exit_ok = status.map(|s| s.success()).unwrap_or(false);
+    if !exit_ok
+        && !timed_out
+        && !outcome.diagnostics.iter().any(|d| d.severity == Severity::Error)
+    {
+        tracing::warn!(
+            "gradle exited non-zero with no compile errors parsed for {} — likely a build-script or \
+             configuration failure, not a code error",
+            root.display()
+        );
+    }
+    outcome
+}
+
+/// Prefer the in-repo wrapper; fall back to `gradle` on PATH only if the resolved binary is OUTSIDE
+/// the workspace (a wrapper-shaped binary inside the repo would be attacker-controlled).
+fn resolve_gradle(root: &Path) -> Option<PathBuf> {
+    let wrapper = root.join(if cfg!(windows) { "gradlew.bat" } else { "gradlew" });
+    if wrapper.is_file() {
+        return Some(wrapper);
+    }
+    let on_path = find_on_path(if cfg!(windows) { "gradle.bat" } else { "gradle" })?;
+    let resolved = on_path.canonicalize().ok()?;
+    let canon_root = root.canonicalize().ok()?;
+    if resolved.starts_with(&canon_root) {
+        tracing::warn!("ignoring `gradle` resolved inside the workspace: {}", resolved.display());
+        return None;
+    }
+    Some(resolved)
+}
+
+/// First `name` found in a `PATH` directory (a plain lookup; we don't invoke through a shell).
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let paths = std::env::var_os("PATH")?;
+    std::env::split_paths(&paths)
+        .map(|dir| dir.join(name))
+        .find(|candidate| candidate.is_file())
+}
+
+/// Read a child pipe to EOF on a thread, capped at `MAX_OUTPUT_BYTES`, as a lossy UTF-8 string.
+fn drain_capped<R: Read + Send + 'static>(mut reader: R) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while buf.len() < MAX_OUTPUT_BYTES {
+            match reader.read(&mut chunk) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            }
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
+/// Poll until the child exits or the deadline passes; kill on overrun. Returns whether it timed out.
+fn wait_with_timeout(child: &mut std::process::Child, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return false,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => return false,
+        }
+    }
 }
 
 /// If `line` is a gradle task-status line for our compile `task` (e.g. `> Task :app:compileKotlin`
@@ -276,5 +419,40 @@ mod tests {
         assert_eq!(d[0].line, 3);
         assert_eq!(d[0].col, 7);
         assert_eq!(d[0].message, "type mismatch");
+    }
+
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("ktlsp_compile_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn resolve_prefers_wrapper() {
+        let dir = scratch("wrapper");
+        let wrapper = dir.join(if cfg!(windows) { "gradlew.bat" } else { "gradlew" });
+        std::fs::write(&wrapper, "#!/bin/sh\n").unwrap();
+        assert_eq!(resolve_gradle(&dir), Some(wrapper));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn non_gradle_dir_yields_empty_outcome() {
+        let dir = scratch("nongradle");
+        let outcome = run_gradle_compile(&dir, DEFAULT_COMPILE_TASK);
+        assert_eq!(outcome, CompileOutcome::default());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Real gradle invocation against the sample project. Ignored by default: requires a gradle
+    /// wrapper or `gradle` on PATH, which the unit environment lacks. Run manually with
+    /// `cargo test -- --ignored gradle_sample`.
+    #[test]
+    #[ignore]
+    fn gradle_sample_integration() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("dev/gradle-sample");
+        let outcome = run_gradle_compile(&root, DEFAULT_COMPILE_TASK);
+        assert!(outcome.executed, "compile task should have run against the sample");
     }
 }

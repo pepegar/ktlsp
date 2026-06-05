@@ -80,8 +80,9 @@ fn inject_stdlib(coords: &mut Vec<Coordinate>, gradle_project: bool) {
     }
 }
 
-/// Whether `root` looks like a Gradle/Kotlin project (worth auto-indexing kotlin-stdlib for).
-fn is_gradle_project(root: &Path) -> bool {
+/// Whether `root` looks like a Gradle/Kotlin project (worth auto-indexing kotlin-stdlib for, and the
+/// gate for spawning a gradle compile).
+pub fn is_gradle_project(root: &Path) -> bool {
     [
         "settings.gradle.kts",
         "settings.gradle",
