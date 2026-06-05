@@ -1053,16 +1053,10 @@ fn overload_arity_disambiguates_return_type() {
     check_contains(input, &["two"]); // 2-arg overload -> Two -> two
 }
 
-#[test]
-fn overload_conflicting_returns_same_arity_is_unknown() {
-    // Two same-arity overloads with different return types and no disambiguator -> Unknown (silent).
-    let input = "//- lib.kt\npackage app\n\
-                 class One {\n    fun one() {}\n}\n\
-                 class Two {\n    fun two() {}\n}\n\
-                 class R {\n    fun pick(a: Int): One = One()\n    fun pick(a: String): Two = Two()\n}\n\
-                 //- Main.kt\npackage app\nfun f(r: R) {\n    r.pick(1).o/*^*/\n}\n";
-    check_none(input);
-}
+// (The former `overload_conflicting_returns_same_arity_is_unknown` test is superseded by U9: its
+// scenario `r.pick(1)` with Int/String overloads now correctly disambiguates to the Int overload via
+// argument-type consistency. The "genuinely can't disambiguate -> Unknown" case is covered by
+// `overload_unknown_argument_does_not_misresolve`.)
 
 // --------------------------------------------------------------------------------------------
 // Gradual checker U7: argument-based generic inference (one-shot unifier)
@@ -1120,4 +1114,42 @@ fn lambda_it_in_let_is_whole_receiver() {
     let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\nfun makeFoo(): Foo = Foo()\n\
                  //- Main.kt\npackage app\nfun f() {\n    makeFoo().let {\n        it.ba/*^*/\n    }\n}\n";
     check_contains(input, &["bar"]);
+}
+
+// --------------------------------------------------------------------------------------------
+// Gradual checker U9: argument-type-consistent overload filtering
+// --------------------------------------------------------------------------------------------
+
+#[test]
+fn overload_arg_type_disambiguates() {
+    // f(Int) and f(String) — same arity; the argument type selects the right return.
+    let input = "//- lib.kt\npackage app\n\
+                 class One {\n    fun one() {}\n}\n\
+                 class Two {\n    fun two() {}\n}\n\
+                 class R {\n    fun pick(a: Int): One = One()\n    fun pick(a: String): Two = Two()\n}\n\
+                 //- Main.kt\npackage app\nfun f(r: R, s: String) {\n    r.pick(s).tw/*^*/\n}\n";
+    check_contains(input, &["two"]); // String arg -> Two -> two
+    check_excludes(input, &["one"]);
+}
+
+#[test]
+fn overload_subtype_argument_is_consistent() {
+    // An argument that is a subtype of the parameter type stays consistent.
+    let input = "//- lib.kt\npackage app\n\
+                 open class Animal\nclass Dog : Animal()\n\
+                 class Res {\n    fun used() {}\n}\n\
+                 class R {\n    fun take(a: Animal): Res = Res()\n}\n\
+                 //- Main.kt\npackage app\nfun f(r: R, d: Dog) {\n    r.take(d).us/*^*/\n}\n";
+    check_contains(input, &["used"]); // Dog <: Animal -> consistent -> Res -> used
+}
+
+#[test]
+fn overload_unknown_argument_does_not_misresolve() {
+    // An Unknown argument can't eliminate either overload; differing returns -> Unknown (silent).
+    let input = "//- lib.kt\npackage app\n\
+                 class One {\n    fun one() {}\n}\n\
+                 class Two {\n    fun two() {}\n}\n\
+                 class R {\n    fun pick(a: Int): One = One()\n    fun pick(a: String): Two = Two()\n}\n\
+                 //- Main.kt\npackage app\nfun f(r: R, mystery: Whatever) {\n    r.pick(mystery).o/*^*/\n}\n";
+    check_none(input);
 }

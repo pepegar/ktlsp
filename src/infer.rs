@@ -581,7 +581,17 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
                 return Type::Unknown;
             };
             let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
-            member_type(index, &recv_ty, node_text(sel, src), true, Some(value_arg_count(node)), ctx, depth)
+            let arg_types = synth_arg_types(index, node, src, ctx, depth);
+            member_type(
+                index,
+                &recv_ty,
+                node_text(sel, src),
+                true,
+                Some(value_arg_count(node)),
+                Some(&arg_types),
+                ctx,
+                depth,
+            )
         }
         _ => Type::Unknown,
     }
@@ -680,7 +690,7 @@ fn infer_navigation(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: 
         return Type::Unknown;
     };
     let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
-    member_type(index, &recv_ty, node_text(sel, src), false, None, ctx, depth)
+    member_type(index, &recv_ty, node_text(sel, src), false, None, None, ctx, depth)
 }
 
 /// The type of member `name` accessed on receiver type `recv_ty`. Resolves overloads as a Kotlin-style
@@ -697,6 +707,7 @@ fn member_type(
     name: &str,
     want_function: bool,
     arg_count: Option<usize>,
+    arg_types: Option<&[Type]>,
     ctx: &FileCtx,
     depth: usize,
 ) -> Type {
@@ -748,6 +759,19 @@ fn member_type(
                 group = exact;
             }
         }
+        // Argument-type consistency: keep candidates whose parameter types are each consistent with
+        // the corresponding argument (gradual — an Unknown arg/param or a type-variable param never
+        // eliminates a candidate; a subtype matches). Never empties the set (fall back if it would).
+        if let Some(args) = arg_types {
+            let consistent: Vec<&crate::index::Entry> = group
+                .iter()
+                .copied()
+                .filter(|e| args_consistent(index, &e.sym.params, &e.sym.type_params, args, ctx, depth))
+                .collect();
+            if !consistent.is_empty() {
+                group = consistent;
+            }
+        }
     }
     // Resolve each candidate's type; agree -> that type, disagree -> Unknown (ambiguous, stay silent).
     let mut result: Option<Type> = None;
@@ -765,6 +789,62 @@ fn member_type(
         }
     }
     result.unwrap_or(Type::Unknown)
+}
+
+/// Whether a candidate's parameter types are each consistent with the corresponding argument type.
+/// Gradual: an `Unknown` argument or param, or a param that is one of the candidate's own type
+/// variables, never eliminates the candidate; a known subtype is consistent. Only the positional value
+/// args are checked (a trailing lambda / extra args beyond the param list are ignored).
+fn args_consistent(
+    index: &Index,
+    params: &[TypeRef],
+    type_params: &[String],
+    args: &[Type],
+    ctx: &FileCtx,
+    depth: usize,
+) -> bool {
+    let tvars: HashSet<&str> = type_params.iter().map(String::as_str).collect();
+    for (p, a) in params.iter().zip(args) {
+        if tvars.contains(p.name.as_str()) {
+            continue; // a type-variable parameter accepts anything
+        }
+        let pt = resolve_type_ref(index, p, ctx, depth + 1);
+        if !consistent(index, a, &pt) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Gradual consistency of an actual argument type with a formal parameter type: an `Unknown` on either
+/// side is consistent; an exact head match is consistent; an actual that is a subtype of the formal is
+/// consistent; otherwise inconsistent.
+fn consistent(index: &Index, actual: &Type, formal: &Type) -> bool {
+    let (Some(an), Some(fname)) = (actual.name(), formal.name()) else {
+        return true; // Unknown on either side -> compatible (don't eliminate)
+    };
+    an == fname || is_subtype(index, an, actual.package(), fname)
+}
+
+/// Whether the type named `name` (in package `pkg` when known) is `target` or a subtype of it,
+/// walking the supertype closure (bounded).
+fn is_subtype(index: &Index, name: &str, pkg: Option<&str>, target: &str) -> bool {
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut frontier: Vec<(String, Option<String>, usize)> =
+        vec![(name.to_string(), pkg.map(str::to_string), 0)];
+    while let Some((cur, cur_pkg, d)) = frontier.pop() {
+        if !visited.insert(cur.clone()) || d > SUPERTYPE_CAP {
+            continue;
+        }
+        if cur == target {
+            return true;
+        }
+        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
+            let sup_pkg = same_pkg_supertype(index, &sup, cur_pkg.as_deref());
+            frontier.push((sup, sup_pkg, d + 1));
+        }
+    }
+    false
 }
 
 /// One-level generic substitution for a single type variable: a member whose declared type is a
