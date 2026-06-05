@@ -6,15 +6,16 @@
 //! mid-request. Byte ranges from the core are converted to LSP positions via `LineIndex` here.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use tokio::sync::Notify;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
-use crate::compile::CompileDiagnostic;
+use crate::compile::{self, CompileDiagnostic, CompileOutcome};
 use crate::complete::ShapedItem;
 use crate::diagnostics::Severity;
 use crate::symbol::{Def, SymbolKind};
@@ -46,6 +47,19 @@ pub struct Backend {
     /// File keys that carried compile diagnostics after the last *executed* run, so the next executed
     /// run can clear the ones that recovered.
     last_compile_keys: Arc<Mutex<HashSet<String>>>,
+    /// Latest save generation for the compile worker. Each save bumps it; the worker reruns until the
+    /// generation it ran for is the latest, so the final save always gets a completed, published run.
+    compile_gen: Arc<Mutex<u64>>,
+    /// Wakes the compile worker when a new save lands.
+    compile_notify: Arc<Notify>,
+    /// The most recently saved file key (for the coverage notice).
+    last_saved: Arc<Mutex<Option<String>>>,
+    /// Whether the long-lived compile worker has been spawned (lazily, on first trusted save).
+    worker_started: Mutex<bool>,
+    /// Roots already asked about trust this session (ask at most once per untrusted root).
+    asked_roots: Arc<Mutex<HashSet<String>>>,
+    /// Whether the "saved file not covered by the configured task" notice has fired (once per session).
+    coverage_notified: Arc<Mutex<bool>>,
 }
 
 impl Backend {
@@ -59,6 +73,12 @@ impl Backend {
             doc_versions: Arc::new(Mutex::new(HashMap::new())),
             compile_diags: Arc::new(Mutex::new(HashMap::new())),
             last_compile_keys: Arc::new(Mutex::new(HashSet::new())),
+            compile_gen: Arc::new(Mutex::new(0)),
+            compile_notify: Arc::new(Notify::new()),
+            last_saved: Arc::new(Mutex::new(None)),
+            worker_started: Mutex::new(false),
+            asked_roots: Arc::new(Mutex::new(HashSet::new())),
+            coverage_notified: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -83,6 +103,100 @@ impl Backend {
             }
             publish_merged(&ws, &compile_diags, &client, &key).await;
         });
+    }
+
+    /// Whether `root` may run gradle: trusted already, or the user accepts the trust prompt now. Asks
+    /// at most once per untrusted root per session. The global flag grants the *capability*; this
+    /// grants per-workspace *authorization* to execute build scripts.
+    async fn ensure_trusted(&self, root: &Path) -> bool {
+        if crate::trust::is_trusted(root) {
+            return true;
+        }
+        let key = root.to_string_lossy().into_owned();
+        {
+            let mut asked = self.asked_roots.lock().unwrap();
+            if !asked.insert(key) {
+                return false;
+            }
+        }
+        let answer = self
+            .client
+            .show_message_request(
+                MessageType::WARNING,
+                format!(
+                    "Run ./gradlew in {} for compile diagnostics? This executes the project's build \
+                     scripts.",
+                    root.display()
+                ),
+                Some(vec![
+                    MessageActionItem { title: "Trust".into(), properties: HashMap::new() },
+                    MessageActionItem { title: "Don't trust".into(), properties: HashMap::new() },
+                ]),
+            )
+            .await
+            .ok()
+            .flatten();
+        if answer.map(|a| a.title).as_deref() == Some("Trust") {
+            crate::trust::trust(root);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Spawn the long-lived compile worker for `root` once. The worker owns all gradle runs (so it is
+    /// inherently single-flight) and reruns while a newer save generation is pending, guaranteeing the
+    /// last save always gets a completed, published run.
+    fn start_worker_once(&self, root: PathBuf) {
+        {
+            let mut started = self.worker_started.lock().unwrap();
+            if *started {
+                return;
+            }
+            *started = true;
+        }
+        let ws = self.ws.clone();
+        let compile_diags = self.compile_diags.clone();
+        let last_compile_keys = self.last_compile_keys.clone();
+        let compile_gen = self.compile_gen.clone();
+        let notify = self.compile_notify.clone();
+        let last_saved = self.last_saved.clone();
+        let coverage_notified = self.coverage_notified.clone();
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            loop {
+                let generation = *compile_gen.lock().unwrap();
+                client.log_message(MessageType::INFO, "ktlsp: compiling…").await;
+                let run_root = root.clone();
+                let outcome = tokio::task::spawn_blocking(move || {
+                    compile::run_gradle_compile(&run_root, compile::DEFAULT_COMPILE_TASK)
+                })
+                .await
+                .unwrap_or_default();
+
+                // A newer save arrived while we were running: rerun for it, don't publish stale output.
+                if *compile_gen.lock().unwrap() != generation {
+                    continue;
+                }
+
+                let summary = outcome_summary(&outcome);
+                reconcile(&outcome, &root, &ws, &compile_diags, &last_compile_keys, &client).await;
+                client.log_message(MessageType::INFO, format!("ktlsp: compile done ({summary})")).await;
+                maybe_notify_coverage(&last_saved, &coverage_notified, &client).await;
+
+                // Nothing newer pending — wait for the next save.
+                if *compile_gen.lock().unwrap() == generation {
+                    notify.notified().await;
+                }
+            }
+        });
+    }
+
+    /// Record the saved file, bump the generation, and wake the worker.
+    fn trigger_compile(&self, key: String) {
+        *self.last_saved.lock().unwrap() = Some(key);
+        *self.compile_gen.lock().unwrap() += 1;
+        self.compile_notify.notify_one();
     }
 }
 
@@ -293,6 +407,29 @@ impl LanguageServer for Backend {
             // (mapped from disk). With no compile entry this publishes empty, matching prior behavior.
             publish_merged(&self.ws, &self.compile_diags, &self.client, &key).await;
         }
+    }
+
+    async fn did_save(&self, params: DidSaveTextDocumentParams) {
+        // Gate cheaply: opt-in flag, gradle project, then per-workspace trust. Any miss = no JVM spawn.
+        if !*self.compile_enabled.lock().unwrap() {
+            return;
+        }
+        let key = match uri_to_key(&params.text_document.uri) {
+            Some(k) => k,
+            None => return,
+        };
+        let root = match self.root.lock().unwrap().clone() {
+            Some(r) => r,
+            None => return,
+        };
+        if !crate::deps::is_gradle_project(&root) {
+            return;
+        }
+        if !self.ensure_trusted(&root).await {
+            return;
+        }
+        self.start_worker_once(root);
+        self.trigger_compile(key);
     }
 
     async fn goto_definition(
@@ -522,6 +659,113 @@ async fn publish_merged(
     client.publish_diagnostics(uri, items, None).await;
 }
 
+/// Fold a compile run into the merge store and publish: group diagnostics by canonical key (dropping
+/// any path outside `root` — a traversal guard against a hostile build emitting `/etc/passwd`),
+/// replace the stored entries, clear recovered files **only when the compile executed** (R8), and
+/// republish every affected key through `publish_merged`.
+async fn reconcile(
+    outcome: &CompileOutcome,
+    root: &Path,
+    ws: &Arc<Mutex<Workspace>>,
+    compile_diags: &Arc<Mutex<HashMap<String, Vec<CompileDiagnostic>>>>,
+    last_compile_keys: &Arc<Mutex<HashSet<String>>>,
+    client: &Client,
+) {
+    let canon_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut grouped: HashMap<String, Vec<CompileDiagnostic>> = HashMap::new();
+    for d in &outcome.diagnostics {
+        match canonical_under(&d.path, &canon_root) {
+            Some(key) => grouped.entry(key).or_default().push(d.clone()),
+            None => tracing::warn!("dropping compiler path outside workspace: {}", d.path),
+        }
+    }
+
+    let republish = {
+        let mut store = compile_diags.lock().unwrap();
+        let mut last = last_compile_keys.lock().unwrap();
+        apply_outcome(&mut store, &mut last, grouped, outcome.executed)
+    };
+
+    for key in republish {
+        publish_merged(ws, compile_diags, client, &key).await;
+    }
+}
+
+/// Replace stored compile entries with `grouped`, and — **only when the compile executed** (R8) —
+/// clear keys that recovered (were present last run, absent now). Returns the keys to republish.
+/// Pure over the two collections so the R8 retention rule is unit-testable without a client.
+fn apply_outcome(
+    store: &mut HashMap<String, Vec<CompileDiagnostic>>,
+    last_keys: &mut HashSet<String>,
+    grouped: HashMap<String, Vec<CompileDiagnostic>>,
+    executed: bool,
+) -> HashSet<String> {
+    let new_keys: HashSet<String> = grouped.keys().cloned().collect();
+    let mut republish = new_keys.clone();
+    for (key, diags) in grouped {
+        store.insert(key, diags);
+    }
+    if executed {
+        for recovered in last_keys.difference(&new_keys).cloned().collect::<Vec<_>>() {
+            store.remove(&recovered);
+            republish.insert(recovered);
+        }
+        *last_keys = new_keys;
+    }
+    republish
+}
+
+/// Canonicalize `path` and return its string key iff it lies under `canon_root`.
+fn canonical_under(path: &str, canon_root: &Path) -> Option<String> {
+    let p = Path::new(path);
+    let canon = p.canonicalize().unwrap_or_else(|_| p.to_path_buf());
+    canon.starts_with(canon_root).then(|| canon.to_string_lossy().into_owned())
+}
+
+/// One-line run summary for the progress log.
+fn outcome_summary(outcome: &CompileOutcome) -> String {
+    if !outcome.executed {
+        return "up-to-date".to_string();
+    }
+    let errors = outcome.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+    let warnings = outcome.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+    format!("{errors} errors, {warnings} warnings")
+}
+
+/// Warn once per session when the last saved file is in a source set the configured task doesn't
+/// compile, so the user doesn't read silence as "no errors". Broader Android/KMP source-set detection
+/// is deferred; this catches the common `src/test/` miss.
+async fn maybe_notify_coverage(
+    last_saved: &Arc<Mutex<Option<String>>>,
+    coverage_notified: &Arc<Mutex<bool>>,
+    client: &Client,
+) {
+    let uncovered =
+        matches!(last_saved.lock().unwrap().as_deref(), Some(s) if is_uncovered_source(s));
+    if !uncovered {
+        return;
+    }
+    {
+        let mut notified = coverage_notified.lock().unwrap();
+        if *notified {
+            return;
+        }
+        *notified = true;
+    }
+    client
+        .show_message(
+            MessageType::INFO,
+            "ktlsp: this file may be outside the configured compile task (compileKotlin); \
+             test/Android/KMP sources aren't covered.",
+        )
+        .await;
+}
+
+/// Heuristic: a path under a `src/test/` source root isn't compiled by `compileKotlin`.
+fn is_uncovered_source(key: &str) -> bool {
+    key.contains("/src/test/") || key.contains("\\src\\test\\")
+}
+
 /// Convert a core `Def` (file key + byte range) into an LSP `Location`, reading the target file's
 /// text to convert byte offsets to UTF-16 positions. `None` if the file is unreadable or its key
 /// isn't a `file://`-convertible path.
@@ -581,5 +825,61 @@ mod tests {
         assert_eq!(d.range.end, Position { line: 1, character: 17 }); // to end of "    val x = bar()"
         assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(d.source.as_deref(), Some("ktlsp (gradle)"));
+    }
+
+    fn cd(path: &str) -> CompileDiagnostic {
+        CompileDiagnostic {
+            path: path.into(),
+            line: 1,
+            col: 1,
+            severity: Severity::Error,
+            message: "x".into(),
+        }
+    }
+
+    #[test]
+    fn executed_run_clears_recovered_keys() {
+        let mut store: HashMap<String, Vec<CompileDiagnostic>> = HashMap::new();
+        store.insert("A".into(), vec![cd("A")]);
+        store.insert("B".into(), vec![cd("B")]);
+        let mut last: HashSet<String> = ["A".to_string(), "B".to_string()].into_iter().collect();
+
+        let grouped = HashMap::from([("A".to_string(), vec![cd("A")])]);
+        let republish = apply_outcome(&mut store, &mut last, grouped, true);
+
+        assert!(store.contains_key("A"));
+        assert!(!store.contains_key("B"), "B recovered -> cleared on an executed run");
+        assert_eq!(last, ["A".to_string()].into_iter().collect());
+        assert!(republish.contains("A") && republish.contains("B"));
+    }
+
+    #[test]
+    fn up_to_date_run_retains_diagnostics() {
+        let mut store: HashMap<String, Vec<CompileDiagnostic>> = HashMap::new();
+        store.insert("A".into(), vec![cd("A")]);
+        let mut last: HashSet<String> = ["A".to_string()].into_iter().collect();
+
+        // Empty grouped + executed:false (UP-TO-DATE) must NOT clear A (R8).
+        let republish = apply_outcome(&mut store, &mut last, HashMap::new(), false);
+
+        assert!(store.contains_key("A"), "UP-TO-DATE run carries no info; retain prior diagnostics");
+        assert_eq!(last, ["A".to_string()].into_iter().collect());
+        assert!(republish.is_empty());
+    }
+
+    #[test]
+    fn outcome_summary_distinguishes_up_to_date() {
+        assert_eq!(outcome_summary(&CompileOutcome::default()), "up-to-date");
+        let executed = CompileOutcome {
+            diagnostics: vec![cd("A")],
+            executed: true,
+        };
+        assert_eq!(outcome_summary(&executed), "1 errors, 0 warnings");
+    }
+
+    #[test]
+    fn uncovered_source_detects_test_dirs() {
+        assert!(is_uncovered_source("/p/src/test/kotlin/A.kt"));
+        assert!(!is_uncovered_source("/p/src/main/kotlin/A.kt"));
     }
 }
