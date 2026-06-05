@@ -1,11 +1,23 @@
 ---
 topic: gradual-type-checker
 date: 2026-06-05
-status: active
+status: completed
 origin: docs/plans/type-inference.md
 ---
 
 # feat: Evolve `infer()` into a `ty`/pyright-style gradual type checker
+
+> **Implementation status (2026-06-05).** Shipped: U1 stability gate, U2 `&&` narrowing, U3
+> early-return narrowing, U4 overload partition + arity, U5 index params + type_params (symcache v5),
+> U7 one-shot unifier + argument inference, U8 lambda-`it` element typing, U9 argument-consistent
+> overloads, U10 unused-import diagnostic (+ `publishDiagnostics` infra, debounced). **U6 subsumed**
+> — the demand-driven model computes lambda/`it` types on-demand and unifies args bottom-up, so no
+> threaded `expected` parameter was needed (YAGNI). **U11 (unresolved-reference) deferred, not
+> shipped** — it cannot meet the never-wrong contract with a best-effort index: false positives on
+> unindexed stdlib/deps, synthetic members (data-class `copy`/`componentN`, `Any.toString`, enum
+> `values`/`valueOf`), and universal stdlib extensions (`let`/`also`/`apply`/`run`). Declining beats
+> wrong diagnostics (KTD5). Verified end-to-end through `dev/nvim_gradle_live.lua` against the real
+> Gradle fixture (12/12 checks). 232 tests pass; member completion ~115µs, goto ~70µs.
 
 This plan lifts the deferred items in the type-inference stop line (`docs/plans/type-inference.md` §8)
 to take ktlsp from a best-effort *resolver* to a *gradual checker* — `ty`/pyright-style, not
