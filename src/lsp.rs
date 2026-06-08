@@ -167,18 +167,26 @@ impl Backend {
         let coverage_notified = self.coverage_notified.clone();
         let client = self.client.clone();
         tokio::spawn(async move {
+            let mut cold = true;
             loop {
                 rx.borrow_and_update();
                 client.log_message(MessageType::INFO, "ktlsp: compiling…").await;
                 let run_root = root.clone();
+                let started = std::time::Instant::now();
                 let outcome = tokio::task::spawn_blocking(move || {
                     compile::run_gradle_compile(&run_root, compile::DEFAULT_COMPILE_TASK)
                 })
                 .await
                 .unwrap_or_default();
+                let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
 
                 // A newer save arrived while we were running: rerun for it, don't publish stale output.
-                if rx.has_changed().unwrap_or(false) {
+                let superseded = rx.has_changed().unwrap_or(false);
+
+                record_compile_timing(&root, &last_saved, &outcome, wall_ms, cold, superseded);
+                cold = false;
+
+                if superseded {
                     continue;
                 }
 
@@ -752,6 +760,33 @@ fn outcome_summary(outcome: &CompileOutcome) -> String {
     let errors = outcome.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
     let warnings = outcome.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
     format!("{errors} errors, {warnings} warnings")
+}
+
+/// Best-effort: append one timing record per completed compile so a real session accumulates
+/// latency data. Gated by the telemetry layer's own destination resolution; never disturbs
+/// diagnostics.
+fn record_compile_timing(
+    root: &Path,
+    last_saved: &Arc<Mutex<Option<String>>>,
+    outcome: &CompileOutcome,
+    wall_ms: f64,
+    cold: bool,
+    superseded: bool,
+) {
+    let errors = outcome.diagnostics.iter().filter(|d| d.severity == Severity::Error).count();
+    let warnings = outcome.diagnostics.iter().filter(|d| d.severity == Severity::Warning).count();
+    crate::telemetry::record(&crate::telemetry::CompileTiming {
+        ts_ms: crate::telemetry::now_ms(),
+        root: root.display().to_string(),
+        trigger: last_saved.lock().unwrap().clone(),
+        wall_ms,
+        executed: outcome.executed,
+        diagnostics: outcome.diagnostics.len(),
+        errors,
+        warnings,
+        cold,
+        superseded,
+    });
 }
 
 /// Warn once per session when the last saved file is in a source set the configured task doesn't

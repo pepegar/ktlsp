@@ -21,6 +21,7 @@ pub mod parser;
 pub mod resolve;
 pub mod solve;
 pub mod symbol;
+pub mod telemetry;
 pub mod text;
 pub mod trust;
 pub mod types;

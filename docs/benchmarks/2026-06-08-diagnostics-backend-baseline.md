@@ -47,6 +47,29 @@ dev/bench-correctness.sh dev/bench-fixture     # parity self-check
 
 Dial the fixture with `NUM_MODULES` / `FILES_PER_MODULE` to push into a larger regime, e.g. `NUM_MODULES=30 FILES_PER_MODULE=80 dev/gen-bench-fixture.sh`.
 
+## Gathering real-session data (the regime this fixture can't reach)
+
+The numbers above are from a synthetic fixture. To find out whether the ~450 ms floor holds on a
+**real** build, test-drive ktlsp on that repo and let it record itself:
+
+1. Build: `cargo build --release`.
+2. Point your editor's ktlsp at the real project with the compile feature on
+   (`initializationOptions: { compile_diagnostics: { enabled: true } }`) and trust the root when
+   prompted (or pre-seed `~/.cache/ktlsp/trusted_roots`).
+3. Edit and save Kotlin files normally for a while. Each completed compile appends one JSON line to
+   `~/.cache/ktlsp/compile-timing.jsonl` (override with `KTLSP_COMPILE_LOG`). This is on real edits,
+   at your real cadence, hitting base-vs-leaf modules in true proportion — richer than the harness's
+   fixed leaf probe.
+4. Summarize: `dev/bench-analyze.sh` (or `bench analyze --file <path> --json`).
+
+`analyze` reports steady-state p50/p95 (executed, published, warm), and separately the cold
+first-compile cost and the up-to-date / superseded counts. Telemetry is only written when the
+opt-in compile worker is active, so it never affects sessions that don't use compile diagnostics.
+
+If the real-build steady-state p50 comes back at seconds rather than ~0.5 s, that's the signal that
+flips the decision toward a warm backend (Tooling API / compile daemon) — and `analyze` will have
+proven it on real edits rather than a synthetic probe.
+
 ## Candidate backends (to be measured as they land)
 
 Each future backend implements the `CompileBackend` seam and is measured with the same harness; append a row here. The `failures` column doubles as a correctness gate — a fast backend with non-zero failures or oracle divergence is disqualified.

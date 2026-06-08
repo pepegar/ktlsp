@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 
 use ktlsp::compile::{run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFAULT_COMPILE_TASK};
 use ktlsp::diagnostics::Severity;
+use ktlsp::telemetry::{self, CompileTiming};
 use serde::Serialize;
 
 const PROBE_FILE: &str = "_BenchProbe.kt";
@@ -521,6 +522,110 @@ fn print_oracle(r: &OracleReport) {
 }
 
 // ---------------------------------------------------------------------------
+// analyze: turn gathered session telemetry into the same p50/p95 view
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct AnalyzeReport {
+    total: usize,
+    skipped_lines: usize,
+    cold: usize,
+    up_to_date: usize,
+    superseded: usize,
+    steady_count: usize,
+    p50_ms: f64,
+    p95_ms: f64,
+    min_ms: f64,
+    max_ms: f64,
+    cold_ms: Vec<f64>,
+}
+
+fn percentile_f64(sorted: &[f64], p: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    let idx = rank.saturating_sub(1).min(sorted.len() - 1);
+    sorted[idx]
+}
+
+/// Steady-state latency = executed, published (not superseded), and not the cold first compile.
+/// The cold sample is reported separately because it folds in daemon/JVM warmup.
+fn analyze(records: &[CompileTiming], skipped_lines: usize) -> AnalyzeReport {
+    let mut steady: Vec<f64> = records
+        .iter()
+        .filter(|r| r.executed && !r.superseded && !r.cold)
+        .map(|r| r.wall_ms)
+        .collect();
+    steady.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+    AnalyzeReport {
+        total: records.len(),
+        skipped_lines,
+        cold: records.iter().filter(|r| r.cold).count(),
+        up_to_date: records.iter().filter(|r| !r.executed).count(),
+        superseded: records.iter().filter(|r| r.superseded).count(),
+        steady_count: steady.len(),
+        p50_ms: percentile_f64(&steady, 50.0),
+        p95_ms: percentile_f64(&steady, 95.0),
+        min_ms: steady.first().copied().unwrap_or(0.0),
+        max_ms: steady.last().copied().unwrap_or(0.0),
+        cold_ms: records.iter().filter(|r| r.cold).map(|r| r.wall_ms).collect(),
+    }
+}
+
+fn cmd_analyze(args: &Args) -> anyhow::Result<ExitCode> {
+    let path = match args.get("file") {
+        Some(f) => PathBuf::from(f),
+        None => telemetry::log_path()
+            .ok_or_else(|| anyhow::anyhow!("no --file and no telemetry path (set HOME or KTLSP_COMPILE_LOG)"))?,
+    };
+    let content = fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+
+    let mut records = Vec::new();
+    let mut skipped = 0;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<CompileTiming>(line) {
+            Ok(r) => records.push(r),
+            Err(_) => skipped += 1,
+        }
+    }
+
+    let report = analyze(&records, skipped);
+    if args.flag("json") {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_analyze(&report, &path);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_analyze(r: &AnalyzeReport, path: &Path) {
+    println!("\n=== ktlsp compile telemetry ({}) ===", path.display());
+    println!("records:     {} ({} unparseable lines skipped)", r.total, r.skipped_lines);
+    println!("up-to-date:  {} (no recompile)", r.up_to_date);
+    println!("superseded:  {} (newer save arrived mid-compile)", r.superseded);
+    println!("cold:        {}{}", r.cold, cold_note(&r.cold_ms));
+    println!("steady-state latency over {} real compiles:", r.steady_count);
+    println!("  p50 {:.0} ms   p95 {:.0} ms   (min {:.0} / max {:.0})", r.p50_ms, r.p95_ms, r.min_ms, r.max_ms);
+    println!("===================================================");
+}
+
+fn cold_note(cold_ms: &[f64]) -> String {
+    if cold_ms.is_empty() {
+        String::new()
+    } else {
+        let max = cold_ms.iter().cloned().fold(0.0_f64, f64::max);
+        format!(" (first-compile up to {max:.0} ms — daemon/JVM warmup)")
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -588,7 +693,8 @@ impl Args {
 fn usage() -> &'static str {
     "usage:\n  \
      bench latency --root <dir> [--backend gradle-cli] [--n 10] [--scenario inject|recover|both] [--probe-dir <dir>] [--json]\n  \
-     bench oracle  --root <dir> [--baseline gradle-cli] [--candidate gradle-cli] [--probe-dir <dir>] [--json]"
+     bench oracle  --root <dir> [--baseline gradle-cli] [--candidate gradle-cli] [--probe-dir <dir>] [--json]\n  \
+     bench analyze [--file <compile-timing.jsonl>] [--json]"
 }
 
 fn run() -> anyhow::Result<ExitCode> {
@@ -600,6 +706,7 @@ fn run() -> anyhow::Result<ExitCode> {
     match sub.as_str() {
         "latency" => cmd_latency(&args),
         "oracle" => cmd_oracle(&args),
+        "analyze" => cmd_analyze(&args),
         other => anyhow::bail!("unknown subcommand '{other}'\n{}", usage()),
     }
 }
@@ -937,6 +1044,62 @@ mod tests {
         assert_eq!(d.mislocated.len(), 1, "alpha moved");
         assert_eq!(d.missing, vec!["C.kt:3:3 [Error] gamma".to_string()]);
         assert_eq!(d.extra, vec!["D.kt:4:4 [Error] delta".to_string()]);
+    }
+
+    // --- analyze ---
+
+    fn timing(wall_ms: f64, executed: bool, cold: bool, superseded: bool) -> CompileTiming {
+        CompileTiming {
+            ts_ms: 0,
+            root: "/p".into(),
+            trigger: None,
+            wall_ms,
+            executed,
+            diagnostics: 0,
+            errors: 0,
+            warnings: 0,
+            cold,
+            superseded,
+        }
+    }
+
+    #[test]
+    fn analyze_steady_state_excludes_cold_uptodate_superseded() {
+        let records = vec![
+            timing(900.0, true, true, false),  // cold -> excluded from steady, reported separately
+            timing(500.0, true, false, false), // steady
+            timing(520.0, true, false, false), // steady
+            timing(480.0, true, false, false), // steady
+            timing(50.0, false, false, false), // up-to-date -> excluded
+            timing(700.0, true, false, true),  // superseded -> excluded
+        ];
+        let r = analyze(&records, 2);
+        assert_eq!(r.total, 6);
+        assert_eq!(r.skipped_lines, 2);
+        assert_eq!(r.cold, 1);
+        assert_eq!(r.up_to_date, 1);
+        assert_eq!(r.superseded, 1);
+        assert_eq!(r.steady_count, 3, "only the 3 executed/published/warm compiles");
+        assert_eq!(r.p50_ms, 500.0);
+        assert_eq!(r.min_ms, 480.0);
+        assert_eq!(r.max_ms, 520.0);
+        assert_eq!(r.cold_ms, vec![900.0]);
+    }
+
+    #[test]
+    fn analyze_empty_is_safe() {
+        let r = analyze(&[], 0);
+        assert_eq!(r.steady_count, 0);
+        assert_eq!(r.p50_ms, 0.0);
+        assert!(r.cold_ms.is_empty());
+    }
+
+    #[test]
+    fn percentile_f64_nearest_rank() {
+        let s = vec![10.0, 20.0, 30.0, 40.0, 100.0];
+        assert_eq!(percentile_f64(&s, 50.0), 30.0);
+        assert_eq!(percentile_f64(&s, 95.0), 100.0);
+        assert_eq!(percentile_f64(&[], 50.0), 0.0);
     }
 
     #[test]

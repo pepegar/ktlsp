@@ -54,7 +54,9 @@ fn trust_in(file: &Path, root: &Path) {
     if let Some(parent) = file.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let body = set.into_iter().collect::<Vec<_>>().join("\n");
+    // Trailing newline so an external appender (the documented headless pre-seed appends a canonical
+    // root to this file) can't concatenate onto the last entry and corrupt it.
+    let body = set.into_iter().collect::<Vec<_>>().join("\n") + "\n";
     // Write to a sibling temp file then rename, so a crash or concurrent writer can't truncate the
     // trust store to a partial state.
     let tmp = file.with_extension(format!("tmp.{}", std::process::id()));
