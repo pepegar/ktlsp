@@ -10,6 +10,11 @@ repository = "https://github.com/pepegar/ktlsp"
 name = "ktlsp"
 path = "src/main.rs"
 
+# Developer-only diagnostics-backend measurement harness (not shipped with the LSP).
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
 [lib]
 name = "ktlsp"
 path = "src/lib.rs"
