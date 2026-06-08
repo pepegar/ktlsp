@@ -1,10 +1,9 @@
 //! Diagnostics-backend measurement harness for ktlsp.
 //!
-//! This is a developer/decision tool, not part of the shipping LSP. It exists to answer one
-//! question with real numbers instead of guesses: is some alternative compile-for-diagnostics
-//! backend (gradle Tooling API, kotlinc + cached classpath, the Kotlin compile daemon, ...)
-//! actually faster than today's `./gradlew compileKotlin`, and does "faster" silently drop
-//! diagnostics?
+//! A developer/decision tool, not part of the shipping LSP. It answers one question with real
+//! numbers instead of guesses: is some alternative compile-for-diagnostics backend (gradle
+//! Tooling API, kotlinc + cached classpath, the Kotlin compile daemon, ...) actually faster than
+//! today's `./gradlew compileKotlin`, and does "faster" silently drop diagnostics?
 //!
 //! It measures at the *backend* level — it calls a [`CompileBackend`] directly and times
 //! `mutate one file -> CompileOutcome returned` — so the compile strategy is isolated from
@@ -14,7 +13,7 @@
 //! Two subcommands:
 //!   bench latency  --root <dir> [--backend gradle] [--n 10] [--scenario inject|recover|both]
 //!                  [--probe-dir <src/main/kotlin dir>] [--json]
-//!   bench oracle   --root <dir> [--n 1] [--json]
+//!   bench oracle   --root <dir> [--baseline gradle] [--candidate gradle] [--probe-dir <dir>] [--json]
 //!
 //! `latency` reports p50/p95 over N warm iterations (after a discarded warm-up). `oracle` diffs
 //! one backend's diagnostics against the gradle-CLI baseline on an identical injected error;
@@ -22,6 +21,7 @@
 //! that also validates the normalization, and activates as a true cross-backend comparison the
 //! moment a second backend lands.
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -31,19 +31,17 @@ use ktlsp::compile::{run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFA
 use ktlsp::diagnostics::Severity;
 use serde::Serialize;
 
-/// The throwaway source the harness writes into a module to trigger a recompile. Kotlin allows a
-/// package that doesn't match the directory, so this compiles wherever it lands.
 const PROBE_FILE: &str = "_BenchProbe.kt";
 const PROBE_PACKAGE: &str = "ktlsp.bench.probe";
 
 // ---------------------------------------------------------------------------
-// Unit 3: backend seam
+// Backend seam
 // ---------------------------------------------------------------------------
 
 /// A diagnostics backend the harness can drive. The harness-side mirror of the production swap
 /// seam (`ktlsp::compile::run_gradle_compile`). Candidate backends implement this and become
 /// measurable through the exact same runner and oracle.
-pub trait CompileBackend {
+trait CompileBackend {
     fn name(&self) -> &str;
 
     /// One discarded pass so a daemon/JVM is hot before timing begins. Default reuses `compile`.
@@ -59,7 +57,7 @@ pub trait CompileBackend {
 
 /// Today's backend: shell out to `./gradlew compileKotlin`, exactly as the LSP does. Reuses the
 /// real `run_gradle_compile` so the harness measures the production code path, not a copy.
-pub struct GradleCliBackend;
+struct GradleCliBackend;
 
 impl CompileBackend for GradleCliBackend {
     fn name(&self) -> &str {
@@ -92,14 +90,18 @@ struct Probe {
 }
 
 impl Probe {
-    fn create(dir: &Path) -> std::io::Result<Probe> {
+    fn create(dir: &Path) -> anyhow::Result<Probe> {
         let path = dir.join(PROBE_FILE);
-        let original = fs::read_to_string(&path).ok();
+        // Only a genuinely-absent file may be removed on drop. An existing-but-unreadable file
+        // must error here rather than be silently deleted by the Drop impl.
+        let original = if path.exists() {
+            Some(fs::read_to_string(&path).map_err(|e| {
+                anyhow::anyhow!("probe path {} exists but is unreadable: {e}", path.display())
+            })?)
+        } else {
+            None
+        };
         Ok(Probe { path, original })
-    }
-
-    fn file_name(&self) -> &str {
-        PROBE_FILE
     }
 
     /// Content unique per `iter` so Gradle always sees a real change and recompiles (identical
@@ -140,7 +142,8 @@ fn has_probe_error(outcome: &CompileOutcome, probe_name: &str) -> bool {
 // Source-root discovery
 // ---------------------------------------------------------------------------
 
-/// Find every `.../src/main/kotlin` directory under `root`, sorted. Skips build/VCS noise.
+/// Find every `.../src/main/kotlin` directory under `root`, sorted. Skips build/VCS noise and does
+/// not descend into a matched source root (it cannot contain another).
 fn find_source_roots(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -160,7 +163,8 @@ fn find_source_roots(root: &Path) -> Vec<PathBuf> {
                 continue;
             }
             if path.ends_with("src/main/kotlin") {
-                found.push(path.clone());
+                found.push(path);
+                continue;
             }
             stack.push(path);
         }
@@ -178,7 +182,7 @@ fn default_probe_dir(root: &Path) -> anyhow::Result<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
-// Unit 4: latency runner
+// Latency runner
 // ---------------------------------------------------------------------------
 
 #[derive(Serialize)]
@@ -246,7 +250,7 @@ fn run_inject(
         let start = Instant::now();
         let outcome = backend.compile(root, &[probe.path.clone()]);
         durations.push(start.elapsed());
-        if !has_probe_error(&outcome, probe.file_name()) {
+        if !has_probe_error(&outcome, PROBE_FILE) {
             failures += 1;
         }
     }
@@ -254,8 +258,8 @@ fn run_inject(
 }
 
 /// recover: from a broken state (untimed setup), time {write the fix -> compile returns an outcome
-/// with the probe error gone}. Respects the executed signal implicitly: a non-executed run would
-/// leave the error present and be counted as a failure.
+/// with the probe error gone}. A non-executed (UP-TO-DATE) run would leave the error present and
+/// be counted as a failure, so unique-per-iteration content is what keeps this honest.
 fn run_recover(
     backend: &dyn CompileBackend,
     root: &Path,
@@ -271,7 +275,7 @@ fn run_recover(
         let start = Instant::now();
         let outcome = backend.compile(root, &[probe.path.clone()]);
         durations.push(start.elapsed());
-        if has_probe_error(&outcome, probe.file_name()) {
+        if has_probe_error(&outcome, PROBE_FILE) {
             failures += 1;
         }
     }
@@ -281,16 +285,14 @@ fn run_recover(
 fn cmd_latency(args: &Args) -> anyhow::Result<ExitCode> {
     let root = args.root()?;
     let backend = backend_by_name(args.get("backend").unwrap_or("gradle-cli"))?;
-    let n: usize = args.get("n").unwrap_or("10").parse()?;
+    let n = args.parse_n()?;
     let scenario = args.get("scenario").unwrap_or("both");
-    let probe_dir = match args.get("probe-dir") {
-        Some(d) => PathBuf::from(d),
-        None => default_probe_dir(&root)?,
-    };
-
+    if !matches!(scenario, "inject" | "recover" | "both") {
+        anyhow::bail!("unknown --scenario '{scenario}' (known: inject, recover, both)");
+    }
+    let probe_dir = args.probe_dir(&root)?;
     let probe = Probe::create(&probe_dir)?;
 
-    // Warm-up: one discarded clean compile so the Gradle daemon/JVM is hot.
     probe.write_clean(0)?;
     let warm_start = Instant::now();
     backend.warm_up(&root);
@@ -318,8 +320,9 @@ fn cmd_latency(args: &Args) -> anyhow::Result<ExitCode> {
     } else {
         print_latency(&report);
     }
-    // Probe restores on drop here.
-    Ok(ExitCode::SUCCESS)
+
+    let any_failures = report.scenarios.iter().any(|s| s.failures > 0);
+    Ok(if any_failures { ExitCode::FAILURE } else { ExitCode::SUCCESS })
 }
 
 fn print_latency(r: &LatencyReport) {
@@ -339,7 +342,7 @@ fn print_latency(r: &LatencyReport) {
 }
 
 // ---------------------------------------------------------------------------
-// Unit 5: diagnostic-parity correctness oracle
+// Diagnostic-parity correctness oracle
 // ---------------------------------------------------------------------------
 
 /// A backend's diagnostic normalized to (root-relative path, line, col, severity, normalized
@@ -355,9 +358,8 @@ struct NormDiag {
 }
 
 fn normalize(d: &CompileDiagnostic, root: &Path) -> NormDiag {
-    let rel = rel_path(&d.path, root);
     NormDiag {
-        path: rel,
+        path: rel_path(&d.path, root),
         line: d.line,
         col: d.col,
         severity: format!("{:?}", d.severity),
@@ -401,21 +403,45 @@ struct OracleReport {
     ok: bool,
 }
 
-/// Diff a candidate's diagnostics against the baseline's on identical input. Classifies each
-/// divergence as missing (baseline has it, candidate doesn't), extra (candidate invented it), or
-/// mislocated (same severity+message, different location).
-fn diff_diags(baseline: &[NormDiag], candidate: &[NormDiag]) -> (usize, Vec<String>, Vec<String>, Vec<String>) {
-    use std::collections::HashSet;
-    let bset: HashSet<&NormDiag> = baseline.iter().collect();
-    let cset: HashSet<&NormDiag> = candidate.iter().collect();
-    let matched = bset.intersection(&cset).count();
+struct DiffResult {
+    matched: usize,
+    missing: Vec<String>,
+    extra: Vec<String>,
+    mislocated: Vec<String>,
+}
 
-    let mut missing: Vec<&NormDiag> = baseline.iter().filter(|d| !cset.contains(*d)).collect();
-    let mut extra: Vec<&NormDiag> = candidate.iter().filter(|d| !bset.contains(*d)).collect();
+/// Diff a candidate's diagnostics against the baseline's on identical input, by **multiset** (so a
+/// dropped duplicate is caught, not masked by set-dedup). Classifies each divergence as missing
+/// (baseline has it, candidate doesn't), extra (candidate invented it), or mislocated (same
+/// severity+message, different location).
+fn diff_diags(baseline: &[NormDiag], candidate: &[NormDiag]) -> DiffResult {
+    let mut counts: HashMap<&NormDiag, i64> = HashMap::new();
+    for d in baseline {
+        *counts.entry(d).or_insert(0) += 1;
+    }
+    for d in candidate {
+        *counts.entry(d).or_insert(0) -= 1;
+    }
+
+    let matched = baseline.len()
+        - counts.values().filter(|&&c| c > 0).map(|&c| c as usize).sum::<usize>();
+
+    let mut missing = Vec::new();
+    let mut extra = Vec::new();
+    for (d, &c) in &counts {
+        if c > 0 {
+            (0..c).for_each(|_| missing.push((*d).clone()));
+        } else if c < 0 {
+            (0..-c).for_each(|_| extra.push((*d).clone()));
+        }
+    }
+    // Stable, input-order-independent output.
+    missing.sort_by(|a, b| a.full().cmp(&b.full()));
+    extra.sort_by(|a, b| a.full().cmp(&b.full()));
 
     let mut mislocated = Vec::new();
     let mut keep_missing = Vec::new();
-    for m in missing.drain(..) {
+    for m in missing {
         if let Some(pos) =
             extra.iter().position(|e| e.severity == m.severity && e.message == m.message)
         {
@@ -425,21 +451,21 @@ fn diff_diags(baseline: &[NormDiag], candidate: &[NormDiag]) -> (usize, Vec<Stri
             keep_missing.push(m.full());
         }
     }
-    let extra_strs: Vec<String> = extra.iter().map(|d| d.full()).collect();
-    (matched, keep_missing, extra_strs, mislocated)
+    DiffResult {
+        matched,
+        missing: keep_missing,
+        extra: extra.iter().map(|d| d.full()).collect(),
+        mislocated,
+    }
 }
 
 fn cmd_oracle(args: &Args) -> anyhow::Result<ExitCode> {
     let root = args.root()?;
     let baseline = backend_by_name(args.get("baseline").unwrap_or("gradle-cli"))?;
     let candidate = backend_by_name(args.get("candidate").unwrap_or("gradle-cli"))?;
-    let probe_dir = match args.get("probe-dir") {
-        Some(d) => PathBuf::from(d),
-        None => default_probe_dir(&root)?,
-    };
+    let probe_dir = args.probe_dir(&root)?;
 
     let probe = Probe::create(&probe_dir)?;
-    // Identical injected error for both backends.
     probe.write_broken(0)?;
 
     let base_out = baseline.compile(&root, &[probe.path.clone()]);
@@ -448,8 +474,8 @@ fn cmd_oracle(args: &Args) -> anyhow::Result<ExitCode> {
     let base: Vec<NormDiag> = base_out.diagnostics.iter().map(|d| normalize(d, &root)).collect();
     let cand: Vec<NormDiag> = cand_out.diagnostics.iter().map(|d| normalize(d, &root)).collect();
 
-    let (matched, missing, extra, mislocated) = diff_diags(&base, &cand);
-    let ok = missing.is_empty() && extra.is_empty() && mislocated.is_empty();
+    let diff = diff_diags(&base, &cand);
+    let ok = diff.missing.is_empty() && diff.extra.is_empty() && diff.mislocated.is_empty();
 
     let report = OracleReport {
         root: root.display().to_string(),
@@ -457,10 +483,10 @@ fn cmd_oracle(args: &Args) -> anyhow::Result<ExitCode> {
         candidate_backend: candidate.name().to_string(),
         baseline_count: base.len(),
         candidate_count: cand.len(),
-        matched,
-        missing,
-        extra,
-        mislocated,
+        matched: diff.matched,
+        missing: diff.missing,
+        extra: diff.extra,
+        mislocated: diff.mislocated,
         ok,
     };
 
@@ -498,38 +524,39 @@ fn print_oracle(r: &OracleReport) {
 // CLI
 // ---------------------------------------------------------------------------
 
+const BOOL_FLAGS: &[&str] = &["json"];
+
 struct Args {
     pairs: Vec<(String, String)>,
     flags: Vec<String>,
 }
 
 impl Args {
-    fn parse(raw: &[String]) -> Args {
+    fn parse(raw: &[String]) -> anyhow::Result<Args> {
         let mut pairs = Vec::new();
         let mut flags = Vec::new();
         let mut i = 0;
         while i < raw.len() {
             let a = &raw[i];
-            if let Some(key) = a.strip_prefix("--") {
-                if key == "json" {
-                    flags.push(key.to_string());
-                    i += 1;
-                } else if i + 1 < raw.len() {
-                    pairs.push((key.to_string(), raw[i + 1].clone()));
-                    i += 2;
-                } else {
-                    flags.push(key.to_string());
-                    i += 1;
-                }
-            } else {
+            let Some(key) = a.strip_prefix("--") else {
+                anyhow::bail!("unexpected argument '{a}' (options use --key value)");
+            };
+            if BOOL_FLAGS.contains(&key) {
+                flags.push(key.to_string());
                 i += 1;
+            } else if i + 1 < raw.len() {
+                pairs.push((key.to_string(), raw[i + 1].clone()));
+                i += 2;
+            } else {
+                anyhow::bail!("--{key} requires a value");
             }
         }
-        Args { pairs, flags }
+        Ok(Args { pairs, flags })
     }
 
+    /// Last occurrence wins, matching standard CLI override semantics.
     fn get(&self, key: &str) -> Option<&str> {
-        self.pairs.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+        self.pairs.iter().rev().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
 
     fn flag(&self, key: &str) -> bool {
@@ -543,6 +570,19 @@ impl Args {
         // an empty outcome). An absolute path is unambiguous.
         std::fs::canonicalize(r).map_err(|e| anyhow::anyhow!("--root {r}: {e}"))
     }
+
+    fn probe_dir(&self, root: &Path) -> anyhow::Result<PathBuf> {
+        match self.get("probe-dir") {
+            Some(d) => Ok(PathBuf::from(d)),
+            None => default_probe_dir(root),
+        }
+    }
+
+    fn parse_n(&self) -> anyhow::Result<usize> {
+        let raw = self.get("n").unwrap_or("10");
+        raw.parse()
+            .map_err(|_| anyhow::anyhow!("--n must be a non-negative integer, got '{raw}'"))
+    }
 }
 
 fn usage() -> &'static str {
@@ -551,22 +591,21 @@ fn usage() -> &'static str {
      bench oracle  --root <dir> [--baseline gradle-cli] [--candidate gradle-cli] [--probe-dir <dir>] [--json]"
 }
 
-fn main() -> ExitCode {
+fn run() -> anyhow::Result<ExitCode> {
     let argv: Vec<String> = std::env::args().skip(1).collect();
     let Some(sub) = argv.first().cloned() else {
-        eprintln!("{}", usage());
-        return ExitCode::FAILURE;
+        anyhow::bail!("{}", usage());
     };
-    let args = Args::parse(&argv[1..]);
-    let result = match sub.as_str() {
+    let args = Args::parse(&argv[1..])?;
+    match sub.as_str() {
         "latency" => cmd_latency(&args),
         "oracle" => cmd_oracle(&args),
-        other => {
-            eprintln!("unknown subcommand '{other}'\n{}", usage());
-            return ExitCode::FAILURE;
-        }
-    };
-    match result {
+        other => anyhow::bail!("unknown subcommand '{other}'\n{}", usage()),
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
         Ok(code) => code,
         Err(e) => {
             eprintln!("error: {e:#}");
@@ -597,7 +636,6 @@ mod tests {
             &self.name
         }
         fn compile(&self, _root: &Path, changed: &[PathBuf]) -> CompileOutcome {
-            // Inspect the (only) changed file; emit an error iff it contains the unresolved marker.
             let mut diagnostics = Vec::new();
             if let Some(p) = changed.first() {
                 if let Ok(content) = fs::read_to_string(p) {
@@ -616,12 +654,30 @@ mod tests {
         }
     }
 
-    // --- Unit 3: backend seam ---
+    /// A backend that always reports the same wrong answer regardless of input, for exercising the
+    /// failure counters.
+    struct AlwaysCleanBackend;
+    impl CompileBackend for AlwaysCleanBackend {
+        fn name(&self) -> &str {
+            "always-clean"
+        }
+        fn compile(&self, _root: &Path, _changed: &[PathBuf]) -> CompileOutcome {
+            CompileOutcome { diagnostics: Vec::new(), executed: true }
+        }
+    }
+
+    fn tmp(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("ktlsp-bench-{tag}-{}-{:?}", std::process::id(), std::thread::current().id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // --- backend seam ---
 
     #[test]
     fn gradle_backend_on_non_gradle_dir_is_empty() {
-        let dir = std::env::temp_dir().join(format!("ktlsp-bench-nogradle-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("nogradle");
         let outcome = GradleCliBackend.compile(&dir, &[]);
         assert!(!outcome.executed);
         assert!(outcome.diagnostics.is_empty());
@@ -635,7 +691,80 @@ mod tests {
         assert!(backend_by_name("kotlinc").is_err());
     }
 
-    // --- Unit 4: percentiles + probe restoration + inject/recover loops ---
+    // --- arg parsing ---
+
+    fn args(raw: &[&str]) -> anyhow::Result<Args> {
+        Args::parse(&raw.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn args_parse_pairs_and_flags() {
+        let a = args(&["--root", "/p", "--n", "20", "--json"]).unwrap();
+        assert_eq!(a.get("root"), Some("/p"));
+        assert_eq!(a.get("n"), Some("20"));
+        assert!(a.flag("json"));
+        assert!(!a.flag("verbose"));
+    }
+
+    #[test]
+    fn args_dangling_value_key_is_error() {
+        assert!(args(&["--root", "/p", "--n"]).is_err());
+    }
+
+    #[test]
+    fn args_trailing_bool_flag_is_ok() {
+        let a = args(&["--root", "/p", "--json"]).unwrap();
+        assert!(a.flag("json"));
+    }
+
+    #[test]
+    fn args_last_value_wins() {
+        let a = args(&["--n", "10", "--n", "20"]).unwrap();
+        assert_eq!(a.get("n"), Some("20"));
+    }
+
+    #[test]
+    fn args_non_option_token_is_error() {
+        assert!(args(&["positional"]).is_err());
+    }
+
+    #[test]
+    fn args_root_missing_is_error() {
+        assert!(args(&["--n", "5"]).unwrap().root().is_err());
+    }
+
+    #[test]
+    fn parse_n_rejects_garbage() {
+        assert!(args(&["--n", "abc"]).unwrap().parse_n().is_err());
+        assert_eq!(args(&["--n", "7"]).unwrap().parse_n().unwrap(), 7);
+        assert_eq!(args(&[]).unwrap().parse_n().unwrap(), 10);
+    }
+
+    // --- source-root discovery ---
+
+    #[test]
+    fn find_source_roots_detects_and_skips_noise() {
+        let root = tmp("roots");
+        let kotlin = root.join("app/src/main/kotlin/com/example");
+        fs::create_dir_all(&kotlin).unwrap();
+        // Noise dirs that must be skipped, including a decoy under build/.
+        fs::create_dir_all(root.join("app/build/src/main/kotlin")).unwrap();
+        fs::create_dir_all(root.join(".gradle/whatever")).unwrap();
+
+        let roots = find_source_roots(&root);
+        assert_eq!(roots.len(), 1, "exactly one real source root, build/ decoy skipped");
+        assert!(roots[0].ends_with("app/src/main/kotlin"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn default_probe_dir_errors_when_none() {
+        let root = tmp("noroots");
+        assert!(default_probe_dir(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- percentiles ---
 
     fn durs(ms: &[u64]) -> Vec<Duration> {
         ms.iter().map(|m| Duration::from_millis(*m)).collect()
@@ -661,10 +790,11 @@ mod tests {
         assert_eq!(percentile(&[], 50.0), Duration::ZERO);
     }
 
+    // --- probe restoration ---
+
     #[test]
     fn probe_removes_file_when_absent_before() {
-        let dir = std::env::temp_dir().join(format!("ktlsp-probe-rm-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("probe-rm");
         let path = dir.join(PROBE_FILE);
         {
             let probe = Probe::create(&dir).unwrap();
@@ -677,8 +807,7 @@ mod tests {
 
     #[test]
     fn probe_restores_original_content() {
-        let dir = std::env::temp_dir().join(format!("ktlsp-probe-restore-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("probe-restore");
         let path = dir.join(PROBE_FILE);
         fs::write(&path, "ORIGINAL").unwrap();
         {
@@ -690,10 +819,28 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    // --- has_probe_error filters ---
+
+    #[test]
+    fn has_probe_error_filters_severity_and_path() {
+        let err_on_probe =
+            CompileOutcome { diagnostics: vec![diag(PROBE_FILE, 1, 1, Severity::Error, "x")], executed: true };
+        assert!(has_probe_error(&err_on_probe, PROBE_FILE));
+
+        let warning =
+            CompileOutcome { diagnostics: vec![diag(PROBE_FILE, 1, 1, Severity::Warning, "x")], executed: true };
+        assert!(!has_probe_error(&warning, PROBE_FILE), "a warning is not a probe error");
+
+        let other_file =
+            CompileOutcome { diagnostics: vec![diag("Other.kt", 1, 1, Severity::Error, "x")], executed: true };
+        assert!(!has_probe_error(&other_file, PROBE_FILE), "error on a different file is not a probe error");
+    }
+
+    // --- inject/recover loops + failure counting ---
+
     #[test]
     fn inject_and_recover_loops_with_fake_backend_leave_tree_clean() {
-        let dir = std::env::temp_dir().join(format!("ktlsp-bench-loop-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
+        let dir = tmp("loop");
         let backend = FakeBackend { name: "fake".into() };
         {
             let probe = Probe::create(&dir).unwrap();
@@ -708,7 +855,18 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    // --- Unit 5: oracle diff classification ---
+    #[test]
+    fn inject_counts_failures_when_backend_never_reports_error() {
+        let dir = tmp("inject-fail");
+        {
+            let probe = Probe::create(&dir).unwrap();
+            let inj = run_inject(&AlwaysCleanBackend, &dir, &probe, 4).unwrap();
+            assert_eq!(inj.failures, 4, "an always-clean backend fails every inject iteration");
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // --- oracle diff classification ---
 
     fn nd(path: &str, line: u32, col: u32, msg: &str) -> NormDiag {
         normalize(&diag(path, line, col, Severity::Error, msg), Path::new("/root"))
@@ -718,36 +876,67 @@ mod tests {
     fn oracle_identical_sets_match() {
         let a = vec![nd("/root/A.kt", 3, 16, "Unresolved reference")];
         let b = vec![nd("/root/A.kt", 3, 16, "Unresolved reference")];
-        let (matched, missing, extra, mis) = diff_diags(&a, &b);
-        assert_eq!(matched, 1);
-        assert!(missing.is_empty() && extra.is_empty() && mis.is_empty());
+        let d = diff_diags(&a, &b);
+        assert_eq!(d.matched, 1);
+        assert!(d.missing.is_empty() && d.extra.is_empty() && d.mislocated.is_empty());
     }
 
     #[test]
     fn oracle_flags_dropped_diagnostic_as_missing() {
         let baseline = vec![nd("/root/A.kt", 3, 16, "Unresolved reference")];
         let candidate: Vec<NormDiag> = vec![];
-        let (_m, missing, extra, mis) = diff_diags(&baseline, &candidate);
-        assert_eq!(missing.len(), 1);
-        assert!(extra.is_empty() && mis.is_empty());
+        let d = diff_diags(&baseline, &candidate);
+        assert_eq!(d.missing.len(), 1);
+        assert!(d.extra.is_empty() && d.mislocated.is_empty());
     }
 
     #[test]
     fn oracle_flags_invented_diagnostic_as_extra() {
         let baseline: Vec<NormDiag> = vec![];
         let candidate = vec![nd("/root/A.kt", 3, 16, "Unresolved reference")];
-        let (_m, missing, extra, mis) = diff_diags(&baseline, &candidate);
-        assert_eq!(extra.len(), 1);
-        assert!(missing.is_empty() && mis.is_empty());
+        let d = diff_diags(&baseline, &candidate);
+        assert_eq!(d.extra.len(), 1);
+        assert!(d.missing.is_empty() && d.mislocated.is_empty());
     }
 
     #[test]
     fn oracle_flags_wrong_location_as_mislocated() {
         let baseline = vec![nd("/root/A.kt", 3, 16, "Unresolved reference")];
         let candidate = vec![nd("/root/A.kt", 9, 1, "Unresolved reference")];
-        let (_m, missing, extra, mis) = diff_diags(&baseline, &candidate);
-        assert_eq!(mis.len(), 1, "same message at a different location is mislocated, not match");
-        assert!(missing.is_empty() && extra.is_empty());
+        let d = diff_diags(&baseline, &candidate);
+        assert_eq!(d.mislocated.len(), 1, "same message at a different location is mislocated, not match");
+        assert!(d.missing.is_empty() && d.extra.is_empty());
+    }
+
+    #[test]
+    fn oracle_detects_dropped_duplicate_diagnostic() {
+        // Baseline emits the same diagnostic twice; candidate emits it once. Multiset diff must
+        // flag the dropped occurrence rather than declaring parity.
+        let x = nd("/root/A.kt", 3, 16, "Unresolved reference");
+        let baseline = vec![x.clone(), x.clone()];
+        let candidate = vec![x];
+        let d = diff_diags(&baseline, &candidate);
+        assert_eq!(d.matched, 1);
+        assert_eq!(d.missing.len(), 1, "the dropped duplicate is missing");
+    }
+
+    #[test]
+    fn oracle_mixed_missing_extra_mislocated() {
+        let baseline = vec![
+            nd("/root/A.kt", 1, 1, "alpha"),    // mislocated (moves in candidate)
+            nd("/root/B.kt", 2, 2, "beta"),     // matched
+            nd("/root/C.kt", 3, 3, "gamma"),    // genuinely missing
+        ];
+        let candidate = vec![
+            nd("/root/A.kt", 9, 9, "alpha"),    // mislocated counterpart
+            nd("/root/B.kt", 2, 2, "beta"),     // matched
+            nd("/root/D.kt", 4, 4, "delta"),    // genuinely extra
+        ];
+        let d = diff_diags(&baseline, &candidate);
+        assert_eq!(d.matched, 1, "only beta matches exactly");
+        assert_eq!(d.mislocated.len(), 1, "alpha moved");
+        assert_eq!(d.missing, vec!["C.kt:3:3 [Error] gamma".to_string()]);
+        assert_eq!(d.extra, vec!["D.kt:4:4 [Error] delta".to_string()]);
     }
 
     #[test]
