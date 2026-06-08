@@ -54,3 +54,16 @@ Gradle cache, which ktlsp will reuse if present.
   resolves to a full `group:artifact:version`.
 - The Kotlin sources are compile-shaped (correct syntax, real library APIs verified against the
   published sources jars) but the fixture is not required to be built to be useful to ktlsp.
+- This fixture intentionally does **not** compile clean: several files (`_Probe.kt`,
+  `CoroutinesProbe.kt`, etc.) contain partial identifiers like `g.gr` / `s.upper` used as
+  *completion probes* by the headless smoke tests. For a clean-compiling Gradle baseline (used
+  by the diagnostics-backend bench harness) use `dev/multimodule-sample` or a generated
+  `dev/bench-fixture/` instead.
+
+## Pinned Gradle wrapper
+
+A Gradle **8.10.2** wrapper is committed here (`gradlew`, `gradle/wrapper/*`) so that any build
+or benchmark uses a pinned, reproducible toolchain rather than whatever `gradle` happens to be
+on `PATH`. 8.10.2 is within the supported Gradle range for the Kotlin 2.1.20 plugin this fixture
+declares. Note: this project pins `jvmToolchain(17)`, so a JDK 17 must be discoverable to build
+it; `dev/multimodule-sample` pins no toolchain and builds on the running JDK.

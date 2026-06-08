@@ -1,2 +1,10 @@
 /target
 /result
+/.agent-shell/
+
+# Gradle build output in the dev/ sample projects (the pinned wrapper is committed; output is not)
+dev/**/.gradle/
+dev/**/build/
+
+# Generated large multi-module bench fixture (recipe is committed via dev/gen-bench-fixture.sh)
+dev/bench-fixture/
