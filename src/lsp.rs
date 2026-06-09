@@ -59,6 +59,9 @@ pub struct Backend {
     asked_roots: Arc<Mutex<HashSet<String>>>,
     /// Whether the "saved file not covered by the configured task" notice has fired (once per session).
     coverage_notified: Arc<Mutex<bool>>,
+    /// Whether the client advertised `window.workDoneProgress` in `initialize`. Gates server-initiated
+    /// progress (the indexing/compile spinner); when false we fall back to log messages.
+    progress_supported: Arc<Mutex<bool>>,
 }
 
 impl Backend {
@@ -77,6 +80,7 @@ impl Backend {
             worker_started: Mutex::new(false),
             asked_roots: Arc::new(Mutex::new(HashSet::new())),
             coverage_notified: Arc::new(Mutex::new(false)),
+            progress_supported: Arc::new(Mutex::new(false)),
         }
     }
 
@@ -166,11 +170,22 @@ impl Backend {
         let last_saved = self.last_saved.clone();
         let coverage_notified = self.coverage_notified.clone();
         let client = self.client.clone();
+        let progress_supported = *self.progress_supported.lock().unwrap();
         tokio::spawn(async move {
             let mut cold = true;
+            let mut compile_seq: u64 = 0;
             loop {
                 rx.borrow_and_update();
-                client.log_message(MessageType::INFO, "ktlsp: compiling…").await;
+                compile_seq += 1;
+                // Spinner for this compile (unique token per run); fall back to a log message.
+                let ongoing = if progress_supported {
+                    let token = ProgressToken::String(format!("ktlsp/compile/{compile_seq}"));
+                    let _ = client.create_work_done_progress(token.clone()).await;
+                    Some(client.progress(token, "ktlsp: compile").with_message("running gradle…").begin().await)
+                } else {
+                    client.log_message(MessageType::INFO, "ktlsp: compiling…").await;
+                    None
+                };
                 let run_root = root.clone();
                 let started = std::time::Instant::now();
                 let outcome = tokio::task::spawn_blocking(move || {
@@ -187,12 +202,22 @@ impl Backend {
                 cold = false;
 
                 if superseded {
+                    if let Some(p) = ongoing {
+                        p.finish_with_message("superseded by a newer save").await;
+                    }
                     continue;
                 }
 
                 let summary = outcome_summary(&outcome);
                 reconcile(&outcome, &root, &ws, &compile_diags, &last_compile_keys, &client).await;
-                client.log_message(MessageType::INFO, format!("ktlsp: compile done ({summary})")).await;
+                match ongoing {
+                    Some(p) => p.finish_with_message(format!("done ({summary})")).await,
+                    None => {
+                        client
+                            .log_message(MessageType::INFO, format!("ktlsp: compile done ({summary})"))
+                            .await
+                    }
+                }
                 maybe_notify_coverage(&last_saved, &coverage_notified, &client).await;
 
                 // Wait for the next save (a strictly newer generation). Err => sender dropped: stop.
@@ -223,7 +248,11 @@ struct DepStats {
 /// Index every dependency declared in the project's version catalog into the shared index.
 /// Runs on a blocking thread; IO/parsing is lock-free and results are inserted per-coordinate
 /// under brief locks so `goto_definition` can interleave while indexing proceeds.
-fn index_dependencies(ws: &Arc<Mutex<Workspace>>, root: &std::path::Path) -> DepStats {
+fn index_dependencies(
+    ws: &Arc<Mutex<Workspace>>,
+    root: &std::path::Path,
+    progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
+) -> DepStats {
     use crate::artifacts::Repos;
     use crate::deps;
     use crate::index::Tier;
@@ -236,11 +265,16 @@ fn index_dependencies(ws: &Arc<Mutex<Workspace>>, root: &std::path::Path) -> Dep
     let mut kotlin = KotlinParser::new();
     let mut java = JavaParser::new();
 
+    let total = coords.len();
     let mut stats = DepStats {
         coordinates: coords.len(),
         ..Default::default()
     };
-    for coord in &coords {
+    for (i, coord) in coords.iter().enumerate() {
+        // Report before resolving so the UI names the coordinate currently being worked on.
+        if let Some(tx) = progress {
+            let _ = tx.send((i + 1, total, coord.label()));
+        }
         // Isolate each coordinate: a panic while parsing one library's sources must not abort
         // indexing of the rest.
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -264,6 +298,70 @@ fn index_dependencies(ws: &Arc<Mutex<Workspace>>, root: &std::path::Path) -> Dep
         }
     }
     stats
+}
+
+/// Warm the index off the request path, reporting progress to the client when it supports work-done
+/// progress (rust-analyzer-style status: "scanning project", then "indexing <coordinate> (n/total)").
+/// Falls back to log messages otherwise. Summaries are always logged.
+async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBuf, progress: bool) {
+    // 1. Project sources (fast).
+    let scan_ws = ws.clone();
+    let scan_root = root.clone();
+
+    let ongoing = if progress {
+        let token = ProgressToken::String("ktlsp/index".to_string());
+        // Server-initiated progress requires creating the token first (per the LSP spec).
+        let _ = client.create_work_done_progress(token.clone()).await;
+        Some(
+            client
+                .progress(token, "ktlsp: indexing")
+                .with_message("scanning project")
+                .with_percentage(0)
+                .begin()
+                .await,
+        )
+    } else {
+        None
+    };
+
+    let count = tokio::task::spawn_blocking(move || scan_ws.lock().unwrap().scan(&scan_root))
+        .await
+        .unwrap_or(0);
+    client
+        .log_message(MessageType::INFO, format!("ktlsp indexed {count} project files"))
+        .await;
+    if let Some(p) = &ongoing {
+        p.report_with_message(format!("indexed {count} project files; resolving dependencies"), 5).await;
+    }
+
+    // 2. Library sources from the version catalog. Stream per-coordinate progress over a channel so
+    //    the blocking indexer can report into the async progress without blocking on it.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize, String)>();
+    let index_ws = ws.clone();
+    let index_root = root.clone();
+    let handle = tokio::task::spawn_blocking(move || {
+        index_dependencies(&index_ws, &index_root, Some(&tx))
+    });
+    while let Some((done, total, label)) = rx.recv().await {
+        if let Some(p) = &ongoing {
+            let pct = if total == 0 { 100 } else { (5 + 95 * done / total).min(100) as u32 };
+            p.report_with_message(format!("indexing {label} ({done}/{total})"), pct).await;
+        }
+    }
+    let stats = handle.await.unwrap_or_default();
+
+    let summary = format!(
+        "ktlsp indexed {} library files ({} symbols) from {} dependencies ({} skipped)",
+        stats.files, stats.symbols, stats.coordinates, stats.failed
+    );
+    client.log_message(MessageType::INFO, summary.clone()).await;
+    if let Some(p) = ongoing {
+        p.finish_with_message(format!(
+            "indexed {} dependencies, {} files",
+            stats.coordinates, stats.files
+        ))
+        .await;
+    }
 }
 
 /// `file://` URI -> canonical key (the file path string). `None` for non-file URIs.
@@ -318,6 +416,16 @@ impl LanguageServer for Backend {
             .unwrap_or(false);
         *self.snippets_supported.lock().unwrap() = snippets;
 
+        // Whether the client supports server-initiated work-done progress (the indexing/compile
+        // spinner). Default false -> fall back to log messages.
+        let progress = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|w| w.work_done_progress)
+            .unwrap_or(false);
+        *self.progress_supported.lock().unwrap() = progress;
+
         // Opt-in gradle compile diagnostics (default off). Read once here so the rest of the server
         // can gate cheaply without re-parsing the options payload.
         *self.compile_enabled.lock().unwrap() =
@@ -366,31 +474,9 @@ impl LanguageServer for Backend {
         if let Some(root) = root {
             let ws = self.ws.clone();
             let client = self.client.clone();
+            let progress = *self.progress_supported.lock().unwrap();
             tokio::spawn(async move {
-                // 1. Project sources (fast).
-                let scan_ws = ws.clone();
-                let scan_root = root.clone();
-                let count = tokio::task::spawn_blocking(move || scan_ws.lock().unwrap().scan(&scan_root))
-                    .await
-                    .unwrap_or(0);
-                client
-                    .log_message(MessageType::INFO, format!("ktlsp indexed {count} project files"))
-                    .await;
-
-                // 2. Library sources from the version catalog (locate/download/extract/parse off
-                //    the lock; insert per-coordinate under brief locks so goto can interleave).
-                let stats = tokio::task::spawn_blocking(move || index_dependencies(&ws, &root))
-                    .await
-                    .unwrap_or_default();
-                client
-                    .log_message(
-                        MessageType::INFO,
-                        format!(
-                            "ktlsp indexed {} library files ({} symbols) from {} dependencies ({} skipped)",
-                            stats.files, stats.symbols, stats.coordinates, stats.failed
-                        ),
-                    )
-                    .await;
+                index_workspace(client, ws, root, progress).await;
             });
         }
     }
