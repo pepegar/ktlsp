@@ -25,8 +25,59 @@
       # The package builder, parameterised over a `pkgs` so it works both as a flake output and from
       # the overlay. Deps are vendored reproducibly from Cargo.lock; the C tree-sitter grammars and
       # ring's crypto compile with the stdenv `cc` (no OpenSSL — ureq uses rustls).
+
+      # The Kotlin compile-daemon sidecar: a JVM built with Gradle that drives the real compiler
+      # (kotlin-build-tools-api) for the opt-in `kotlin-daemon` diagnostics backend. Gradle fetches
+      # its deps from Maven, which a sandboxed nix build can't do — so dependencies are pinned in
+      # `sidecar/deps.json` via nixpkgs' gradle mitm-cache. Regenerate that lock after changing the
+      # sidecar's dependencies with:  nix run .#sidecar.mitmCache.updateScript
+      mkSidecar =
+        pkgs:
+        pkgs.stdenv.mkDerivation (finalAttrs: {
+          pname = "ktlsp-sidecar";
+          version = cargoToml.package.version;
+
+          src = ./sidecar;
+
+          nativeBuildInputs = [
+            pkgs.gradle
+            pkgs.makeWrapper
+          ];
+
+          mitmCache = pkgs.gradle.fetchDeps {
+            pkg = finalAttrs.finalPackage;
+            data = ./sidecar/deps.json;
+          };
+          # mitm-cache binds a local proxy; the Darwin sandbox needs local networking allowed.
+          __darwinAllowLocalNetworking = true;
+
+          gradleBuildTask = "installDist";
+          # Pure JVM build, no behavioural tests to run here.
+          doCheck = false;
+
+          installPhase = ''
+            runHook preInstall
+            mkdir -p $out
+            cp -r build/install/ktlsp-sidecar $out/ktlsp-sidecar
+            # The installDist launcher resolves `java` via JAVA_HOME; pin it to a JRE so the
+            # sidecar runs without a JDK on the user's PATH.
+            wrapProgram $out/ktlsp-sidecar/bin/ktlsp-sidecar \
+              --set JAVA_HOME ${pkgs.jdk21.home}
+            runHook postInstall
+          '';
+
+          meta = {
+            description = "ktlsp Kotlin compile-daemon sidecar";
+            license = lib.licenses.mit;
+            platforms = systems;
+          };
+        });
+
       mkKtlsp =
         pkgs:
+        let
+          sidecar = mkSidecar pkgs;
+        in
         pkgs.rustPlatform.buildRustPackage {
           pname = cargoToml.package.name;
           version = cargoToml.package.version;
@@ -34,8 +85,18 @@
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
 
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+
           # Darwin links against libiconv; Linux needs nothing beyond stdenv.
           buildInputs = lib.optionals pkgs.stdenv.isDarwin [ pkgs.libiconv ];
+
+          # Point ktlsp at the packaged sidecar launcher (used only by the opt-in kotlin-daemon
+          # backend; the default gradle backend never spawns it). --set-default so a user/test can
+          # still override KTLSP_SIDECAR_BIN.
+          postInstall = ''
+            wrapProgram $out/bin/ktlsp \
+              --set-default KTLSP_SIDECAR_BIN ${sidecar}/ktlsp-sidecar/bin/ktlsp-sidecar
+          '';
 
           meta = {
             description = cargoToml.package.description;
@@ -54,6 +115,7 @@
       # `nix build`, and for consumers: `ktlsp.packages.${system}.default`.
       packages = forAllSystems (pkgs: rec {
         ktlsp = mkKtlsp pkgs;
+        sidecar = mkSidecar pkgs;
         default = ktlsp;
       });
 
