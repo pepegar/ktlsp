@@ -117,6 +117,8 @@ fn cache_path(root: &Path) -> PathBuf {
 }
 
 /// Resolve every module's compile classpath, using the cache when build files are unchanged.
+/// Note: on a build with configuration-on-demand this may only return the configured subset; prefer
+/// `resolve_module` when the target module is known.
 pub fn resolve(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
     let mtimes = build_file_mtimes(root);
     let cache = cache_path(root);
@@ -127,7 +129,7 @@ pub fn resolve(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
             }
         }
     }
-    let modules = run_dump(root)?;
+    let modules = run_dump(root, "ktlspDumpClasspath")?;
     if let Some(parent) = cache.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -137,9 +139,50 @@ pub fn resolve(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
     Ok(modules)
 }
 
+/// Resolve one module's classpath by gradle path (e.g. `:Web:api`), running only that module's dump
+/// task. This configures just the module + its dependencies — essential on large repos with
+/// configuration-on-demand, where an unqualified task wouldn't reach the module. Cached per module.
+pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspath> {
+    let mtimes = build_file_mtimes(root);
+    let cache = module_cache_path(root, module);
+    if let Ok(text) = std::fs::read_to_string(&cache) {
+        if let Ok(entry) = serde_json::from_str::<CacheEntry>(&text) {
+            if entry.mtimes == mtimes {
+                if let Some(m) = entry.modules.into_iter().find(|m| m.module == module) {
+                    return Ok(m);
+                }
+            }
+        }
+    }
+    let task = format!("{}:ktlspDumpClasspath", module.trim_end_matches(':'));
+    let modules = run_dump(root, &task)?;
+    let found = modules
+        .iter()
+        .find(|m| m.module == module)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("module {module} not found in dump"))?;
+    if let Some(parent) = cache.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(text) = serde_json::to_string(&CacheEntry { mtimes, modules }) {
+        let _ = std::fs::write(&cache, text);
+    }
+    Ok(found)
+}
+
+fn module_cache_path(root: &Path, module: &str) -> PathBuf {
+    let key = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut hash: u64 = 1469598103934665603;
+    for b in key.to_string_lossy().bytes().chain(module.bytes()) {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(1099511628211);
+    }
+    crate::deps::cache_home().join("classpath").join(format!("mod-{hash:016x}.json"))
+}
+
 /// Run the init script via the project's gradle wrapper and parse the dump. Inherits the parent's
 /// environment (so repo-specific flags like SKIP_* are honored when ktlsp is launched with them).
-fn run_dump(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
+fn run_dump(root: &Path, task: &str) -> anyhow::Result<Vec<ModuleClasspath>> {
     // Absolute wrapper path: with current_dir(root) set, a relative program path resolves against
     // the child's cwd and fails to spawn.
     let gradlew = std::fs::canonicalize(root.join(if cfg!(windows) { "gradlew.bat" } else { "gradlew" }))
@@ -153,7 +196,7 @@ fn run_dump(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
         .current_dir(root)
         .arg("-I")
         .arg(&script)
-        .arg("ktlspDumpClasspath")
+        .arg(task)
         .arg("-q")
         .arg("--console=plain")
         .output()?;

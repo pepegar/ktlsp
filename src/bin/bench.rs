@@ -28,7 +28,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ktlsp::classpath::{self, ModuleClasspath};
+use ktlsp::classpath;
 use ktlsp::compile::{parse_output, run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFAULT_COMPILE_TASK};
 use ktlsp::diagnostics::Severity;
 use ktlsp::sidecar::{self, CompileRequest, SidecarClient};
@@ -79,25 +79,12 @@ impl CompileBackend for GradleCliBackend {
 /// the gradle backend uses, so the oracle compares like with like.
 struct KotlinDaemonBackend {
     client: Mutex<Option<SidecarClient>>,
-    modules: Mutex<Option<Vec<ModuleClasspath>>>,
-    last_module: Mutex<Option<usize>>,
+    last_module: Mutex<Option<String>>,
 }
 
 impl KotlinDaemonBackend {
     fn new() -> Self {
-        KotlinDaemonBackend {
-            client: Mutex::new(None),
-            modules: Mutex::new(None),
-            last_module: Mutex::new(None),
-        }
-    }
-
-    fn ensure_modules(&self, root: &Path) -> anyhow::Result<()> {
-        let mut g = self.modules.lock().unwrap();
-        if g.is_none() {
-            *g = Some(classpath::resolve(root)?);
-        }
-        Ok(())
+        KotlinDaemonBackend { client: Mutex::new(None), last_module: Mutex::new(None) }
     }
 
     fn ensure_client(&self) -> anyhow::Result<()> {
@@ -114,33 +101,27 @@ impl KotlinDaemonBackend {
     }
 
     fn do_compile(&self, root: &Path, changed: &[PathBuf]) -> anyhow::Result<CompileOutcome> {
-        self.ensure_modules(root)?;
-        let req = {
-            let guard = self.modules.lock().unwrap();
-            let modules = guard.as_ref().unwrap();
-            let idx = match changed.first() {
-                Some(c) => {
-                    let i = modules
-                        .iter()
-                        .position(|m| c.starts_with(&m.project_dir))
-                        .ok_or_else(|| anyhow::anyhow!("no module owns {}", c.display()))?;
-                    *self.last_module.lock().unwrap() = Some(i);
-                    i
-                }
-                None => self
-                    .last_module
-                    .lock()
-                    .unwrap()
-                    .ok_or_else(|| anyhow::anyhow!("no module determined yet (edit a file first)"))?,
-            };
-            let m = &modules[idx];
-            CompileRequest::new(
-                m.module.clone(),
-                vec![m.project_dir.join("src/main/kotlin").to_string_lossy().into_owned()],
-                m.entries.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
-                daemon_cache_dir(&m.module).to_string_lossy().into_owned(),
-            )
+        let module = match changed.first() {
+            Some(c) => {
+                let m = module_path_for(root, c)
+                    .ok_or_else(|| anyhow::anyhow!("can't derive gradle module for {}", c.display()))?;
+                *self.last_module.lock().unwrap() = Some(m.clone());
+                m
+            }
+            None => self
+                .last_module
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("no module determined yet (edit a file first)"))?,
         };
+        let mc = classpath::resolve_module(root, &module)?;
+        let req = CompileRequest::new(
+            mc.module.clone(),
+            vec![mc.project_dir.join("src/main/kotlin").to_string_lossy().into_owned()],
+            mc.entries.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            daemon_cache_dir(&mc.module).to_string_lossy().into_owned(),
+        );
 
         self.ensure_client()?;
         let mut cg = self.client.lock().unwrap();
@@ -149,6 +130,27 @@ impl KotlinDaemonBackend {
         // sidecar's executed signal (the daemon always runs the compiler).
         let parsed = parse_output(&result.diagnostics.join("\n"), DEFAULT_COMPILE_TASK);
         Ok(CompileOutcome { diagnostics: parsed.diagnostics, executed: result.executed })
+    }
+}
+
+/// Derive a Gradle project path from a source file path, by Gradle's default dir convention: the
+/// directory segments between `root` and the `src/` source-set marker, joined with `:`. e.g.
+/// `<root>/Web/api/src/main/kotlin/X.kt` -> `:Web:api`. (Assumes the default projectDir convention;
+/// modules with a remapped projectDir would need the settings graph.)
+fn module_path_for(root: &Path, file: &Path) -> Option<String> {
+    let rel = file.strip_prefix(root).ok()?;
+    let mut segs = Vec::new();
+    for comp in rel.components() {
+        let s = comp.as_os_str().to_str()?;
+        if s == "src" {
+            break;
+        }
+        segs.push(s);
+    }
+    if segs.is_empty() {
+        Some(":".to_string())
+    } else {
+        Some(format!(":{}", segs.join(":")))
     }
 }
 
@@ -169,8 +171,7 @@ impl CompileBackend for KotlinDaemonBackend {
 
     // Warm the JVM (spawn + ready handshake) so its startup isn't in the timed samples. The first
     // real compile still pays the module's cold incremental-cache build.
-    fn warm_up(&self, root: &Path) {
-        let _ = self.ensure_modules(root);
+    fn warm_up(&self, _root: &Path) {
         let _ = self.ensure_client();
     }
 
