@@ -77,9 +77,9 @@ Each future backend implements the `CompileBackend` seam and is measured with th
 | Backend | inject p50 | inject p95 | recover p50 | recover p95 | oracle vs gradle-cli | notes |
 |---|---|---|---|---|---|---|
 | gradle-cli (baseline) | 489–546 ms | 544–602 ms | 492–541 ms | 537–548 ms | n/a | warm daemon, this machine |
-| gradle Tooling API (warm) | — | — | — | — | — | not yet implemented |
-| kotlinc + cached classpath | — | — | — | — | — | not yet implemented |
-| kotlin compile daemon | — | — | — | — | — | not yet implemented |
+| gradle Tooling API (warm) | — | — | — | — | — | not implemented |
+| kotlinc + cached classpath | — | — | — | — | — | not implemented (dropped — non-incremental) |
+| kotlin compile daemon | 38 ms | — | 49 ms | — | OK (parity) | **measured** — see `2026-06-09-kotlin-daemon-results.md`; ~1.1 s on real GN5 `:Web:api` vs ~1.8 s gradle |
 
 ## Caveats / threats to validity
 
