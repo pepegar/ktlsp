@@ -5,6 +5,7 @@
 // invokes.
 plugins {
     kotlin("jvm") version "2.1.20"
+    kotlin("plugin.serialization") version "2.1.20"
     application
 }
 
@@ -17,6 +18,7 @@ dependencies {
     implementation("org.jetbrains.kotlin:kotlin-build-tools-api:2.1.20")
     // ...and the implementation (pulls kotlin-compiler-embeddable transitively).
     runtimeOnly("org.jetbrains.kotlin:kotlin-build-tools-impl:2.1.20")
+    implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 }
 
 application {
