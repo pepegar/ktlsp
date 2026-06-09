@@ -25,10 +25,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ktlsp::compile::{run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFAULT_COMPILE_TASK};
+use ktlsp::classpath::{self, ModuleClasspath};
+use ktlsp::compile::{parse_output, run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFAULT_COMPILE_TASK};
 use ktlsp::diagnostics::Severity;
+use ktlsp::sidecar::{self, CompileRequest, SidecarClient};
 use ktlsp::telemetry::{self, CompileTiming};
 use serde::Serialize;
 
@@ -70,11 +73,124 @@ impl CompileBackend for GradleCliBackend {
     }
 }
 
+/// Warm, incremental Kotlin compiler driven via the JVM sidecar. Resolves the project's classpath
+/// once, maps the edited file to its Gradle module, and compiles that module incrementally. The
+/// sidecar keeps the compiler warm across calls; diagnostics are parsed by the same `parse_output`
+/// the gradle backend uses, so the oracle compares like with like.
+struct KotlinDaemonBackend {
+    client: Mutex<Option<SidecarClient>>,
+    modules: Mutex<Option<Vec<ModuleClasspath>>>,
+    last_module: Mutex<Option<usize>>,
+}
+
+impl KotlinDaemonBackend {
+    fn new() -> Self {
+        KotlinDaemonBackend {
+            client: Mutex::new(None),
+            modules: Mutex::new(None),
+            last_module: Mutex::new(None),
+        }
+    }
+
+    fn ensure_modules(&self, root: &Path) -> anyhow::Result<()> {
+        let mut g = self.modules.lock().unwrap();
+        if g.is_none() {
+            *g = Some(classpath::resolve(root)?);
+        }
+        Ok(())
+    }
+
+    fn ensure_client(&self) -> anyhow::Result<()> {
+        let mut g = self.client.lock().unwrap();
+        if g.is_none() {
+            let bin = sidecar::default_bin().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sidecar binary not found — build it (cd sidecar && ./gradlew installDist) or set KTLSP_SIDECAR_BIN"
+                )
+            })?;
+            *g = Some(SidecarClient::spawn(&bin)?);
+        }
+        Ok(())
+    }
+
+    fn do_compile(&self, root: &Path, changed: &[PathBuf]) -> anyhow::Result<CompileOutcome> {
+        self.ensure_modules(root)?;
+        let req = {
+            let guard = self.modules.lock().unwrap();
+            let modules = guard.as_ref().unwrap();
+            let idx = match changed.first() {
+                Some(c) => {
+                    let i = modules
+                        .iter()
+                        .position(|m| c.starts_with(&m.project_dir))
+                        .ok_or_else(|| anyhow::anyhow!("no module owns {}", c.display()))?;
+                    *self.last_module.lock().unwrap() = Some(i);
+                    i
+                }
+                None => self
+                    .last_module
+                    .lock()
+                    .unwrap()
+                    .ok_or_else(|| anyhow::anyhow!("no module determined yet (edit a file first)"))?,
+            };
+            let m = &modules[idx];
+            CompileRequest::new(
+                m.module.clone(),
+                vec![m.project_dir.join("src/main/kotlin").to_string_lossy().into_owned()],
+                m.entries.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+                daemon_cache_dir(&m.module).to_string_lossy().into_owned(),
+            )
+        };
+
+        self.ensure_client()?;
+        let mut cg = self.client.lock().unwrap();
+        let result = cg.as_mut().unwrap().compile(&req)?;
+        // Diagnostics arrive as GRADLE_STYLE strings; reuse the gradle parser, but trust the
+        // sidecar's executed signal (the daemon always runs the compiler).
+        let parsed = parse_output(&result.diagnostics.join("\n"), DEFAULT_COMPILE_TASK);
+        Ok(CompileOutcome { diagnostics: parsed.diagnostics, executed: result.executed })
+    }
+}
+
+/// Per-module IC state dir for the daemon, under the ktlsp cache home.
+fn daemon_cache_dir(module: &str) -> PathBuf {
+    let mut h: u64 = 1469598103934665603;
+    for b in module.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    ktlsp::deps::cache_home().join("daemon").join(format!("{h:016x}"))
+}
+
+impl CompileBackend for KotlinDaemonBackend {
+    fn name(&self) -> &str {
+        "kotlin-daemon"
+    }
+
+    // Warm the JVM (spawn + ready handshake) so its startup isn't in the timed samples. The first
+    // real compile still pays the module's cold incremental-cache build.
+    fn warm_up(&self, root: &Path) {
+        let _ = self.ensure_modules(root);
+        let _ = self.ensure_client();
+    }
+
+    fn compile(&self, root: &Path, changed: &[PathBuf]) -> CompileOutcome {
+        match self.do_compile(root, changed) {
+            Ok(o) => o,
+            Err(e) => {
+                eprintln!("kotlin-daemon backend: {e:#}");
+                CompileOutcome::default()
+            }
+        }
+    }
+}
+
 fn backend_by_name(name: &str) -> anyhow::Result<Box<dyn CompileBackend>> {
     match name {
         "gradle" | "gradle-cli" => Ok(Box::new(GradleCliBackend)),
+        "kotlin-daemon" | "daemon" => Ok(Box::new(KotlinDaemonBackend::new())),
         other => anyhow::bail!(
-            "unknown backend '{other}' (known: gradle-cli; tooling-api/kotlinc/daemon land later)"
+            "unknown backend '{other}' (known: gradle-cli, kotlin-daemon)"
         ),
     }
 }

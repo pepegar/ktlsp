@@ -20,6 +20,7 @@ pub mod java;
 pub mod lsp;
 pub mod parser;
 pub mod resolve;
+pub mod sidecar;
 pub mod solve;
 pub mod symbol;
 pub mod telemetry;
