@@ -26,6 +26,7 @@ pub mod solve;
 pub mod symbol;
 pub mod telemetry;
 pub mod text;
+pub mod trace;
 pub mod trust;
 pub mod types;
 pub mod workspace;

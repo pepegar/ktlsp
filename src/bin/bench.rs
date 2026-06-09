@@ -32,6 +32,7 @@ use ktlsp::compile::{run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFA
 use ktlsp::daemon::DaemonCompiler;
 use ktlsp::diagnostics::Severity;
 use ktlsp::telemetry::{self, CompileTiming};
+use ktlsp::trace::{self, TraceEvent};
 use serde::Serialize;
 
 const PROBE_FILE: &str = "_BenchProbe.kt";
@@ -658,6 +659,43 @@ fn cold_note(cold_ms: &[f64]) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// trace: convert recorded LSP request events into a perfetto-loadable trace
+// ---------------------------------------------------------------------------
+
+fn cmd_trace(args: &Args) -> anyhow::Result<ExitCode> {
+    let path = match args.get("file") {
+        Some(f) => PathBuf::from(f),
+        None => trace::log_path()
+            .ok_or_else(|| anyhow::anyhow!("no --file and no trace path (set HOME or KTLSP_TRACE)"))?,
+    };
+    let out = args.get("out").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("ktlsp-trace.json"));
+    let content = fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("reading {}: {e}", path.display()))?;
+
+    let mut events = Vec::new();
+    let mut skipped = 0;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<TraceEvent>(line) {
+            Ok(e) => events.push(e),
+            Err(_) => skipped += 1,
+        }
+    }
+    let n = events.len();
+    // Chrome Trace Event format: an object with traceEvents[]. Loadable at https://ui.perfetto.dev.
+    let doc = serde_json::json!({ "displayTimeUnit": "ms", "traceEvents": events });
+    fs::write(&out, serde_json::to_string(&doc)?)?;
+    println!(
+        "wrote {n} request events ({skipped} skipped) to {} — open it at https://ui.perfetto.dev",
+        out.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+// ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
@@ -726,7 +764,8 @@ fn usage() -> &'static str {
     "usage:\n  \
      bench latency --root <dir> [--backend gradle-cli] [--n 10] [--scenario inject|recover|both] [--probe-dir <dir>] [--json]\n  \
      bench oracle  --root <dir> [--baseline gradle-cli] [--candidate gradle-cli] [--probe-dir <dir>] [--json]\n  \
-     bench analyze [--file <compile-timing.jsonl>] [--json]"
+     bench analyze [--file <compile-timing.jsonl>] [--json]\n  \
+     bench trace   [--file <trace-events.jsonl>] [--out ktlsp-trace.json]"
 }
 
 fn run() -> anyhow::Result<ExitCode> {
@@ -739,6 +778,7 @@ fn run() -> anyhow::Result<ExitCode> {
         "latency" => cmd_latency(&args),
         "oracle" => cmd_oracle(&args),
         "analyze" => cmd_analyze(&args),
+        "trace" => cmd_trace(&args),
         other => anyhow::bail!("unknown subcommand '{other}'\n{}", usage()),
     }
 }

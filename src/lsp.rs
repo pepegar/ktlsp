@@ -581,6 +581,7 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
+        let start = std::time::Instant::now();
         let uri = params.text_document_position_params.text_document.uri;
         let pos = params.text_document_position_params.position;
         let key = match uri_to_key(&uri) {
@@ -589,18 +590,31 @@ impl LanguageServer for Backend {
         };
 
         // All work is synchronous; the lock is never held across an `.await`.
-        let locations = {
+        let (locations, symbol) = {
             let mut ws = self.ws.lock().unwrap();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
             };
             let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let symbol = crate::trace::ident_at(&text, offset);
             let defs = ws.goto_definition(&key, offset);
-            defs.iter().filter_map(|d| def_to_location(&ws, d)).collect::<Vec<_>>()
+            let locs = defs.iter().filter_map(|d| def_to_location(&ws, d)).collect::<Vec<_>>();
+            (locs, symbol)
         };
 
-        Ok(match locations.len() {
+        let count = locations.len();
+        crate::trace::request(
+            "goto_definition",
+            start,
+            &key,
+            pos.line,
+            pos.character,
+            symbol.as_deref(),
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok(match count {
             0 => None,
             1 => Some(GotoDefinitionResponse::Scalar(
                 locations.into_iter().next().unwrap(),
@@ -610,6 +624,7 @@ impl LanguageServer for Backend {
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let start = std::time::Instant::now();
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
@@ -618,21 +633,35 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let locations = {
+        let (locations, symbol) = {
             let mut ws = self.ws.lock().unwrap();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
             };
             let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let symbol = crate::trace::ident_at(&text, offset);
             let sites = ws.references(&key, offset, include_declaration);
-            sites.iter().filter_map(|d| def_to_location(&ws, d)).collect::<Vec<_>>()
+            let locs = sites.iter().filter_map(|d| def_to_location(&ws, d)).collect::<Vec<_>>();
+            (locs, symbol)
         };
 
+        let count = locations.len();
+        crate::trace::request(
+            "references",
+            start,
+            &key,
+            pos.line,
+            pos.character,
+            symbol.as_deref(),
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
         Ok((!locations.is_empty()).then_some(locations))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let start = std::time::Instant::now();
         let uri = params.text_document_position.text_document.uri;
         let pos = params.text_document_position.position;
         let key = match uri_to_key(&uri) {
@@ -644,24 +673,38 @@ impl LanguageServer for Backend {
         // build the `LineIndex` and compute the byte offset, then the offset is passed to
         // `ws.complete`, which internally accesses the cached tree exactly like `goto_definition`.
         let snippets = *self.snippets_supported.lock().unwrap();
-        let (items, is_incomplete) = {
+        let (items, is_incomplete, symbol) = {
             let mut ws = self.ws.lock().unwrap();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
             };
             let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let symbol = crate::trace::ident_at(&text, offset);
             match ws.complete(&key, offset, snippets) {
                 Some(shaped) => {
                     let incomplete = shaped.is_incomplete;
                     let items =
                         shaped.items.into_iter().map(to_completion_item).collect::<Vec<_>>();
-                    (items, incomplete)
+                    (items, incomplete, symbol)
                 }
-                None => return Ok(None),
+                // No completion offered (e.g. not in a completable position): trace as empty rather
+                // than returning early, so "completion produced nothing here" is visible.
+                None => (Vec::new(), false, symbol),
             }
         };
 
+        let count = items.len();
+        crate::trace::request(
+            "completion",
+            start,
+            &key,
+            pos.line,
+            pos.character,
+            symbol.as_deref(),
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
         Ok((!items.is_empty()).then(|| {
             CompletionResponse::List(CompletionList { is_incomplete, items })
         }))
