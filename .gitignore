@@ -8,3 +8,7 @@ dev/**/build/
 
 # Generated large multi-module bench fixture (recipe is committed via dev/gen-bench-fixture.sh)
 dev/bench-fixture/
+
+# Kotlin compile-daemon sidecar build output (the source + wrapper are committed)
+sidecar/.gradle/
+sidecar/build/
