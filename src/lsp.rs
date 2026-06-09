@@ -17,6 +17,7 @@ use tower_lsp_server::{Client, LanguageServer};
 
 use crate::compile::{self, CompileDiagnostic, CompileOutcome};
 use crate::complete::ShapedItem;
+use crate::daemon::DaemonCompiler;
 use crate::diagnostics::Severity;
 use crate::symbol::{Def, SymbolKind};
 use crate::text::LineIndex;
@@ -62,6 +63,9 @@ pub struct Backend {
     /// Whether the client advertised `window.workDoneProgress` in `initialize`. Gates server-initiated
     /// progress (the indexing/compile spinner); when false we fall back to log messages.
     progress_supported: Arc<Mutex<bool>>,
+    /// Compile-diagnostics backend from `initialization_options.compile_diagnostics.backend`:
+    /// `"kotlin-daemon"` uses the warm incremental sidecar; anything else (default) uses gradle.
+    use_daemon: Mutex<bool>,
 }
 
 impl Backend {
@@ -81,6 +85,7 @@ impl Backend {
             asked_roots: Arc::new(Mutex::new(HashSet::new())),
             coverage_notified: Arc::new(Mutex::new(false)),
             progress_supported: Arc::new(Mutex::new(false)),
+            use_daemon: Mutex::new(false),
         }
     }
 
@@ -171,28 +176,50 @@ impl Backend {
         let coverage_notified = self.coverage_notified.clone();
         let client = self.client.clone();
         let progress_supported = *self.progress_supported.lock().unwrap();
+        let use_daemon = *self.use_daemon.lock().unwrap();
         tokio::spawn(async move {
             let mut cold = true;
             let mut compile_seq: u64 = 0;
+            let mut daemon = DaemonCompiler::new();
             loop {
                 rx.borrow_and_update();
                 compile_seq += 1;
+                let backend_msg = if use_daemon { "compiling (kotlin-daemon)…" } else { "running gradle…" };
                 // Spinner for this compile (unique token per run); fall back to a log message.
                 let ongoing = if progress_supported {
                     let token = ProgressToken::String(format!("ktlsp/compile/{compile_seq}"));
                     let _ = client.create_work_done_progress(token.clone()).await;
-                    Some(client.progress(token, "ktlsp: compile").with_message("running gradle…").begin().await)
+                    Some(client.progress(token, "ktlsp: compile").with_message(backend_msg).begin().await)
                 } else {
-                    client.log_message(MessageType::INFO, "ktlsp: compiling…").await;
+                    client.log_message(MessageType::INFO, format!("ktlsp: {backend_msg}")).await;
                     None
                 };
-                let run_root = root.clone();
                 let started = std::time::Instant::now();
-                let outcome = tokio::task::spawn_blocking(move || {
-                    compile::run_gradle_compile(&run_root, compile::DEFAULT_COMPILE_TASK)
-                })
-                .await
-                .unwrap_or_default();
+                let outcome = if use_daemon {
+                    // Daemon path: compile the edited file's module incrementally (blocking IO to the
+                    // sidecar, off the async path). Fall back to gradle if the sidecar is unavailable.
+                    let changed = last_saved.lock().unwrap().clone().map(PathBuf::from);
+                    let compile_root = root.clone();
+                    match tokio::task::block_in_place(|| daemon.compile(&compile_root, changed.as_deref())) {
+                        Ok(o) => o,
+                        Err(e) => {
+                            tracing::warn!("daemon compile failed ({e:#}); falling back to gradle");
+                            let run_root = root.clone();
+                            tokio::task::spawn_blocking(move || {
+                                compile::run_gradle_compile(&run_root, compile::DEFAULT_COMPILE_TASK)
+                            })
+                            .await
+                            .unwrap_or_default()
+                        }
+                    }
+                } else {
+                    let run_root = root.clone();
+                    tokio::task::spawn_blocking(move || {
+                        compile::run_gradle_compile(&run_root, compile::DEFAULT_COMPILE_TASK)
+                    })
+                    .await
+                    .unwrap_or_default()
+                };
                 let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
 
                 // A newer save arrived while we were running: rerun for it, don't publish stale output.
@@ -385,6 +412,16 @@ fn compile_enabled_from(opts: &Option<serde_json::Value>) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether `initialization_options.compile_diagnostics.backend == "kotlin-daemon"`. Any other value
+/// (or absence) selects the default gradle backend.
+fn use_daemon_from(opts: &Option<serde_json::Value>) -> bool {
+    opts.as_ref()
+        .and_then(|v| v.get("compile_diagnostics"))
+        .and_then(|c| c.get("backend"))
+        .and_then(|b| b.as_str())
+        == Some("kotlin-daemon")
+}
+
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Remember the workspace root so `initialized` can index it off the request path.
@@ -430,6 +467,7 @@ impl LanguageServer for Backend {
         // can gate cheaply without re-parsing the options payload.
         *self.compile_enabled.lock().unwrap() =
             compile_enabled_from(&params.initialization_options);
+        *self.use_daemon.lock().unwrap() = use_daemon_from(&params.initialization_options);
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {

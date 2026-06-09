@@ -28,10 +28,9 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use ktlsp::classpath;
-use ktlsp::compile::{parse_output, run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFAULT_COMPILE_TASK};
+use ktlsp::compile::{run_gradle_compile, CompileDiagnostic, CompileOutcome, DEFAULT_COMPILE_TASK};
+use ktlsp::daemon::DaemonCompiler;
 use ktlsp::diagnostics::Severity;
-use ktlsp::sidecar::{self, CompileRequest, SidecarClient};
 use ktlsp::telemetry::{self, CompileTiming};
 use serde::Serialize;
 
@@ -73,95 +72,16 @@ impl CompileBackend for GradleCliBackend {
     }
 }
 
-/// Warm, incremental Kotlin compiler driven via the JVM sidecar. Resolves the project's classpath
-/// once, maps the edited file to its Gradle module, and compiles that module incrementally. The
-/// sidecar keeps the compiler warm across calls; diagnostics are parsed by the same `parse_output`
-/// the gradle backend uses, so the oracle compares like with like.
+/// Warm, incremental Kotlin compiler driven via the JVM sidecar — a thin harness wrapper over the
+/// shared `daemon::DaemonCompiler` (the same code the LSP uses).
 struct KotlinDaemonBackend {
-    client: Mutex<Option<SidecarClient>>,
-    last_module: Mutex<Option<String>>,
+    inner: Mutex<DaemonCompiler>,
 }
 
 impl KotlinDaemonBackend {
     fn new() -> Self {
-        KotlinDaemonBackend { client: Mutex::new(None), last_module: Mutex::new(None) }
+        KotlinDaemonBackend { inner: Mutex::new(DaemonCompiler::new()) }
     }
-
-    fn ensure_client(&self) -> anyhow::Result<()> {
-        let mut g = self.client.lock().unwrap();
-        if g.is_none() {
-            let bin = sidecar::default_bin().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "sidecar binary not found — build it (cd sidecar && ./gradlew installDist) or set KTLSP_SIDECAR_BIN"
-                )
-            })?;
-            *g = Some(SidecarClient::spawn(&bin)?);
-        }
-        Ok(())
-    }
-
-    fn do_compile(&self, root: &Path, changed: &[PathBuf]) -> anyhow::Result<CompileOutcome> {
-        let module = match changed.first() {
-            Some(c) => {
-                let m = module_path_for(root, c)
-                    .ok_or_else(|| anyhow::anyhow!("can't derive gradle module for {}", c.display()))?;
-                *self.last_module.lock().unwrap() = Some(m.clone());
-                m
-            }
-            None => self
-                .last_module
-                .lock()
-                .unwrap()
-                .clone()
-                .ok_or_else(|| anyhow::anyhow!("no module determined yet (edit a file first)"))?,
-        };
-        let mc = classpath::resolve_module(root, &module)?;
-        let req = CompileRequest::new(
-            mc.module.clone(),
-            vec![mc.project_dir.join("src/main/kotlin").to_string_lossy().into_owned()],
-            mc.entries.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
-            daemon_cache_dir(&mc.module).to_string_lossy().into_owned(),
-        );
-
-        self.ensure_client()?;
-        let mut cg = self.client.lock().unwrap();
-        let result = cg.as_mut().unwrap().compile(&req)?;
-        // Diagnostics arrive as GRADLE_STYLE strings; reuse the gradle parser, but trust the
-        // sidecar's executed signal (the daemon always runs the compiler).
-        let parsed = parse_output(&result.diagnostics.join("\n"), DEFAULT_COMPILE_TASK);
-        Ok(CompileOutcome { diagnostics: parsed.diagnostics, executed: result.executed })
-    }
-}
-
-/// Derive a Gradle project path from a source file path, by Gradle's default dir convention: the
-/// directory segments between `root` and the `src/` source-set marker, joined with `:`. e.g.
-/// `<root>/Web/api/src/main/kotlin/X.kt` -> `:Web:api`. (Assumes the default projectDir convention;
-/// modules with a remapped projectDir would need the settings graph.)
-fn module_path_for(root: &Path, file: &Path) -> Option<String> {
-    let rel = file.strip_prefix(root).ok()?;
-    let mut segs = Vec::new();
-    for comp in rel.components() {
-        let s = comp.as_os_str().to_str()?;
-        if s == "src" {
-            break;
-        }
-        segs.push(s);
-    }
-    if segs.is_empty() {
-        Some(":".to_string())
-    } else {
-        Some(format!(":{}", segs.join(":")))
-    }
-}
-
-/// Per-module IC state dir for the daemon, under the ktlsp cache home.
-fn daemon_cache_dir(module: &str) -> PathBuf {
-    let mut h: u64 = 1469598103934665603;
-    for b in module.bytes() {
-        h ^= b as u64;
-        h = h.wrapping_mul(1099511628211);
-    }
-    ktlsp::deps::cache_home().join("daemon").join(format!("{h:016x}"))
 }
 
 impl CompileBackend for KotlinDaemonBackend {
@@ -169,14 +89,9 @@ impl CompileBackend for KotlinDaemonBackend {
         "kotlin-daemon"
     }
 
-    // Warm the JVM (spawn + ready handshake) so its startup isn't in the timed samples. The first
-    // real compile still pays the module's cold incremental-cache build.
-    fn warm_up(&self, _root: &Path) {
-        let _ = self.ensure_client();
-    }
-
     fn compile(&self, root: &Path, changed: &[PathBuf]) -> CompileOutcome {
-        match self.do_compile(root, changed) {
+        let changed_file = changed.first().map(|p| p.as_path());
+        match self.inner.lock().unwrap().compile(root, changed_file) {
             Ok(o) => o,
             Err(e) => {
                 eprintln!("kotlin-daemon backend: {e:#}");

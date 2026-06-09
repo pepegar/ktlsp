@@ -9,6 +9,7 @@ pub mod catalog;
 pub mod classpath;
 pub mod compile;
 pub mod complete;
+pub mod daemon;
 pub mod coords;
 pub mod deps;
 pub mod diagnostics;
