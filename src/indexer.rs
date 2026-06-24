@@ -9,14 +9,83 @@
 use tree_sitter::Node;
 
 use crate::index::Usage;
-use crate::parser::{child_of_kind, class_kind, first_ident, name_field, node_text};
+use crate::parser::{
+    child_of_kind, class_kind, first_ident, imports_of, name_field, node_text, Import,
+};
+use crate::resolve::DEFAULT_IMPORT_PACKAGES;
 use crate::symbol::{IndexedSymbol, SymbolKind};
 use crate::types::TypeRef;
 
 pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Vec<IndexedSymbol> {
     let mut out = Vec::new();
-    walk(tree.root_node(), src, package, None, &mut out);
+    let scope = TypeScope::new(package, imports_of(tree, src));
+    walk(tree.root_node(), src, package, None, &scope, &mut out);
     out
+}
+
+/// Declaration-file visibility facts used to stamp indexed `TypeRef`s. This keeps `fun f(): Bar`
+/// bound to the imports/package of the file declaring `f`, instead of incorrectly resolving `Bar`
+/// in whichever file later calls `f`.
+struct TypeScope {
+    package: String,
+    imports: Vec<Import>,
+}
+
+impl TypeScope {
+    fn new(package: &str, imports: Vec<Import>) -> Self {
+        TypeScope {
+            package: package.to_string(),
+            imports,
+        }
+    }
+
+    fn type_ref(&self, local_name: &str, nullable: bool, args: Vec<TypeRef>) -> TypeRef {
+        // Alias imports rewrite the local name to the imported symbol's real simple name.
+        for imp in &self.imports {
+            if !imp.wildcard && imp.alias.as_deref() == Some(local_name) {
+                return TypeRef {
+                    name: imp.simple_name().to_string(),
+                    nullable,
+                    args,
+                    package_candidates: vec![imp.package()],
+                };
+            }
+        }
+        // Explicit non-aliased imports are exact.
+        for imp in &self.imports {
+            if !imp.wildcard && imp.alias.is_none() && imp.simple_name() == local_name {
+                return TypeRef {
+                    name: local_name.to_string(),
+                    nullable,
+                    args,
+                    package_candidates: vec![imp.package()],
+                };
+            }
+        }
+
+        let mut package_candidates = Vec::new();
+        push_candidate(&mut package_candidates, self.package.clone());
+        for imp in &self.imports {
+            if imp.wildcard {
+                push_candidate(&mut package_candidates, imp.package());
+            }
+        }
+        for pkg in DEFAULT_IMPORT_PACKAGES {
+            push_candidate(&mut package_candidates, (*pkg).to_string());
+        }
+        TypeRef {
+            name: local_name.to_string(),
+            nullable,
+            args,
+            package_candidates,
+        }
+    }
+}
+
+fn push_candidate(out: &mut Vec<String>, package: String) {
+    if !out.iter().any(|p| p == &package) {
+        out.push(package);
+    }
 }
 
 /// Collect every `identifier` occurrence (declarations and usages alike) as a usage site, for the
@@ -75,6 +144,7 @@ fn push_property_names(
     package: &str,
     container: Option<&str>,
     ext_receiver: Option<&str>,
+    scope: &TypeScope,
     out: &mut Vec<IndexedSymbol>,
 ) {
     let mut cursor = decl.walk();
@@ -82,8 +152,17 @@ fn push_property_names(
         match child.kind() {
             "variable_declaration" => {
                 if let Some(id) = first_ident(child) {
-                    let vt = value_type_of(child, src);
-                    push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver, vt);
+                    let vt = value_type_of_scoped(child, src, Some(scope));
+                    push_ext(
+                        out,
+                        id,
+                        src,
+                        SymbolKind::Property,
+                        package,
+                        container,
+                        ext_receiver,
+                        vt,
+                    );
                 }
             }
             "multi_variable_declaration" => {
@@ -91,8 +170,17 @@ fn push_property_names(
                 for vd in child.named_children(&mut c2) {
                     if vd.kind() == "variable_declaration" {
                         if let Some(id) = first_ident(vd) {
-                            let vt = value_type_of(vd, src);
-                            push_ext(out, id, src, SymbolKind::Property, package, container, ext_receiver, vt);
+                            let vt = value_type_of_scoped(vd, src, Some(scope));
+                            push_ext(
+                                out,
+                                id,
+                                src,
+                                SymbolKind::Property,
+                                package,
+                                container,
+                                ext_receiver,
+                                vt,
+                            );
                         }
                     }
                 }
@@ -139,12 +227,13 @@ fn push_function(
     package: &str,
     container: Option<&str>,
     ext_receiver: Option<&str>,
+    scope: &TypeScope,
 ) {
     out.push(IndexedSymbol {
         ext_receiver: ext_receiver.map(str::to_string),
         arity: Some(value_param_count(decl)),
-        return_type: return_type_of(decl, src),
-        params: param_types_of(decl, src),
+        return_type: return_type_of(decl, src, scope),
+        params: param_types_of(decl, src, scope),
         type_params: type_params_of(decl, src),
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -221,7 +310,7 @@ fn type_params_of(decl: Node, src: &str) -> Vec<String> {
 /// The declared types of a `function_declaration`'s value parameters, in order (one [`TypeRef`] per
 /// `parameter`; an unannotated parameter — rare for named functions — gets `TypeRef::default()` to
 /// preserve positional alignment). Empty when there is no `function_value_parameters` child.
-fn param_types_of(decl: Node, src: &str) -> Vec<TypeRef> {
+fn param_types_of(decl: Node, src: &str, scope: &TypeScope) -> Vec<TypeRef> {
     let Some(params) = child_of_kind(decl, "function_value_parameters") else {
         return Vec::new();
     };
@@ -229,7 +318,7 @@ fn param_types_of(decl: Node, src: &str) -> Vec<TypeRef> {
     let mut cursor = params.walk();
     for p in params.named_children(&mut cursor) {
         if p.kind() == "parameter" {
-            out.push(value_type_of(p, src).unwrap_or_default());
+            out.push(value_type_of_scoped(p, src, Some(scope)).unwrap_or_default());
         }
     }
     out
@@ -292,49 +381,62 @@ fn extension_receiver(decl: Node, src: &str) -> Option<String> {
 // Type extraction (return types / property types -> TypeRef for inference).
 // ---------------------------------------------------------------------------------------------
 
-/// The simple-name `identifier` of a `user_type`: its LAST direct `identifier` child. A qualified
-/// `a.b.C` lists its path as successive `identifier` children (`a`, `b`, `C`) — the simple name is
-/// the last; for `List<String>` the only direct identifier is `List` (the arg nests under
-/// `type_arguments`). Verified via `examples/dump`.
-fn user_type_name<'t>(ut: Node<'t>) -> Option<Node<'t>> {
+/// The direct identifier texts of a `user_type`. A qualified `a.b.C` lists its path as successive
+/// `identifier` children (`a`, `b`, `C`); for `List<String>` the only direct identifier is `List`
+/// (the arg nests under `type_arguments`). Verified via `examples/dump`.
+fn user_type_identifiers<'a>(ut: Node, src: &'a str) -> Vec<&'a str> {
     let mut cursor = ut.walk();
-    let mut last = None;
+    let mut out = Vec::new();
     for c in ut.named_children(&mut cursor) {
         if c.kind() == "identifier" {
-            last = Some(c);
+            out.push(node_text(c, src));
         }
     }
-    last
+    out
 }
 
 /// Build a [`TypeRef`] from a `user_type` / `nullable_type` node: simple name + nullability + raw
 /// type-arguments. `None` if no name identifier is present.
-fn type_ref_from(node: Node, src: &str) -> Option<TypeRef> {
+fn type_ref_from(node: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
     match node.kind() {
         "nullable_type" => {
             let ut = find_descendant(node, "user_type")?;
-            let mut tr = type_ref_from_user_type(ut, src)?;
+            let mut tr = type_ref_from_user_type(ut, src, scope)?;
             tr.nullable = true;
             Some(tr)
         }
-        "user_type" => type_ref_from_user_type(node, src),
+        "user_type" => type_ref_from_user_type(node, src, scope),
         _ => None,
     }
 }
 
-fn type_ref_from_user_type(ut: Node, src: &str) -> Option<TypeRef> {
-    let name = user_type_name(ut)?;
-    Some(TypeRef {
-        name: node_text(name, src).to_string(),
-        nullable: false,
-        args: type_args_of(ut, src),
+fn type_ref_from_user_type(ut: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
+    let names = user_type_identifiers(ut, src);
+    let name = names.last()?;
+    let args = type_args_of(ut, src, scope);
+    if names.len() > 1 {
+        return Some(TypeRef {
+            name: (*name).to_string(),
+            nullable: false,
+            args,
+            package_candidates: vec![names[..names.len() - 1].join(".")],
+        });
+    }
+    Some(match scope {
+        Some(scope) => scope.type_ref(name, false, args),
+        None => TypeRef {
+            name: (*name).to_string(),
+            nullable: false,
+            args,
+            package_candidates: Vec::new(),
+        },
     })
 }
 
 /// The type arguments of a `user_type` (`List<Foo>` -> `[Foo]`). Each `type_projection` wraps a
 /// `user_type`/`nullable_type`; star projections / unparsable args are skipped. Captured at index
 /// time for one-level generic inference (Stage 5).
-fn type_args_of(ut: Node, src: &str) -> Vec<TypeRef> {
+fn type_args_of(ut: Node, src: &str, scope: Option<&TypeScope>) -> Vec<TypeRef> {
     let mut out = Vec::new();
     let Some(ta) = child_of_kind(ut, "type_arguments") else {
         return out;
@@ -347,7 +449,7 @@ fn type_args_of(ut: Node, src: &str) -> Vec<TypeRef> {
         let mut c2 = proj.walk();
         for child in proj.named_children(&mut c2) {
             if matches!(child.kind(), "user_type" | "nullable_type") {
-                if let Some(tr) = type_ref_from(child, src) {
+                if let Some(tr) = type_ref_from(child, src, scope) {
                     out.push(tr);
                 }
                 break;
@@ -362,7 +464,7 @@ fn type_args_of(ut: Node, src: &str) -> Vec<TypeRef> {
 /// `name:`; a parameter's own type lives inside `function_value_parameters`). `None` when there is
 /// no explicit return annotation. Verified via `examples/dump`:
 /// `fun method(a: Int): Widget` -> `... function_value_parameters, user_type «Widget», function_body`.
-fn return_type_of(decl: Node, src: &str) -> Option<TypeRef> {
+fn return_type_of(decl: Node, src: &str, scope: &TypeScope) -> Option<TypeRef> {
     let mut cursor = decl.walk();
     let mut after_params = false;
     for child in decl.named_children(&mut cursor) {
@@ -372,9 +474,9 @@ fn return_type_of(decl: Node, src: &str) -> Option<TypeRef> {
         }
         if after_params {
             match child.kind() {
-                "user_type" | "nullable_type" => return type_ref_from(child, src),
+                "user_type" | "nullable_type" => return type_ref_from(child, src, Some(scope)),
                 // No explicit annotation: best-effort single-expression-body inference (Stage 6).
-                "function_body" => return expr_body_type(child, src),
+                "function_body" => return expr_body_type(child, src, scope),
                 _ => {}
             }
         }
@@ -386,7 +488,7 @@ fn return_type_of(decl: Node, src: &str) -> Option<TypeRef> {
 /// constructor's simple name. Gated on an UPPERCASE-led callee (Kotlin's type-naming convention) so
 /// a lowercase function call (`= helper()`, whose return type we can't know here) is NOT mistaken
 /// for a type — keeping the no-wrong-completion contract. Block bodies `{ ... }` are not inferred.
-fn expr_body_type(body: Node, src: &str) -> Option<TypeRef> {
+fn expr_body_type(body: Node, src: &str, scope: &TypeScope) -> Option<TypeRef> {
     let expr = body.named_child(0)?;
     if expr.kind() != "call_expression" {
         return None;
@@ -399,7 +501,7 @@ fn expr_body_type(body: Node, src: &str) -> Option<TypeRef> {
     name.chars()
         .next()
         .map_or(false, |c| c.is_uppercase())
-        .then(|| TypeRef::simple(name))
+        .then(|| scope.type_ref(name, false, Vec::new()))
 }
 
 /// A `variable_declaration`'s (or `parameter`'s) declared type (`val x: T` / `x: T` -> `T`): the
@@ -407,10 +509,14 @@ fn expr_body_type(body: Node, src: &str) -> Option<TypeRef> {
 /// inference can read a local/param annotation from the live AST with the same rules used at index
 /// time.
 pub(crate) fn value_type_of(var_decl: Node, src: &str) -> Option<TypeRef> {
+    value_type_of_scoped(var_decl, src, None)
+}
+
+fn value_type_of_scoped(var_decl: Node, src: &str, scope: Option<&TypeScope>) -> Option<TypeRef> {
     let mut cursor = var_decl.walk();
     for child in var_decl.named_children(&mut cursor) {
         if matches!(child.kind(), "user_type" | "nullable_type") {
-            return type_ref_from(child, src);
+            return type_ref_from(child, src, scope);
         }
     }
     None
@@ -439,6 +545,7 @@ fn push_ctor_properties(
     src: &str,
     package: &str,
     container: &str,
+    scope: &TypeScope,
 ) {
     let Some(pc) = child_of_kind(class_decl, "primary_constructor") else {
         return;
@@ -455,7 +562,7 @@ fn push_ctor_properties(
             continue; // a plain parameter, not a property
         }
         if let Some(id) = first_ident(cp) {
-            let vt = value_type_of(cp, src);
+            let vt = value_type_of_scoped(cp, src, Some(scope));
             push_ext(out, id, src, SymbolKind::Property, package, Some(container), None, vt);
         }
     }
@@ -475,7 +582,14 @@ fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     None
 }
 
-fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut Vec<IndexedSymbol>) {
+fn walk(
+    node: Node,
+    src: &str,
+    package: &str,
+    container: Option<&str>,
+    scope: &TypeScope,
+    out: &mut Vec<IndexedSymbol>,
+) {
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         match child.kind() {
@@ -489,11 +603,11 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
                     // Primary-constructor `val`/`var` parameters ARE properties of the class (this is
                     // every data-class property). Index them as members; plain params (no val/var) are
                     // not members and stay unindexed.
-                    push_ctor_properties(out, child, src, package, &cname);
+                    push_ctor_properties(out, child, src, package, &cname, scope);
                     let mut c2 = child.walk();
                     for body in child.named_children(&mut c2) {
                         if matches!(body.kind(), "class_body" | "enum_class_body") {
-                            walk(body, src, package, Some(&cname), out);
+                            walk(body, src, package, Some(&cname), scope, out);
                         }
                     }
                 }
@@ -505,14 +619,14 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
                     push_type(out, name, src, SymbolKind::Object, package, container, sts, Vec::new());
                     let cname = node_text(name, src).to_string();
                     if let Some(body) = child_of_kind(child, "class_body") {
-                        walk(body, src, package, Some(&cname), out);
+                        walk(body, src, package, Some(&cname), scope, out);
                     }
                 }
             }
             // Companion members belong to the enclosing class (keep `container`).
             "companion_object" => {
                 if let Some(body) = child_of_kind(child, "class_body") {
-                    walk(body, src, package, container, out);
+                    walk(body, src, package, container, scope, out);
                 }
             }
             "function_declaration" => {
@@ -522,13 +636,13 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
                     // different shape, but `extension_receiver` keys off the `name:` boundary so it
                     // is correct either way. We record it unconditionally.
                     let recv = extension_receiver(child, src);
-                    push_function(out, child, name, src, package, container, recv.as_deref());
+                    push_function(out, child, name, src, package, container, recv.as_deref(), scope);
                 }
                 // Do NOT recurse into the body: it only contains locals.
             }
             "property_declaration" => {
                 let recv = extension_receiver(child, src);
-                push_property_names(child, src, package, container, recv.as_deref(), out);
+                push_property_names(child, src, package, container, recv.as_deref(), scope, out);
             }
             "enum_entry" => {
                 if let Some(id) = first_ident(child) {
@@ -538,7 +652,7 @@ fn walk(node: Node, src: &str, package: &str, container: Option<&str>, out: &mut
             // Structural wrappers, `package_header`, `import`, and crucially `ERROR` nodes:
             // recurse to recover declarations nested inside. We never reach function bodies this
             // way (function_declaration is handled above without recursion), so locals stay out.
-            _ => walk(child, src, package, container, out),
+            _ => walk(child, src, package, container, scope, out),
         }
     }
 }

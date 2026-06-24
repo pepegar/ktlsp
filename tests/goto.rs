@@ -260,6 +260,30 @@ fn import_alias_call() {
 }
 
 #[test]
+fn fully_qualified_type_position() {
+    check(
+        "//- Target.kt\npackage p1\nclass /*def*/Target\n\
+         //- Main.kt\npackage app\nfun use(x: p1./*^*/Target) {}\n",
+    );
+}
+
+#[test]
+fn fully_qualified_constructor_call() {
+    check(
+        "//- Target.kt\npackage p1\nclass /*def*/Target\n\
+         //- Main.kt\npackage app\nfun main() { val x = p1./*^*/Target() }\n",
+    );
+}
+
+#[test]
+fn fully_qualified_top_level_function_call() {
+    check(
+        "//- Util.kt\npackage p1.tools\nfun /*def*/make(): Int = 1\n\
+         //- Main.kt\npackage app\nfun main() { val x = p1.tools./*^*/make() }\n",
+    );
+}
+
+#[test]
 fn ambiguous_same_package_returns_all() {
     check(
         "//- A.kt\npackage app\nfun /*def*/foo() {}\n//- B.kt\npackage app\nfun /*def*/foo() {}\n//- Main.kt\npackage app\nfun main() { /*^*/foo() }\n",
@@ -273,6 +297,14 @@ fn ambiguous_same_package_returns_all() {
 #[test]
 fn member_selector_unique_resolves() {
     check("class Box { fun /*def*/open() {} }\nfun main() { val b = Box(); b./*^*/open() }\n");
+}
+
+#[test]
+fn local_receiver_wins_over_same_named_package() {
+    check(
+        "//- Lib.kt\npackage b\nfun open() {}\n\
+         //- Main.kt\nclass Box {\n    fun /*def*/open() {}\n}\nfun main() { val b = Box(); b./*^*/open() }\n",
+    );
 }
 
 // (Classes are multi-line; the terse `class A { … }\nclass B { … }` one-liner form collapses to
@@ -370,6 +402,79 @@ fn member_goto_via_function_return_type() {
     check(
         "//- lib.kt\npackage app\nclass Bar {\n    fun /*def*/describe(): String = \"\"\n}\nfun makeBar(): Bar = Bar()\n\
          //- Main.kt\npackage app\nfun main() {\n    val b = makeBar()\n    b./*^*/describe()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_uses_return_type_declaration_imports_not_caller_imports() {
+    // `factory.make()` returns p1.Target because factory.kt imports p1.Target. Main.kt imports a
+    // different p2.Target; that caller import must not retarget the inferred receiver type.
+    check(
+        "//- p1/Target.kt\npackage p1\nclass Target {\n    fun /*def*/hit() {}\n}\n\
+         //- p2/Target.kt\npackage p2\nclass Target {\n    fun hit() {}\n}\n\
+         //- factory.kt\npackage factory\nimport p1.Target\nfun make(): Target = Target()\n\
+         //- Main.kt\npackage app\nimport factory.make\nimport p2.Target\nfun main() {\n    val x = make()\n    x./*^*/hit()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_uses_property_type_declaration_imports_not_caller_imports() {
+    check(
+        "//- p1/Target.kt\npackage p1\nclass Target {\n    fun /*def*/hit() {}\n}\n\
+         //- p2/Target.kt\npackage p2\nclass Target {\n    fun hit() {}\n}\n\
+         //- factory.kt\npackage factory\nimport p1.Target\nclass Holder {\n    val target: Target = Target()\n}\nfun holder(): Holder = Holder()\n\
+         //- Main.kt\npackage app\nimport factory.holder\nimport p2.Target\nfun main() {\n    val h = holder()\n    h.target./*^*/hit()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_resolves_aliased_return_type_imports() {
+    check(
+        "//- p1/Target.kt\npackage p1\nclass Target {\n    fun /*def*/hit() {}\n}\n\
+         //- factory.kt\npackage factory\nimport p1.Target as RealTarget\nfun make(): RealTarget = RealTarget()\n\
+         //- Main.kt\npackage app\nimport factory.make\nfun main() {\n    val x = make()\n    x./*^*/hit()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_uses_visible_free_function_not_first_same_named_function() {
+    check(
+        "//- wrong/Wrong.kt\npackage wrong\nclass Target {\n    fun hit() {}\n}\nfun make(): Target = Target()\n\
+         //- p1/Target.kt\npackage p1\nclass Target {\n    fun /*def*/hit() {}\n}\n\
+         //- factory.kt\npackage factory\nimport p1.Target\nfun make(): Target = Target()\n\
+         //- Main.kt\npackage app\nimport factory.make\nfun main() {\n    val x = make()\n    x./*^*/hit()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_infers_alias_imported_free_function() {
+    check(
+        "//- p1/Target.kt\npackage p1\nclass Target {\n    fun /*def*/hit() {}\n}\n\
+         //- factory.kt\npackage factory\nimport p1.Target\nfun make(): Target = Target()\n\
+         //- Main.kt\npackage app\nimport factory.make as build\nfun main() {\n    val x = build()\n    x./*^*/hit()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_uses_visible_top_level_property_not_first_same_named_property() {
+    check(
+        "//- wrong/Wrong.kt\npackage wrong\nclass Target {\n    fun hit() {}\n}\nval shared: Target = Target()\n\
+         //- p1/Target.kt\npackage p1\nclass Target {\n    fun /*def*/hit() {}\n}\n\
+         //- factory.kt\npackage factory\nimport p1.Target\nval shared: Target = Target()\n\
+         //- Main.kt\npackage app\nimport factory.shared\nfun main() {\n    val x = shared\n    x./*^*/hit()\n}\n",
+    );
+}
+
+#[test]
+fn member_goto_preserves_default_import_type_arguments_from_declaration() {
+    // Main.kt has its own app.String, but lib.names(): List<String> means kotlin.String in lib.kt.
+    // The generic `first(): T` substitution must therefore land on kotlin.String.trim.
+    check(
+        "//- kotlin/String.kt\npackage kotlin\nclass String {\n    fun /*def*/trim(): String = this\n}\n\
+         //- kotlin/collections/List.kt\npackage kotlin.collections\nclass List<T> {\n    fun first(): T = TODO()\n}\n\
+         //- app/String.kt\npackage app\nclass String {\n    fun trim() {}\n}\n\
+         //- lib.kt\npackage lib\nfun names(): List<String> = TODO()\n\
+         //- Main.kt\npackage app\nimport lib.names\nfun main() {\n    val s = names().first()\n    s./*^*/trim()\n}\n",
     );
 }
 

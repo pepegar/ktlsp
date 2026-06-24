@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use walkdir::{DirEntry, WalkDir};
 
 use crate::artifacts::{self, Repos};
 use crate::catalog;
@@ -32,29 +33,75 @@ pub struct FileSymbols {
     pub symbols: Vec<IndexedSymbol>,
 }
 
-/// Read the project's coordinates from `gradle/libs.versions.toml` (or a top-level
-/// `libs.versions.toml`), then ensure kotlin-stdlib is among them (the Kotlin Gradle plugin adds it
-/// implicitly, so most projects never list it). Returns empty if no catalog is present, it can't be
-/// parsed, AND the root doesn't look like a Gradle project.
+/// Read coordinates from every version catalog under `root` (`gradle/libs.versions.toml`, a
+/// top-level `libs.versions.toml`, and nested Gradle builds' catalogs), then ensure kotlin-stdlib is
+/// among them (the Kotlin Gradle plugin adds it implicitly, so most projects never list it).
+/// Returns empty if no catalog is present, it can't be parsed, AND the root doesn't look like a
+/// Gradle project.
 pub fn coordinates_for_root(root: &Path) -> Vec<Coordinate> {
-    let candidates = [
-        root.join("gradle/libs.versions.toml"),
-        root.join("libs.versions.toml"),
-    ];
     let mut coords = Vec::new();
-    for path in candidates {
+    for path in catalog_paths(root) {
         if let Ok(src) = fs::read_to_string(&path) {
             match catalog::parse_catalog(&src) {
                 Ok(c) => {
-                    coords = c;
-                    break;
+                    coords.extend(c);
                 }
                 Err(e) => tracing::warn!("failed to parse {}: {e}", path.display()),
             }
         }
     }
+    coords.sort();
+    coords.dedup();
     inject_stdlib(&mut coords, is_gradle_project(root));
     coords
+}
+
+fn catalog_paths(root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let root_catalog = root.join("gradle/libs.versions.toml");
+    if root_catalog.is_file() {
+        out.push(root_catalog);
+    }
+    let top_level_catalog = root.join("libs.versions.toml");
+    if top_level_catalog.is_file() {
+        out.push(top_level_catalog);
+    }
+    let walker = WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_catalog_excluded(e));
+    for entry in walker.filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if path.file_name().and_then(|n| n.to_str()) != Some("libs.versions.toml") {
+            continue;
+        }
+        let Some(parent) = path.parent() else {
+            continue;
+        };
+        if parent.file_name().and_then(|n| n.to_str()) != Some("gradle") {
+            continue;
+        }
+        let p = path.to_path_buf();
+        if !out.iter().any(|existing| existing == &p) {
+            out.push(p);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn is_catalog_excluded(entry: &DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy();
+    if entry.file_type().is_dir() {
+        return name.starts_with('.')
+            || matches!(
+                name.as_ref(),
+                "build" | "out" | "target" | "node_modules" | ".gradle"
+            );
+    }
+    false
 }
 
 /// Pinned fallback when a project's Kotlin version can't be derived from its catalog.
@@ -117,7 +164,7 @@ fn symcache_dir() -> PathBuf {
 /// non-self-describing, so a layout shift (e.g. adding `supertypes`/`ext_receiver`) makes old
 /// `.bin` caches deserialize wrong; folding this tag into the fingerprint forces a one-time
 /// re-parse instead of relying on the corrupt-cache fallback (which only logs a warning).
-const SYMCACHE_VERSION: &[u8] = b"v6";
+const SYMCACHE_VERSION: &[u8] = b"v7";
 
 /// A cheap, stat-only fingerprint of a resolved jar (path + mtime + size). Published jars are
 /// immutable, so this is a stable cache key without reading the jar's contents; any content change
@@ -290,5 +337,63 @@ mod tests {
         let mut coords = Vec::new();
         inject_stdlib(&mut coords, false);
         assert!(coords.is_empty(), "loose-file dirs must not auto-index stdlib");
+    }
+
+    #[test]
+    fn coordinates_include_nested_gradle_catalogs() {
+        let root = std::env::temp_dir().join(format!("ktlsp_catalogs_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("gradle")).unwrap();
+        fs::create_dir_all(root.join("Android/gradle")).unwrap();
+        fs::create_dir_all(root.join("build/gradle")).unwrap();
+        fs::create_dir_all(root.join(".worktrees/feature/gradle")).unwrap();
+        fs::write(root.join("settings.gradle.kts"), "").unwrap();
+        fs::write(
+            root.join("gradle/libs.versions.toml"),
+            r#"
+[versions]
+root = "1.0"
+[libraries]
+root-lib = { module = "com.example:root-lib", version.ref = "root" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("Android/gradle/libs.versions.toml"),
+            r#"
+[versions]
+android = "2.0"
+[libraries]
+android-lib = { module = "com.example:android-lib", version.ref = "android" }
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("build/gradle/libs.versions.toml"),
+            r#"
+[libraries]
+generated = "com.example:generated:9.9"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join(".worktrees/feature/gradle/libs.versions.toml"),
+            r#"
+[libraries]
+worktree = "com.example:worktree:9.9"
+"#,
+        )
+        .unwrap();
+
+        let labels: Vec<String> = coordinates_for_root(&root)
+            .into_iter()
+            .map(|c| c.label())
+            .collect();
+        assert!(labels.contains(&"com.example:root-lib:1.0".to_string()));
+        assert!(labels.contains(&"com.example:android-lib:2.0".to_string()));
+        assert!(!labels.iter().any(|l| l.contains("generated")));
+        assert!(!labels.iter().any(|l| l.contains("worktree")));
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

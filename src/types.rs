@@ -1,10 +1,11 @@
 //! Lightweight type values for compiler-free (no-kotlinc) inference.
 //!
 //! Two representations, on purpose:
-//! - [`TypeRef`] is what the *index* stores for a declaration's return/property type: a bare simple
-//!   name (plus nullability and raw type-args). It deliberately carries **no package**, because
-//!   which `Bar` a `fun f(): Bar` means depends on the *use site's* imports, not the declaration —
-//!   so resolution is deferred to inference time. `TypeRef` is serialized into the symcache.
+//! - [`TypeRef`] is what the *index* stores for a declaration's return/property/parameter type: a
+//!   simple name, nullability, raw type-args, plus declaration-context package candidates. The
+//!   candidates keep `fun f(): Bar` tied to the imports/package of the file that declared `f`;
+//!   inference only falls back to the call site's context when the declaration context cannot be
+//!   resolved from the current index. `TypeRef` is serialized into the symcache.
 //! - [`Type`] is a type *resolved at a use site*: a simple name plus the package we resolved it to.
 //!   [`Type::Unknown`] is a first-class, non-failing outcome that drives the silent-omission
 //!   contract (no members → show nothing). `Type` is runtime-only (never serialized).
@@ -25,6 +26,12 @@ pub struct TypeRef {
     /// inference (Stage 5). Empty for non-generic types.
     #[serde(default)]
     pub args: Vec<TypeRef>,
+    /// Ordered package candidates from the declaration file's visibility context. The first entry is
+    /// the same-package or exact-import candidate; remaining entries are wildcard/default-import
+    /// fallbacks. Empty for live local AST annotations and synthetic refs, which resolve in the
+    /// current file context.
+    #[serde(default)]
+    pub package_candidates: Vec<String>,
 }
 
 impl TypeRef {
@@ -34,6 +41,7 @@ impl TypeRef {
             name: name.into(),
             nullable: false,
             args: Vec::new(),
+            package_candidates: Vec::new(),
         }
     }
 }

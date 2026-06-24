@@ -74,13 +74,14 @@ pub struct IndexedSymbol {
     /// lack the field) still deserialize.
     #[serde(default)]
     pub arity: Option<u8>,
-    /// For a `Function` (or property getter): its declared return type, as an unresolved [`TypeRef`]
-    /// (simple name + nullability + raw type-args; package resolved at the use site). `None` when
-    /// there is no explicit return annotation. Drives `val x = foo()` / chained-call inference.
+    /// For a `Function` (or property getter): its declared return type, as a [`TypeRef`] carrying
+    /// the declaration file's package/import candidates. `None` when there is no explicit return
+    /// annotation. Drives `val x = foo()` / chained-call inference.
     #[serde(default)]
     pub return_type: Option<TypeRef>,
-    /// For a `Property`: its declared type (`val x: T`), as an unresolved [`TypeRef`]. `None` when
-    /// the property has no explicit type annotation. Drives member-of-a-property inference.
+    /// For a `Property`: its declared type (`val x: T`), as a [`TypeRef`] carrying the declaration
+    /// file's package/import candidates. `None` when the property has no explicit type annotation.
+    /// Drives member-of-a-property inference.
     #[serde(default)]
     pub value_type: Option<TypeRef>,
     /// For a `Function`: the declared types of its value parameters, in declaration order (one entry

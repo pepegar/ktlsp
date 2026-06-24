@@ -82,6 +82,14 @@ pub fn goto(index: &Index, file: &str, src: &str, tree: &Tree, offset: usize) ->
     }
     let uk = use_kind(ident);
 
+    // Fully-qualified top-level names (`pkg.Type`, `pkg.func()`) bypass imports. Handle them before
+    // the member path so a package-qualified selector is not mistaken for `receiver.member`.
+    if let Some(defs) = resolve_qualified(index, ident, name, uk, src) {
+        if !defs.is_empty() {
+            return defs;
+        }
+    }
+
     // Member access: infer the receiver's type and filter members by it (S6), else best-effort.
     if uk == UseKind::MemberSelector {
         return resolve_member(index, ident, name, src, tree);
@@ -445,6 +453,90 @@ fn to_def(e: &Entry) -> Def {
     }
 }
 
+fn resolve_qualified(
+    index: &Index,
+    usage: Node,
+    name: &str,
+    uk: UseKind,
+    src: &str,
+) -> Option<Vec<Def>> {
+    let (package, qkind) = qualified_package_and_kind(usage, uk, src)?;
+    Some(
+        index
+            .lookup_by_name(name)
+            .iter()
+            .filter(|e| e.sym.package == package && kind_ok(qkind, e.sym.kind))
+            .map(to_def)
+            .collect(),
+    )
+}
+
+fn qualified_package_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(String, UseKind)> {
+    let parent = usage.parent()?;
+    if parent.kind() == "user_type" {
+        let parts = direct_identifier_parts(parent, src);
+        if parts.len() > 1 && parts.last().is_some_and(|(_, n)| n == node_text(usage, src)) {
+            return Some((join_part_names(&parts[..parts.len() - 1]), UseKind::Type));
+        }
+    }
+    if parent.kind() == "navigation_expression" {
+        let parts = navigation_parts(parent, src)?;
+        if parts.len() > 1 && parts.last().is_some_and(|(n, _)| *n == usage) {
+            let (first_node, first_name) = &parts[0];
+            if local_decl(*first_node, first_name, UseKind::Value, src).is_some() {
+                return None;
+            }
+            let qkind = match parent.parent().map(|p| p.kind()) {
+                Some("call_expression") => UseKind::Call,
+                _ => {
+                    if uk == UseKind::MemberSelector {
+                        UseKind::Value
+                    } else {
+                        uk
+                    }
+                }
+            };
+            return Some((join_part_names(&parts[..parts.len() - 1]), qkind));
+        }
+    }
+    None
+}
+
+fn direct_identifier_parts<'t>(node: Node<'t>, src: &str) -> Vec<(Node<'t>, String)> {
+    let mut out = Vec::new();
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier" {
+            out.push((child, node_text(child, src).to_string()));
+        }
+    }
+    out
+}
+
+fn navigation_parts<'t>(node: Node<'t>, src: &str) -> Option<Vec<(Node<'t>, String)>> {
+    match node.kind() {
+        "identifier" => Some(vec![(node, node_text(node, src).to_string())]),
+        "navigation_expression" => {
+            let mut out = navigation_parts(node.named_child(0)?, src)?;
+            let selector = node.named_child(1)?;
+            if selector.kind() != "identifier" {
+                return None;
+            }
+            out.push((selector, node_text(selector, src).to_string()));
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn join_part_names(parts: &[(Node, String)]) -> String {
+    parts
+        .iter()
+        .map(|(_, name)| name.as_str())
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: UseKind) -> Vec<Def> {
     let imports = imports_of(tree, src);
     let current_pkg = package_of(tree, src);
@@ -506,7 +598,7 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
 
 /// Packages Kotlin imports implicitly into every file (JVM target). Symbols in these resolve
 /// without an explicit `import`.
-const DEFAULT_IMPORT_PACKAGES: &[&str] = &[
+pub(crate) const DEFAULT_IMPORT_PACKAGES: &[&str] = &[
     "kotlin",
     "kotlin.annotation",
     "kotlin.collections",

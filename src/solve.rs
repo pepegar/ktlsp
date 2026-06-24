@@ -68,6 +68,7 @@ mod tests {
             name: "List".into(),
             nullable: false,
             args: vec![TypeRef::simple("T")],
+            package_candidates: Vec::new(),
         };
         let actual = Type::Class {
             name: "List".into(),

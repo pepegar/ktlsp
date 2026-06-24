@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Tree};
 
-use crate::index::Index;
+use crate::index::{Entry, Index};
 use crate::parser::{child_of_kind, first_ident, imports_of, node_text, package_of, Import};
 use crate::resolve::{self, UseKind};
 use crate::solve;
@@ -496,7 +496,7 @@ fn has_child_token(node: Node, token: &str) -> bool {
 
 /// A bare identifier: a local/param (read its declared/initialized type), the boolean literals
 /// `true`/`false` (which parse as plain identifiers), a name that IS a type (`Foo.`/`Color.` static
-/// access), or a cross-file top-level property.
+/// access), or a visible cross-file top-level property.
 fn infer_identifier(index: &Index, ident: Node, src: &str, ctx: &FileCtx, depth: usize) -> Type {
     let name = node_text(ident, src);
     if name == "true" || name == "false" {
@@ -523,8 +523,8 @@ fn infer_identifier(index: &Index, ident: Node, src: &str, ctx: &FileCtx, depth:
     if !index.lookup_type(name).is_empty() {
         return resolve_type_name(index, name, ctx, false);
     }
-    // 3. A cross-file top-level property of that name.
-    if let Some(tr) = index.property_type_of(name, None, None) {
+    // 3. A visible cross-file top-level property of that name.
+    if let Some(tr) = top_level_property_type(index, name, ctx) {
         return resolve_type_ref(index, &tr, ctx, depth);
     }
     Type::Unknown
@@ -579,8 +579,8 @@ fn initializer_expr<'t>(prop: Node<'t>, var_decl: Node<'t>) -> Option<Node<'t>> 
     None
 }
 
-/// A call expression: a constructor call (`Foo(...)` -> `Foo`), a free function call (`foo()` ->
-/// foo's return type), or a method call (`recv.method(...)` -> method's return type).
+/// A call expression: a constructor call (`Foo(...)` -> `Foo`), a visible free function call
+/// (`foo()` -> foo's return type), or a method call (`recv.method(...)` -> method's return type).
 fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize) -> Type {
     let Some(callee) = node.named_child(0) else {
         return Type::Unknown;
@@ -593,7 +593,10 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
                 return resolve_type_name(index, cname, ctx, false);
             }
             // Free function call.
-            if let Some((ret_tr, type_params, params)) = free_function_sig(index, cname) {
+            let arg_types = synth_arg_types(index, node, src, ctx, depth);
+            if let Some((ret_tr, type_params, params)) =
+                free_function_sig(index, cname, ctx, value_arg_count(node), &arg_types, depth)
+            {
                 if type_params.is_empty() {
                     return resolve_type_ref(index, &ret_tr, ctx, depth);
                 }
@@ -601,16 +604,15 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
                 // parameter types against the synthesized argument types, then substitute the bindings
                 // through the declared return type (`List<T>` with `T := Foo` -> `List<Foo>`).
                 let tset: HashSet<String> = type_params.into_iter().collect();
-                let args = synth_arg_types(index, node, src, ctx, depth);
                 let mut subst: HashMap<String, Type> = HashMap::new();
                 for (i, p) in params.iter().enumerate() {
-                    if let Some(a) = args.get(i) {
+                    if let Some(a) = arg_types.get(i) {
                         solve::unify_into(p, a, &tset, &mut subst);
                     }
                 }
                 // Vararg / extra args: unify the remaining args against the last formal param.
                 if let Some(last) = params.last() {
-                    for a in args.iter().skip(params.len()) {
+                    for a in arg_types.iter().skip(params.len()) {
                         solve::unify_into(last, a, &tset, &mut subst);
                     }
                 }
@@ -640,25 +642,132 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
     }
 }
 
-/// The signature of a free (top-level) function named `name`, for generic call inference:
-/// `(return type, formal type-parameter names, value-parameter types)`. The first top-level function
-/// with a recorded return type wins (overload-by-args is U9's concern). Cloned to keep lifetimes simple.
-fn free_function_sig(index: &Index, name: &str) -> Option<(TypeRef, Vec<String>, Vec<TypeRef>)> {
+/// The signature of a visible free (top-level) function named `local_name`, for generic call
+/// inference: `(return type, formal type-parameter names, value-parameter types)`. Visibility mirrors
+/// goto: alias/explicit import > same package > wildcard/default imports. Overloads are narrowed by
+/// arity and argument-type consistency; unresolved ambiguity returns `None` rather than a guess.
+fn free_function_sig(
+    index: &Index,
+    local_name: &str,
+    ctx: &FileCtx,
+    arg_count: usize,
+    arg_types: &[Type],
+    depth: usize,
+) -> Option<(TypeRef, Vec<String>, Vec<TypeRef>)> {
+    let entries = visible_top_level_entries(index, local_name, ctx, SymbolKind::Function);
+    let mut group: Vec<&Entry> = entries
+        .into_iter()
+        .filter(|e| e.sym.return_type.is_some())
+        .collect();
+    if group.is_empty() {
+        return None;
+    }
+    let exact: Vec<&Entry> = group
+        .iter()
+        .copied()
+        .filter(|e| e.sym.arity == Some(arg_count.min(u8::MAX as usize) as u8))
+        .collect();
+    if !exact.is_empty() {
+        group = exact;
+    }
+    let consistent: Vec<&Entry> = group
+        .iter()
+        .copied()
+        .filter(|e| {
+            args_consistent(
+                index,
+                &e.sym.params,
+                &e.sym.type_params,
+                arg_types,
+                ctx,
+                depth,
+            )
+        })
+        .collect();
+    if !consistent.is_empty() {
+        group = consistent;
+    }
+    let first = group.first()?;
+    if group.len() > 1
+        && !group.iter().all(|e| {
+            e.sym.return_type == first.sym.return_type
+                && e.sym.type_params == first.sym.type_params
+                && e.sym.params == first.sym.params
+        })
+    {
+        return None;
+    }
+    Some((
+        first.sym.return_type.clone().unwrap(),
+        first.sym.type_params.clone(),
+        first.sym.params.clone(),
+    ))
+}
+
+fn top_level_property_type(index: &Index, local_name: &str, ctx: &FileCtx) -> Option<TypeRef> {
+    let group: Vec<&Entry> = visible_top_level_entries(index, local_name, ctx, SymbolKind::Property)
+        .into_iter()
+        .filter(|e| e.sym.value_type.is_some())
+        .collect();
+    let first = group.first()?;
+    if group.len() > 1 && !group.iter().all(|e| e.sym.value_type == first.sym.value_type) {
+        return None;
+    }
+    first.sym.value_type.clone()
+}
+
+fn visible_top_level_entries<'a>(
+    index: &'a Index,
+    local_name: &str,
+    ctx: &FileCtx,
+    kind: SymbolKind,
+) -> Vec<&'a Entry> {
+    for imp in &ctx.imports {
+        if !imp.wildcard && imp.alias.as_deref() == Some(local_name) {
+            let hits = top_level_entries_exact(index, imp.simple_name(), &imp.package(), kind);
+            if !hits.is_empty() {
+                return hits;
+            }
+        }
+    }
+    for imp in &ctx.imports {
+        if !imp.wildcard && imp.alias.is_none() && imp.simple_name() == local_name {
+            let hits = top_level_entries_exact(index, local_name, &imp.package(), kind);
+            if !hits.is_empty() {
+                return hits;
+            }
+        }
+    }
+    let same_pkg = top_level_entries_exact(index, local_name, &ctx.package, kind);
+    if !same_pkg.is_empty() {
+        return same_pkg;
+    }
+    let star_pkgs: Vec<String> = ctx
+        .imports
+        .iter()
+        .filter(|i| i.wildcard)
+        .map(|i| i.package())
+        .chain(resolve::DEFAULT_IMPORT_PACKAGES.iter().map(|s| s.to_string()))
+        .collect();
+    index
+        .lookup_by_name(local_name)
+        .iter()
+        .filter(|e| e.sym.kind == kind && e.sym.container.is_none())
+        .filter(|e| star_pkgs.contains(&e.sym.package))
+        .collect()
+}
+
+fn top_level_entries_exact<'a>(
+    index: &'a Index,
+    name: &str,
+    package: &str,
+    kind: SymbolKind,
+) -> Vec<&'a Entry> {
     index
         .lookup_by_name(name)
         .iter()
-        .find(|e| {
-            e.sym.kind == SymbolKind::Function
-                && e.sym.container.is_none()
-                && e.sym.return_type.is_some()
-        })
-        .map(|e| {
-            (
-                e.sym.return_type.clone().unwrap(),
-                e.sym.type_params.clone(),
-                e.sym.params.clone(),
-            )
-        })
+        .filter(|e| e.sym.kind == kind && e.sym.container.is_none() && e.sym.package == package)
+        .collect()
 }
 
 /// The synthesized (bottom-up) types of a call's value arguments, in order. Each `value_argument`'s
@@ -706,7 +815,7 @@ fn resolve_with_subst(
     };
     Type::Class {
         name: tr.name.clone(),
-        package: resolve_package(index, &tr.name, ctx),
+        package: resolve_type_ref_package(index, tr, ctx),
         nullable: tr.nullable,
         args,
     }
@@ -945,9 +1054,40 @@ fn resolve_type_ref(index: &Index, tr: &TypeRef, ctx: &FileCtx, depth: usize) ->
     };
     Type::Class {
         name: tr.name.clone(),
-        package: resolve_package(index, &tr.name, ctx),
+        package: resolve_type_ref_package(index, tr, ctx),
         nullable: tr.nullable,
         args,
+    }
+}
+
+/// Resolve a stored type reference's package. Indexed declarations carry declaration-context
+/// candidates; those win when they identify an indexed type. Live local annotations have no
+/// candidates and resolve in the current file context.
+fn resolve_type_ref_package(index: &Index, tr: &TypeRef, ctx: &FileCtx) -> Option<String> {
+    package_from_decl_candidates(index, tr).or_else(|| resolve_package(index, &tr.name, ctx))
+}
+
+fn package_from_decl_candidates(index: &Index, tr: &TypeRef) -> Option<String> {
+    let candidates = index.lookup_type(&tr.name);
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut pkgs = tr.package_candidates.iter();
+    let primary = pkgs.next()?;
+    if candidates.iter().any(|e| &e.sym.package == primary) {
+        return Some(primary.clone());
+    }
+    let mut rest_hits: Vec<String> = Vec::new();
+    for pkg in pkgs {
+        if candidates.iter().any(|e| &e.sym.package == pkg)
+            && !rest_hits.iter().any(|p| p == pkg)
+        {
+            rest_hits.push(pkg.clone());
+        }
+    }
+    match rest_hits.as_slice() {
+        [one] => Some(one.clone()),
+        _ => None,
     }
 }
 
