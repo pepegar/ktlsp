@@ -3,9 +3,17 @@
 -- (dev/gradle-sample). Consolidates the probe files under com/example/probe/ authored by the
 -- verification workflow. One nvim, one ktlsp client; opens each probe file and asserts completion /
 -- goto / diagnostics. Prints a per-category summary + every FAIL with the raw observed labels.
-local repo = "/Users/pepe/projects/github.com/pepegar/ktlsp"
-local root = repo .. "/dev/gradle-sample"
-local bin = repo .. "/target/release/ktlsp"
+local script = debug.getinfo(1, "S").source:gsub("^@", "")
+local dev_dir = vim.fn.fnamemodify(script, ":p:h")
+local repo = vim.fn.fnamemodify(dev_dir, ":h")
+local root = arg[1] or (repo .. "/dev/gradle-sample")
+local bin = arg[2] or os.getenv("KTLSP_BIN")
+if not bin or bin == "" then
+  bin = repo .. "/target/release/ktlsp"
+  if vim.fn.filereadable(bin) == 0 then
+    bin = repo .. "/target/debug/ktlsp"
+  end
+end
 local probe = root .. "/src/main/kotlin/com/example/probe/"
 
 local files = {
@@ -236,4 +244,4 @@ if #fails > 0 then
   for _, f in ipairs(fails) do print(f) end
 end
 print("================================================================")
-os.exit(0)
+os.exit(#fails == 0 and 0 or 1)

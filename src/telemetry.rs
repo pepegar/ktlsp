@@ -6,9 +6,11 @@
 //! `bench analyze` reader share one definition. Writing is best-effort — a telemetry failure must
 //! never disturb diagnostics.
 //!
-//! Destination: `KTLSP_COMPILE_LOG` if set, else `~/.cache/ktlsp/compile-timing.jsonl` (alongside
-//! the trust store). No env and no `HOME` -> telemetry is silently skipped.
+//! Destination: `KTLSP_COMPILE_LOG` if set, else `KTLSP_CACHE_DIR/compile-timing.jsonl`, else
+//! `~/.cache/ktlsp/compile-timing.jsonl` (alongside the trust store). No env and no `HOME` ->
+//! telemetry is silently skipped.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -49,8 +51,22 @@ pub fn log_path() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".cache/ktlsp/compile-timing.jsonl"))
+    default_log_path(
+        std::env::var_os(crate::deps::CACHE_DIR_ENV),
+        std::env::var_os("HOME"),
+        "compile-timing.jsonl",
+    )
+}
+
+fn default_log_path(
+    cache_dir: Option<OsString>,
+    home: Option<OsString>,
+    file_name: &str,
+) -> Option<PathBuf> {
+    if let Some(path) = cache_dir.filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path).join(file_name));
+    }
+    home.map(|h| Path::new(&h).join(".cache/ktlsp").join(file_name))
 }
 
 /// Append one record as a JSON line. Best-effort: any IO or serialization failure is dropped.
@@ -102,5 +118,29 @@ mod tests {
             Some(v) => std::env::set_var("KTLSP_COMPILE_LOG", v),
             None => std::env::remove_var("KTLSP_COMPILE_LOG"),
         }
+    }
+
+    #[test]
+    fn default_log_path_prefers_cache_dir() {
+        assert_eq!(
+            default_log_path(
+                Some(OsString::from("/tmp/ktlsp-cache")),
+                Some(OsString::from("/home/me")),
+                "compile-timing.jsonl",
+            ),
+            Some(PathBuf::from("/tmp/ktlsp-cache/compile-timing.jsonl"))
+        );
+    }
+
+    #[test]
+    fn default_log_path_ignores_empty_cache_dir() {
+        assert_eq!(
+            default_log_path(
+                Some(OsString::from("")),
+                Some(OsString::from("/home/me")),
+                "compile-timing.jsonl",
+            ),
+            Some(PathBuf::from("/home/me/.cache/ktlsp/compile-timing.jsonl"))
+        );
     }
 }

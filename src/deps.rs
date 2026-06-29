@@ -10,6 +10,7 @@
 //! fingerprint (path + mtime + size); a cache hit deserializes the symbols and skips parsing
 //! entirely, turning that ~10s into a one-time-per-jar cost.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -142,9 +143,18 @@ pub fn is_gradle_project(root: &Path) -> bool {
     .any(|f| root.join(f).exists())
 }
 
-/// ktlsp's cache root (`~/.cache/ktlsp`, or under the temp dir if HOME is unset).
+pub const CACHE_DIR_ENV: &str = "KTLSP_CACHE_DIR";
+
+/// ktlsp's cache root (`KTLSP_CACHE_DIR`, `~/.cache/ktlsp`, or under the temp dir if HOME is unset).
 pub fn cache_home() -> PathBuf {
-    std::env::var_os("HOME")
+    cache_home_from(std::env::var_os(CACHE_DIR_ENV), std::env::var_os("HOME"))
+}
+
+fn cache_home_from(cache_dir: Option<OsString>, home: Option<OsString>) -> PathBuf {
+    if let Some(path) = cache_dir.filter(|p| !p.is_empty()) {
+        return PathBuf::from(path);
+    }
+    home
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join(".cache/ktlsp")
@@ -306,6 +316,25 @@ mod tests {
 
     fn coord(s: &str) -> Coordinate {
         Coordinate::parse(s).unwrap()
+    }
+
+    #[test]
+    fn cache_home_prefers_env_root() {
+        assert_eq!(
+            cache_home_from(
+                Some(OsString::from("/tmp/ktlsp-run/cache")),
+                Some(OsString::from("/home/me")),
+            ),
+            PathBuf::from("/tmp/ktlsp-run/cache")
+        );
+    }
+
+    #[test]
+    fn cache_home_ignores_empty_env_root() {
+        assert_eq!(
+            cache_home_from(Some(OsString::from("")), Some(OsString::from("/home/me"))),
+            PathBuf::from("/home/me/.cache/ktlsp")
+        );
     }
 
     #[test]

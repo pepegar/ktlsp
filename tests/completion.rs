@@ -1072,6 +1072,15 @@ fn generic_arg_inference_list_of() {
 }
 
 #[test]
+fn default_imported_list_of_flows_through_extension_first() {
+    // Mirrors the live Gradle probe: no explicit import, stdlib-style extension `first`.
+    let input = "//- coll.kt\npackage kotlin.collections\nclass List<E>\nfun <T> listOf(vararg e: T): List<T> = TODO()\nfun <T> List<T>.first(): T = TODO()\n\
+                 //- app.kt\npackage app\nclass Widget {\n    fun render() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f() {\n    listOf(Widget()).first().ren/*^*/\n}\n";
+    check_contains(input, &["render"]);
+}
+
+#[test]
 fn generic_arg_inference_unbound_is_unknown() {
     // A generic call with no argument to bind the type variable -> List<Unknown> -> first() Unknown.
     let input = "//- coll.kt\npackage kotlin.collections\nclass List<E> {\n    fun first(): E = TODO()\n}\nfun <T> emptyList(): List<T> = TODO()\n\
@@ -1097,6 +1106,61 @@ fn lambda_it_is_element_type_in_map() {
     let input = "//- coll.kt\npackage kotlin.collections\nclass List<E>\nfun <T> List<T>.map(f: (T) -> Unit) {}\n\
                  //- app.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
                  //- Main.kt\npackage app\nimport kotlin.collections.map\nfun f(xs: List<Foo>) {\n    xs.map {\n        it.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn default_imported_list_of_flows_into_lambda_it() {
+    // Mirrors the live Gradle probe: the lambda receiver is a call expression, not a local `xs`.
+    let input = "//- coll.kt\npackage kotlin.collections\nclass List<E>\nfun <T> listOf(vararg e: T): List<T> = TODO()\nfun <T, R> List<T>.map(f: (T) -> R): List<R> = TODO()\n\
+                 //- app.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f() {\n    listOf(Foo()).map {\n        it.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn stdlib_collection_overloads_keep_list_of_element_type_for_first() {
+    // Closer to the real stdlib: List is an Iterable subtype, listOf has several overloads, and
+    // first is an extension function.
+    let input = "//- coll.kt\npackage kotlin.collections\n\
+                 interface Iterable<out T>\n\
+                 interface Collection<out E> : Iterable<E>\n\
+                 interface List<out E> : Collection<E>\n\
+                 fun <T> listOf(vararg elements: T): List<T> = TODO()\n\
+                 fun <T> listOf(element: T): List<T> = TODO()\n\
+                 fun <T> listOf(): List<T> = TODO()\n\
+                 fun <T> Iterable<T>.first(): T = TODO()\n\
+                 fun <T> List<T>.first(): T = TODO()\n\
+                 //- app.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f() {\n    listOf(Foo()).first().ba/*^*/\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn duplicate_stdlib_signatures_with_different_import_contexts_still_agree() {
+    // Real kotlin-stdlib indexes common/expect and JVM/actual declarations. Their TypeRefs can have
+    // different package-candidate lists while naming the same semantic type; that must not make
+    // `listOf(Widget())` ambiguous.
+    let input = "//- contracts.kt\npackage kotlin.contracts\nclass ContractMarker\n\
+                 //- coll_a.kt\npackage kotlin.collections\nimport kotlin.contracts.*\nclass List<E>\nfun <T> listOf(element: T): List<T> = TODO()\nfun <T> List<T>.first(): T = TODO()\n\
+                 //- coll_b.kt\npackage kotlin.collections\nfun <T> listOf(element: T): List<T> = TODO()\n\
+                 //- app.kt\npackage app\nclass Widget {\n    fun render() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f() {\n    listOf(Widget()).first().ren/*^*/\n}\n";
+    check_contains(input, &["render"]);
+}
+
+#[test]
+fn stdlib_collection_overloads_keep_list_of_element_type_for_lambda_it() {
+    let input = "//- coll.kt\npackage kotlin.collections\n\
+                 interface Iterable<out T>\n\
+                 interface Collection<out E> : Iterable<E>\n\
+                 interface List<out E> : Collection<E>\n\
+                 fun <T> listOf(vararg elements: T): List<T> = TODO()\n\
+                 fun <T> listOf(element: T): List<T> = TODO()\n\
+                 fun <T> listOf(): List<T> = TODO()\n\
+                 fun <T, R> Iterable<T>.map(transform: (T) -> R): List<R> = TODO()\n\
+                 //- app.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\n\
+                 //- Main.kt\npackage app\nfun f() {\n    listOf(Foo()).map {\n        it.ba/*^*/\n    }\n}\n";
     check_contains(input, &["bar"]);
 }
 

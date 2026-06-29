@@ -690,9 +690,9 @@ fn free_function_sig(
     let first = group.first()?;
     if group.len() > 1
         && !group.iter().all(|e| {
-            e.sym.return_type == first.sym.return_type
+            opt_type_ref_same_shape(e.sym.return_type.as_ref(), first.sym.return_type.as_ref())
                 && e.sym.type_params == first.sym.type_params
-                && e.sym.params == first.sym.params
+                && type_ref_list_same_shape(&e.sym.params, &first.sym.params)
         })
     {
         return None;
@@ -710,10 +710,33 @@ fn top_level_property_type(index: &Index, local_name: &str, ctx: &FileCtx) -> Op
         .filter(|e| e.sym.value_type.is_some())
         .collect();
     let first = group.first()?;
-    if group.len() > 1 && !group.iter().all(|e| e.sym.value_type == first.sym.value_type) {
+    if group.len() > 1
+        && !group
+            .iter()
+            .all(|e| opt_type_ref_same_shape(e.sym.value_type.as_ref(), first.sym.value_type.as_ref()))
+    {
         return None;
     }
     first.sym.value_type.clone()
+}
+
+fn opt_type_ref_same_shape(a: Option<&TypeRef>, b: Option<&TypeRef>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => type_ref_same_shape(a, b),
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+fn type_ref_list_same_shape(a: &[TypeRef], b: &[TypeRef]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| type_ref_same_shape(a, b))
+}
+
+fn type_ref_same_shape(a: &TypeRef, b: &TypeRef) -> bool {
+    a.name == b.name
+        && a.nullable == b.nullable
+        && a.args.len() == b.args.len()
+        && a.args.iter().zip(&b.args).all(|(a, b)| type_ref_same_shape(a, b))
 }
 
 fn visible_top_level_entries<'a>(
