@@ -4,18 +4,21 @@
 -- Drives the REAL Neovim built-in LSP client against the ktlsp binary over stdio and asserts
 -- goto-definition (local + cross-file). Run from the repo root:
 --
---     nvim -l dev/nvim_smoke.lua
+--     nvim -l dev/nvim_smoke.lua [project-dir] [ktlsp-bin]
 --
 -- Exits 0 if all checks pass, 1 otherwise. No plugins, no user config involved.
 
 local script = debug.getinfo(1, "S").source:gsub("^@", "")
 local dev_dir = vim.fn.fnamemodify(script, ":p:h")
 local root = vim.fn.fnamemodify(dev_dir, ":h")
-local sample = dev_dir .. "/sample"
+local sample = arg[1] or (dev_dir .. "/sample")
 
-local bin = root .. "/target/release/ktlsp"
-if vim.fn.filereadable(bin) == 0 then
-  bin = root .. "/target/debug/ktlsp"
+local bin = arg[2] or os.getenv("KTLSP_BIN")
+if not bin or bin == "" then
+  bin = root .. "/target/release/ktlsp"
+  if vim.fn.filereadable(bin) == 0 then
+    bin = root .. "/target/debug/ktlsp"
+  end
 end
 assert(vim.fn.filereadable(bin) == 1, "ktlsp binary not found — run `cargo build` first")
 

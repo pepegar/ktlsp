@@ -1,7 +1,7 @@
 ---@diagnostic disable: undefined-global
 -- Throwaway Neovim config to try ktlsp interactively (no plugins, ignores your real config).
 --
---   nvim -u /Users/pepe/projects/github.com/pepegar/ktlsp/dev/init.lua  path/to/SomeFile.kt
+--   nvim -u /path/to/ktlsp/dev/init.lua  path/to/SomeFile.kt
 --
 -- In a Kotlin buffer:  gd = goto-definition,  gR = find-references  (grr also works on nvim 0.11+).
 
