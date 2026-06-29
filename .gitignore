@@ -12,3 +12,4 @@ dev/bench-fixture/
 # Kotlin compile-daemon sidecar build output (the source + wrapper are committed)
 sidecar/.gradle/
 sidecar/build/
+.worktrees
