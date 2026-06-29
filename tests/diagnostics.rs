@@ -63,3 +63,81 @@ fn diagnostic_range_points_at_the_import() {
     assert_eq!(d[0].start_byte, 0);
     assert!(&src[d[0].start_byte..d[0].end_byte].contains("import a.b.Unused"));
 }
+
+#[test]
+fn duplicate_top_level_class_is_flagged() {
+    let src = "class Box\nclass Box\n";
+    let d = diagnostics(src);
+    assert_eq!(d.len(), 1, "expected one duplicate classifier diagnostic, got {d:?}");
+    assert!(d[0].message.contains("Duplicate classifier: Box"));
+    assert_eq!(&src[d[0].start_byte..d[0].end_byte], "Box");
+}
+
+#[test]
+fn class_and_object_with_same_name_are_flagged() {
+    let m = messages("class Registry\nobject Registry\n");
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate classifier: Registry"));
+}
+
+#[test]
+fn overloaded_functions_are_not_duplicate_declarations() {
+    let src = r#"
+fun parse(raw: String): String = raw
+fun parse(raw: Int): Int = raw
+"#;
+    assert!(diagnostics(src).is_empty());
+}
+
+#[test]
+fn duplicate_member_property_is_flagged() {
+    let src = r#"
+class Account {
+    val id: String = ""
+    val id: Int = 1
+}
+"#;
+    let m = messages(src);
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate property: id"));
+}
+
+#[test]
+fn constructor_property_conflicting_with_body_property_is_flagged() {
+    let src = r#"
+class Account(val id: String) {
+    val id: Int = 1
+}
+"#;
+    let m = messages(src);
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate property: id"));
+}
+
+#[test]
+fn duplicate_function_parameter_is_flagged() {
+    let m = messages("fun rename(name: String, name: String) {}\n");
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate parameter: name"));
+}
+
+#[test]
+fn duplicate_primary_constructor_parameter_is_flagged() {
+    let m = messages("class User(id: String, id: String)\n");
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate parameter: id"));
+}
+
+#[test]
+fn duplicate_type_parameter_is_flagged() {
+    let m = messages("class Box<T, T>\n");
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate type parameter: T"));
+}
+
+#[test]
+fn duplicate_enum_entry_is_flagged() {
+    let m = messages("enum class State {\n    Ready,\n    Ready\n}\n");
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate enum entry: Ready"));
+}

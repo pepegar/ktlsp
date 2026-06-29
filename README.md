@@ -118,6 +118,18 @@ definition, so results are at the same best-effort precision as goto (a shadowed
 scope is excluded). The declaration itself is included when the client asks. Rename and call
 hierarchy are natural follow-ons on the same index.
 
+## Fast diagnostics
+
+ktlsp publishes conservative compiler-free diagnostics from the live tree-sitter parse. Today that
+means unused imports plus duplicate simple declarations in local scopes: classifiers, properties,
+enum entries, value parameters, primary-constructor parameters, and type parameters. These checks run
+without Gradle or the Kotlin compiler and are gated on a clean parse, so ktlsp stays silent while the
+file is syntactically incomplete instead of guessing.
+
+The fast diagnostics deliberately do not report type mismatches, unresolved references, exhaustiveness
+errors, or full overload-resolution failures. Those require Kotlin compiler semantics; use the opt-in
+compile diagnostics backend below when you want the compiler as the oracle.
+
 ## Compile diagnostics (opt-in, off by default)
 
 ktlsp's tree-sitter core can't produce sound type errors, so genuine compile errors come from the
