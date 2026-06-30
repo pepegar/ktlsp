@@ -246,6 +246,30 @@ fn cross_file_explicit_import_other_package() {
 }
 
 #[test]
+fn goto_on_imported_type_name() {
+    check(
+        "//- Target.kt\npackage lib\nclass /*def*/Target\n\
+         //- Main.kt\npackage app\nimport lib./*^*/Target\nfun main() {}\n",
+    );
+}
+
+#[test]
+fn goto_on_imported_member_type_name() {
+    check(
+        "//- Notifications.kt\npackage lib\nclass Notification {\n    class /*def*/Updated\n}\n\
+         //- Main.kt\npackage app\nimport lib.Notification./*^*/Updated\nfun main() {}\n",
+    );
+}
+
+#[test]
+fn goto_on_imported_type_alias_name() {
+    check(
+        "//- Target.kt\npackage lib\nclass /*def*/Target\n\
+         //- Main.kt\npackage app\nimport lib.Target as /*^*/Alias\nfun main() {}\n",
+    );
+}
+
+#[test]
 fn cross_file_wildcard_import() {
     check(
         "//- Util.kt\npackage lib\nfun /*def*/tool() {}\n//- Main.kt\npackage app\nimport lib.*\nfun main() { /*^*/tool() }\n",
@@ -264,6 +288,38 @@ fn fully_qualified_type_position() {
     check(
         "//- Target.kt\npackage p1\nclass /*def*/Target\n\
          //- Main.kt\npackage app\nfun use(x: p1./*^*/Target) {}\n",
+    );
+}
+
+#[test]
+fn nested_type_same_package() {
+    check(
+        "//- Notification.kt\npackage app\nclass Notification {\n    class /*def*/Updated\n}\n\
+         //- Main.kt\npackage app\nfun use(x: Notification./*^*/Updated) {}\n",
+    );
+}
+
+#[test]
+fn nested_type_via_imported_outer() {
+    check(
+        "//- Notification.kt\npackage lib\nclass Notification {\n    class /*def*/Updated\n}\n\
+         //- Main.kt\npackage app\nimport lib.Notification\nfun use(x: Notification./*^*/Updated) {}\n",
+    );
+}
+
+#[test]
+fn nested_type_via_aliased_outer_import() {
+    check(
+        "//- Notification.kt\npackage lib\nclass Notification {\n    class /*def*/Updated\n}\n\
+         //- Main.kt\npackage app\nimport lib.Notification as N\nfun use(x: N./*^*/Updated) {}\n",
+    );
+}
+
+#[test]
+fn nested_type_via_fully_qualified_outer() {
+    check(
+        "//- Notification.kt\npackage lib\nclass Notification {\n    class /*def*/Updated\n}\n\
+         //- Main.kt\npackage app\nfun use(x: lib.Notification./*^*/Updated) {}\n",
     );
 }
 

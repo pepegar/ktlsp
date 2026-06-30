@@ -82,6 +82,12 @@ pub fn goto(index: &Index, file: &str, src: &str, tree: &Tree, offset: usize) ->
     }
     let uk = use_kind(ident);
 
+    // Import declarations are neither value nor type positions. Resolve the imported target (or
+    // alias) directly by its qualified path.
+    if let Some(defs) = resolve_import_target(index, ident, src) {
+        return defs;
+    }
+
     // Fully-qualified top-level names (`pkg.Type`, `pkg.func()`) bypass imports. Handle them before
     // the member path so a package-qualified selector is not mistaken for `receiver.member`.
     if let Some(defs) = resolve_qualified(index, ident, name, uk, src) {
@@ -99,6 +105,11 @@ pub fn goto(index: &Index, file: &str, src: &str, tree: &Tree, offset: usize) ->
     }
     if let Some(def) = resolve_local(ident, name, uk, src, file) {
         return vec![def];
+    }
+    if let Some(defs) = resolve_nested_type(index, tree, src, ident) {
+        if !defs.is_empty() {
+            return defs;
+        }
     }
     resolve_cross_file(index, tree, src, name, uk)
 }
@@ -453,6 +464,23 @@ fn to_def(e: &Entry) -> Def {
     }
 }
 
+fn resolve_import_target(index: &Index, usage: Node, src: &str) -> Option<Vec<Def>> {
+    let import = ancestor_of_kind(usage, "import")?;
+    let qid = child_of_kind(import, "qualified_identifier")?;
+    let parts = direct_identifier_parts(qid, src);
+    if parts.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let on_imported_name = parts.last().is_some_and(|(node, _)| *node == usage);
+    let on_alias = usage.parent() == Some(import);
+    if !on_imported_name && !on_alias {
+        return Some(Vec::new());
+    }
+
+    Some(resolve_absolute_path(index, &part_names(&parts), |_| true))
+}
+
 fn resolve_qualified(
     index: &Index,
     usage: Node,
@@ -469,6 +497,51 @@ fn resolve_qualified(
             .map(to_def)
             .collect(),
     )
+}
+
+fn resolve_nested_type(index: &Index, tree: &Tree, src: &str, usage: Node) -> Option<Vec<Def>> {
+    let parent = usage.parent()?;
+    if parent.kind() != "user_type" {
+        return None;
+    }
+    let parts = direct_identifier_parts(parent, src);
+    if parts.len() < 2 || !parts.last().is_some_and(|(node, _)| *node == usage) {
+        return None;
+    }
+    let names = part_names(&parts);
+
+    // Package-qualified nested type: `pkg.Outer.Inner`.
+    if names.len() > 2 {
+        let absolute = resolve_absolute_path(index, &names, |kind| kind.is_type_like());
+        if !absolute.is_empty() {
+            return Some(absolute);
+        }
+    }
+
+    // Visible nested type: `Outer.Inner`, where `Outer` may be same-package, explicitly imported,
+    // alias-imported, wildcard-imported, or default-imported.
+    if names.len() == 2 {
+        let outer = &names[0];
+        let inner = &names[1];
+        let visible_outers = visible_outer_types(index, tree, src, outer);
+        let hits: Vec<Def> = index
+            .lookup_by_name(inner)
+            .iter()
+            .filter(|e| e.sym.kind.is_type_like())
+            .filter(|e| {
+                visible_outers
+                    .iter()
+                    .any(|(real_outer, pkg)| {
+                        e.sym.container.as_deref() == Some(real_outer.as_str())
+                            && &e.sym.package == pkg
+                    })
+            })
+            .map(to_def)
+            .collect();
+        return Some(hits);
+    }
+
+    None
 }
 
 fn qualified_package_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(String, UseKind)> {
@@ -502,6 +575,16 @@ fn qualified_package_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(St
     None
 }
 
+fn ancestor_of_kind<'t>(mut node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == kind {
+            return Some(parent);
+        }
+        node = parent;
+    }
+    None
+}
+
 fn direct_identifier_parts<'t>(node: Node<'t>, src: &str) -> Vec<(Node<'t>, String)> {
     let mut out = Vec::new();
     let mut cursor = node.walk();
@@ -511,6 +594,10 @@ fn direct_identifier_parts<'t>(node: Node<'t>, src: &str) -> Vec<(Node<'t>, Stri
         }
     }
     out
+}
+
+fn part_names(parts: &[(Node, String)]) -> Vec<String> {
+    parts.iter().map(|(_, name)| name.clone()).collect()
 }
 
 fn navigation_parts<'t>(node: Node<'t>, src: &str) -> Option<Vec<(Node<'t>, String)>> {
@@ -535,6 +622,85 @@ fn join_part_names(parts: &[(Node, String)]) -> String {
         .map(|(_, name)| name.as_str())
         .collect::<Vec<_>>()
         .join(".")
+}
+
+fn resolve_absolute_path(
+    index: &Index,
+    parts: &[String],
+    kind_ok: impl Fn(SymbolKind) -> bool,
+) -> Vec<Def> {
+    let Some(name) = parts.last() else {
+        return Vec::new();
+    };
+    let prefix = &parts[..parts.len() - 1];
+    index
+        .lookup_by_name(name)
+        .iter()
+        .filter(|e| kind_ok(e.sym.kind))
+        .filter(|e| absolute_path_matches(e, prefix))
+        .map(to_def)
+        .collect()
+}
+
+fn absolute_path_matches(entry: &Entry, prefix: &[String]) -> bool {
+    if let Some(container) = &entry.sym.container {
+        let Some((last, package_parts)) = prefix.split_last() else {
+            return false;
+        };
+        container == last && entry.sym.package == package_parts.join(".")
+    } else {
+        entry.sym.package == prefix.join(".")
+    }
+}
+
+fn visible_outer_types(
+    index: &Index,
+    tree: &Tree,
+    src: &str,
+    local_name: &str,
+) -> Vec<(String, String)> {
+    let imports = imports_of(tree, src);
+    let current_pkg = package_of(tree, src);
+    let mut out = Vec::new();
+
+    for imp in &imports {
+        if imp.alias.as_deref() == Some(local_name) {
+            push_visible_outer(index, &mut out, imp.simple_name(), &imp.package());
+        }
+    }
+    for imp in &imports {
+        if !imp.wildcard && imp.alias.is_none() && imp.simple_name() == local_name {
+            push_visible_outer(index, &mut out, local_name, &imp.package());
+        }
+    }
+
+    push_visible_outer(index, &mut out, local_name, &current_pkg);
+
+    let star_pkgs = imports
+        .iter()
+        .filter(|i| i.wildcard)
+        .map(|i| i.package())
+        .chain(DEFAULT_IMPORT_PACKAGES.iter().map(|s| s.to_string()));
+    for pkg in star_pkgs {
+        push_visible_outer(index, &mut out, local_name, &pkg);
+    }
+
+    out
+}
+
+fn push_visible_outer(index: &Index, out: &mut Vec<(String, String)>, name: &str, package: &str) {
+    if index
+        .lookup_by_name(name)
+        .iter()
+        .any(|e| {
+            e.sym.kind.is_type_like() && e.sym.container.is_none() && e.sym.package == package
+        })
+    {
+        let item = (name.to_string(), package.to_string());
+        if !out.contains(&item) {
+            out.push(item);
+        }
+    }
 }
 
 fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: UseKind) -> Vec<Def> {

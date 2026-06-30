@@ -82,8 +82,55 @@ end
 local uri = vim.uri_from_bufnr(bufnr)
 
 -- Add one unused import through the editor so code actions exercise the real didChange path.
-vim.api.nvim_buf_set_lines(bufnr, 1, 1, false, { "import a.b.Unused" })
+vim.api.nvim_buf_set_lines(bufnr, 1, 1, false, {
+  "import widgets.Decorator",
+  "import widgets.Decorator.Badge",
+  "import a.b.Unused",
+})
+do
+  local n = vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, n, n, false, {
+    "",
+    "fun usesNestedType(x: Decorator.Badge) {}",
+  })
+end
 vim.wait(800)
+
+-- ---- Goto-definition from import targets and imported nested types ----
+do
+  local l, c = find("import widgets.Decorator", "Decorator")
+  check("found Decorator import target", l ~= nil)
+  if l then
+    local res = request("textDocument/definition", { textDocument = { uri = uri }, position = { line = l, character = c } })
+    local loc = res
+    if type(res) == "table" and res[1] then
+      loc = res[1]
+    end
+    check("goto on imported type -> Decor.kt", loc ~= nil and loc.uri ~= nil and loc.uri:match("Decor%.kt$") ~= nil, loc and loc.uri)
+  end
+
+  l, c = find("import widgets.Decorator.Badge", "Badge")
+  check("found Badge import target", l ~= nil)
+  if l then
+    local res = request("textDocument/definition", { textDocument = { uri = uri }, position = { line = l, character = c } })
+    local loc = res
+    if type(res) == "table" and res[1] then
+      loc = res[1]
+    end
+    check("goto on imported nested type -> Decor.kt", loc ~= nil and loc.uri ~= nil and loc.uri:match("Decor%.kt$") ~= nil, loc and loc.uri)
+  end
+
+  l, c = find("fun usesNestedType", "Badge")
+  check("found nested Badge type usage", l ~= nil)
+  if l then
+    local res = request("textDocument/definition", { textDocument = { uri = uri }, position = { line = l, character = c } })
+    local loc = res
+    if type(res) == "table" and res[1] then
+      loc = res[1]
+    end
+    check("goto on imported outer nested type -> Decor.kt", loc ~= nil and loc.uri ~= nil and loc.uri:match("Decor%.kt$") ~= nil, loc and loc.uri)
+  end
+end
 
 -- ---- Passive symbol surface: document symbols, hover, highlights, workspace symbols ----
 do
@@ -264,41 +311,41 @@ end
 
 -- ---- Stage C: an unimported, indexed type is offered WITH an auto-import additionalTextEdits ----
 do
-  -- `Decorator` is declared in dev/sample/Decor.kt under package `widgets` (no import in Main.kt),
-  -- and referenced unimported below; completion must carry an `import widgets.Decorator` edit.
+  -- `AutoImportTarget` is declared in dev/sample/Decor.kt under package `widgets` (no import in
+  -- Main.kt), and referenced unimported below; completion must carry an import edit.
   local n0 = vim.api.nvim_buf_line_count(bufnr)
   vim.api.nvim_buf_set_lines(bufnr, n0, n0, false, {
     "",
-    "fun tryAutoImport() { Decorat }",
+    "fun tryAutoImport() { AutoImportTarge }",
   })
   vim.wait(800)
-  local l, c = find("fun tryAutoImport() { Decorat }", "Decorat")
-  check("found Decorat reference for auto-import", l ~= nil)
+  local l, c = find("fun tryAutoImport() { AutoImportTarge }", "AutoImportTarge")
+  check("found AutoImportTarge reference for auto-import", l ~= nil)
   if l then
-    -- The cross-file `Decorator` symbol comes from the background project scan, which races with
-    -- this request; poll the completion until it warms up (or time out).
-    local decorator_item = nil
+    -- The cross-file `AutoImportTarget` symbol comes from the background project scan, which races
+    -- with this request; poll the completion until it warms up (or time out).
+    local auto_import_item = nil
     local last_count = 0
     vim.wait(8000, function()
       local res = request("textDocument/completion", {
         textDocument = { uri = uri },
-        position = { line = l, character = c + #"Decorat" },
+        position = { line = l, character = c + #"AutoImportTarge" },
       })
       local items = res and (res.items or res) or {}
       last_count = #items
       for _, item in ipairs(items) do
-        if item.label == "Decorator" then
-          decorator_item = item
+        if item.label == "AutoImportTarget" then
+          auto_import_item = item
           return true
         end
       end
       return false
     end, 200)
-    check("completion offers `Decorator`", decorator_item ~= nil, "got " .. last_count .. " items")
-    if decorator_item then
-      local edits = decorator_item.additionalTextEdits
+    check("completion offers `AutoImportTarget`", auto_import_item ~= nil, "got " .. last_count .. " items")
+    if auto_import_item then
+      local edits = auto_import_item.additionalTextEdits
       local ok = edits ~= nil and edits[1] ~= nil and edits[1].newText ~= nil and edits[1].newText:match("^import ") ~= nil
-      check("  Decorator carries an `import ` additionalTextEdit", ok, edits and edits[1] and edits[1].newText)
+      check("  AutoImportTarget carries an `import ` additionalTextEdit", ok, edits and edits[1] and edits[1].newText)
     end
   end
 end
