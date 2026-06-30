@@ -1,10 +1,11 @@
-//! Name-based, high-confidence diagnostics (pure core; byte offsets, no LSP types).
+//! Parser-backed diagnostics (pure core; byte offsets, no LSP types).
 //!
-//! The silent-omission contract **inverts** for diagnostics: inference shows nothing when unsure; a
-//! checker must EMIT nothing when unsure, because a false positive is a wrong result shown to the
-//! user. So every check here fires only when it is *provably* wrong, and the whole pass is suppressed
-//! on a non-clean parse (an `ERROR`-recovered subtree is provably partial — absence of a node there
-//! does not mean absence in source, which would make "unused"/"unresolved" false-positive).
+//! Syntax diagnostics are direct tree-sitter recovery markers (`ERROR` or missing nodes). Semantic
+//! checks keep the silent-omission contract: inference shows nothing when unsure; a checker must EMIT
+//! nothing when unsure, because a false positive is a wrong result shown to the user. So every
+//! semantic check here fires only when it is *provably* wrong, and those checks are suppressed on a
+//! non-clean parse (an `ERROR`-recovered subtree is provably partial — absence of a node there does
+//! not mean absence in source, which would make "unused"/"unresolved" false-positive).
 //!
 //! U10 ships the safest check (unused import — pure name-usage, no type resolution). U11 adds
 //! unresolved references (gated on full information).
@@ -25,12 +26,14 @@ pub enum Severity {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DiagnosticCode {
+    SyntaxError,
     UnusedImport,
 }
 
 impl DiagnosticCode {
     pub fn as_str(self) -> &'static str {
         match self {
+            DiagnosticCode::SyntaxError => "syntax_error",
             DiagnosticCode::UnusedImport => "unused_import",
         }
     }
@@ -46,15 +49,110 @@ pub struct Diagnostic {
     pub message: String,
 }
 
-/// Compute all diagnostics for a parsed file. Returns empty on a non-clean parse (suppress to avoid
-/// false positives over partial/`ERROR`-recovered trees).
+/// Compute all diagnostics for a parsed file. Syntax errors are reported from tree-sitter recovery
+/// markers. Semantic diagnostics run only on a clean parse to avoid false positives over
+/// partial/`ERROR`-recovered trees.
 pub fn compute(src: &str, tree: &Tree) -> Vec<Diagnostic> {
-    if tree.root_node().has_error() {
-        return Vec::new();
+    let syntax = syntax_errors(tree, src);
+    if !syntax.is_empty() {
+        return syntax;
     }
     let mut out = unused_imports(tree, src);
     out.extend(duplicate_declarations(tree, src));
     out
+}
+
+/// Tree-sitter is error-tolerant: invalid Kotlin still produces a tree with `ERROR` and sometimes
+/// zero-width missing nodes. Those are exactly the parser diagnostics ktlsp can report without a
+/// compiler.
+fn syntax_errors(tree: &Tree, src: &str) -> Vec<Diagnostic> {
+    let root = tree.root_node();
+    if !root.has_error() {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    collect_syntax_errors(root, src, &mut out);
+    if out.is_empty() {
+        let (start_byte, end_byte) = diagnostic_range(src, root.start_byte(), root.end_byte());
+        out.push(Diagnostic {
+            start_byte,
+            end_byte,
+            severity: Severity::Error,
+            code: Some(DiagnosticCode::SyntaxError),
+            message: "Syntax error".to_string(),
+        });
+    }
+    out
+}
+
+fn collect_syntax_errors(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
+    if node.is_missing() {
+        let (start_byte, end_byte) = diagnostic_range(src, node.start_byte(), node.end_byte());
+        out.push(Diagnostic {
+            start_byte,
+            end_byte,
+            severity: Severity::Error,
+            code: Some(DiagnosticCode::SyntaxError),
+            message: format!("Syntax error: missing `{}`", node.kind()),
+        });
+        return;
+    }
+
+    if node.is_error() {
+        let (start_byte, end_byte) = diagnostic_range(src, node.start_byte(), node.end_byte());
+        out.push(Diagnostic {
+            start_byte,
+            end_byte,
+            severity: Severity::Error,
+            code: Some(DiagnosticCode::SyntaxError),
+            message: "Syntax error".to_string(),
+        });
+        return;
+    }
+
+    if !node.has_error() {
+        return;
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_syntax_errors(child, src, out);
+    }
+}
+
+fn diagnostic_range(src: &str, start: usize, end: usize) -> (usize, usize) {
+    let start = start.min(src.len());
+    let end = end.min(src.len());
+    if end > start {
+        return (start, end);
+    }
+
+    if src.is_empty() {
+        return (0, 0);
+    }
+
+    if start < src.len() {
+        return (start, next_char_boundary(src, start));
+    }
+
+    (previous_char_boundary(src, start), start)
+}
+
+fn next_char_boundary(src: &str, start: usize) -> usize {
+    let mut end = (start + 1).min(src.len());
+    while end < src.len() && !src.is_char_boundary(end) {
+        end += 1;
+    }
+    end
+}
+
+fn previous_char_boundary(src: &str, end: usize) -> usize {
+    let mut start = end.saturating_sub(1);
+    while start > 0 && !src.is_char_boundary(start) {
+        start -= 1;
+    }
+    start
 }
 
 /// Unused imports: a non-wildcard `import a.b.C` (or `… as D`) whose local name has no identifier
@@ -417,5 +515,35 @@ mod tests {
     fn aliased_import_unused() {
         let d = diags("import a.b.C as D\nfun main() { C() }\n");
         assert_eq!(d.len(), 1, "C is the original name, not the bound alias D");
+    }
+
+    #[test]
+    fn syntax_error_is_reported_from_error_node() {
+        let src = "import a.b.Unused\nfun broken( { )\n";
+        let d = diags(src);
+        assert_eq!(d.len(), 1, "expected only syntax diagnostics, got {d:?}");
+        assert_eq!(d[0].severity, Severity::Error);
+        assert_eq!(d[0].code, Some(DiagnosticCode::SyntaxError));
+        assert_eq!(d[0].message, "Syntax error");
+        assert!(
+            d[0].start_byte < d[0].end_byte,
+            "syntax diagnostics should have a visible range"
+        );
+        assert!(
+            !d[0].message.contains("Unused"),
+            "semantic diagnostics must stay suppressed on partial parses"
+        );
+    }
+
+    #[test]
+    fn zero_width_parse_error_gets_visible_range() {
+        let src = "fun main() {\n    val x = \n}\n";
+        let d = diags(src);
+        assert!(!d.is_empty(), "expected syntax diagnostics for incomplete expression");
+        assert_eq!(d[0].code, Some(DiagnosticCode::SyntaxError));
+        assert!(
+            d.iter().all(|diag| diag.start_byte < diag.end_byte),
+            "zero-width parser errors should be expanded to a visible range: {d:?}"
+        );
     }
 }

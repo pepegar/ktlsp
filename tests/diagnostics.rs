@@ -47,11 +47,21 @@ fn only_the_unused_one_of_several_imports_is_flagged() {
 }
 
 #[test]
-fn error_recovered_file_suppresses_diagnostics() {
-    // A file that fails to parse cleanly (ERROR node) must produce NO diagnostics — an ERROR-recovered
-    // tree is provably partial, so "unused" can't be trusted.
+fn error_recovered_file_reports_syntax_not_semantic_diagnostics() {
+    // A file that fails to parse cleanly should surface the parser error, but semantic diagnostics
+    // such as unused imports stay suppressed because the recovered tree is partial.
     let d = diagnostics("import a.b.Unused\nfun broken( { )\n");
-    assert!(d.is_empty(), "diagnostics must be suppressed on a non-clean parse, got {d:?}");
+    assert_eq!(d.len(), 1, "expected one parser diagnostic, got {d:?}");
+    assert_eq!(d[0].message, "Syntax error");
+    assert!(!d[0].message.contains("Unused"));
+    assert!(d[0].start_byte < d[0].end_byte);
+}
+
+#[test]
+fn incomplete_expression_reports_visible_syntax_diagnostic() {
+    let d = diagnostics("fun main() {\n    val x = \n}\n");
+    assert!(!d.is_empty(), "expected syntax diagnostic for incomplete expression");
+    assert!(d.iter().all(|diag| diag.start_byte < diag.end_byte), "{d:?}");
 }
 
 #[test]

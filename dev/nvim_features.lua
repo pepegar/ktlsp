@@ -226,6 +226,46 @@ do
   end
 end
 
+-- ---- Parser diagnostics: broken syntax is published, semantic hints wait for a clean parse ----
+do
+  local start_line = vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, start_line, start_line, false, {
+    "",
+    "fun syntaxProbe( { )",
+  })
+
+  local syntax_diag = nil
+  vim.wait(4000, function()
+    for _, d in ipairs(vim.diagnostic.get(bufnr)) do
+      if d.source == "ktlsp" and d.severity == vim.diagnostic.severity.ERROR and d.message:find("Syntax error", 1, true) then
+        syntax_diag = d
+        return true
+      end
+    end
+    return false
+  end, 100)
+  check("publishDiagnostics reports tree-sitter syntax error", syntax_diag ~= nil, vim.inspect(vim.diagnostic.get(bufnr)))
+
+  local has_unused_during_parse_error = false
+  for _, d in ipairs(vim.diagnostic.get(bufnr)) do
+    if d.source == "ktlsp" and d.message:find("Unused import", 1, true) then
+      has_unused_during_parse_error = true
+      break
+    end
+  end
+  check("syntax error suppresses semantic diagnostics", not has_unused_during_parse_error, vim.inspect(vim.diagnostic.get(bufnr)))
+
+  vim.api.nvim_buf_set_lines(bufnr, start_line, start_line + 2, false, {})
+  vim.wait(4000, function()
+    for _, d in ipairs(vim.diagnostic.get(bufnr)) do
+      if d.source == "ktlsp" and d.severity == vim.diagnostic.severity.ERROR and d.message:find("Syntax error", 1, true) then
+        return false
+      end
+    end
+    return true
+  end, 100)
+end
+
 -- ---- Visual editor features: folding, selection ranges, semantic tokens, inlay hints ----
 do
   local folds = request("textDocument/foldingRange", { textDocument = { uri = uri } })

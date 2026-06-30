@@ -156,10 +156,11 @@ vim.lsp.start({
 ## Fast diagnostics
 
 ktlsp publishes conservative compiler-free diagnostics from the live tree-sitter parse. Today that
-means unused imports plus duplicate simple declarations in local scopes: classifiers, properties,
-enum entries, value parameters, primary-constructor parameters, and type parameters. These checks run
-without Gradle or the Kotlin compiler and are gated on a clean parse, so ktlsp stays silent while the
-file is syntactically incomplete instead of guessing.
+means tree-sitter syntax errors, unused imports, plus duplicate simple declarations in local scopes:
+classifiers, properties, enum entries, value parameters, primary-constructor parameters, and type
+parameters. These checks run without Gradle or the Kotlin compiler. Syntax errors come directly from
+tree-sitter recovery nodes; semantic checks are still gated on a clean parse so ktlsp does not guess
+from a partial tree.
 
 The fast diagnostics deliberately do not report type mismatches, unresolved references, exhaustiveness
 errors, or full overload-resolution failures. Those require Kotlin compiler semantics; use the opt-in
@@ -308,9 +309,9 @@ Useful scenarios:
 
 - `basic` creates a disposable two-file Kotlin project and checks local + cross-file goto.
 - `features` runs the richer `dev/sample` smoke: references, completion, auto-import, hover,
-  document/workspace symbols, highlights, code actions, folding/selection ranges, semantic tokens,
-  inlay hints, member goto, rename, signature help, implementation/type-definition, call/type
-  hierarchy, workspace commands, and did-change reparse.
+  document/workspace symbols, highlights, syntax diagnostics, code actions, folding/selection
+  ranges, semantic tokens, inlay hints, member goto, rename, signature help,
+  implementation/type-definition, call/type hierarchy, workspace commands, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
   `kotlin-stdlib` and JDK sources.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.
