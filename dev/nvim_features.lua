@@ -49,6 +49,12 @@ check("advertises foldingRangeProvider", client and client.server_capabilities.f
 check("advertises selectionRangeProvider", client and client.server_capabilities.selectionRangeProvider ~= nil)
 check("advertises semanticTokensProvider", client and client.server_capabilities.semanticTokensProvider ~= nil)
 check("advertises inlayHintProvider", client and client.server_capabilities.inlayHintProvider ~= nil)
+check("advertises renameProvider", client and client.server_capabilities.renameProvider ~= nil)
+check("advertises signatureHelpProvider", client and client.server_capabilities.signatureHelpProvider ~= nil)
+check("advertises implementationProvider", client and client.server_capabilities.implementationProvider ~= nil)
+check("advertises typeDefinitionProvider", client and client.server_capabilities.typeDefinitionProvider ~= nil)
+check("advertises callHierarchyProvider", client and client.server_capabilities.callHierarchyProvider ~= nil)
+check("advertises executeCommandProvider", client and client.server_capabilities.executeCommandProvider ~= nil)
 
 -- locate (0-indexed) line/col of `token` on the buffer line containing `anchor`
 local function find(anchor, token)
@@ -73,6 +79,24 @@ local function request(method, params)
         res = v.result
         return true
       end
+    end
+    return false
+  end, 100)
+  return res
+end
+
+local function request_raw(method, params)
+  local res
+  vim.wait(4000, function()
+    if not client or not client.request_sync then
+      return false
+    end
+    local ok, r = pcall(function()
+      return client:request_sync(method, params, 1000, bufnr)
+    end)
+    if ok and r and r.result ~= nil then
+      res = r.result
+      return true
     end
     return false
   end, 100)
@@ -234,6 +258,124 @@ do
     end
   end
   check("inlayHint returns local type hint", has_type_hint, vim.inspect(hints))
+end
+
+-- ---- Expanded editor surface: rename, graph navigation, signature help, commands ----
+do
+  local n0 = vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, n0, n0, false, {
+    "",
+    "interface FeatureSurface",
+    "class FeatureImpl : FeatureSurface",
+    "fun addForSignature(a: Int, b: Int): Int = a + b",
+    "fun callSignature(): Int = addForSignature(1, 2)",
+  })
+  vim.wait(800)
+
+  local l, c = find("class FeatureImpl : FeatureSurface", "FeatureSurface")
+  check("found FeatureSurface supertype usage", l ~= nil)
+  if l then
+    local impls = request("textDocument/implementation", {
+      textDocument = { uri = uri },
+      position = { line = l, character = c },
+    })
+    local loc = impls and (impls[1] or impls)
+    check("implementation(FeatureSurface) returns FeatureImpl", loc ~= nil and loc.range ~= nil, vim.inspect(impls))
+
+    local type_params = {
+      textDocument = { uri = uri },
+      position = { line = l, character = c },
+    }
+    local types = request_raw("textDocument/prepareTypeHierarchy", type_params)
+    local item = types and types[1]
+    check("prepareTypeHierarchy returns FeatureSurface", item ~= nil and item.name == "FeatureSurface", vim.inspect(types))
+    if item then
+      local subtypes = request_raw("typeHierarchy/subtypes", { item = item })
+      local has_impl = false
+      for _, subtype in ipairs(subtypes or {}) do
+        if subtype.name == "FeatureImpl" then
+          has_impl = true
+          break
+        end
+      end
+      check("typeHierarchy/subtypes returns FeatureImpl", has_impl, vim.inspect(subtypes))
+    end
+  end
+
+  local gl, gc = find("println(g.greet())", "g")
+  check("found g for typeDefinition", gl ~= nil)
+  if gl then
+    local type_def = request("textDocument/typeDefinition", {
+      textDocument = { uri = uri },
+      position = { line = gl, character = gc },
+    })
+    local loc = type_def and (type_def[1] or type_def)
+    check("typeDefinition(g) returns Greeter", loc ~= nil and loc.uri ~= nil and loc.uri:match("Greeter%.kt$") ~= nil, loc and loc.uri)
+  end
+
+  local sl, sc = find("fun callSignature(): Int = addForSignature(1, 2)", "2")
+  check("found addForSignature call for signatureHelp", sl ~= nil)
+  if sl then
+    local sig = request("textDocument/signatureHelp", {
+      textDocument = { uri = uri },
+      position = { line = sl, character = sc },
+    })
+    local ok = sig ~= nil and sig.signatures ~= nil and sig.signatures[1] ~= nil and sig.signatures[1].label:find("addForSignature", 1, true) ~= nil
+    check("signatureHelp(addForSignature) returns signature", ok, vim.inspect(sig))
+  end
+
+  local rl, rc = find("fun callSignature(): Int = addForSignature(1, 2)", "addForSignature")
+  check("found addForSignature call for rename/hierarchy", rl ~= nil)
+  if rl then
+    local prepared = request("textDocument/prepareRename", {
+      textDocument = { uri = uri },
+      position = { line = rl, character = rc },
+    })
+    check("prepareRename(addForSignature) returns placeholder", prepared ~= nil and prepared.placeholder == "addForSignature", vim.inspect(prepared))
+
+    local renamed = request("textDocument/rename", {
+      textDocument = { uri = uri },
+      position = { line = rl, character = rc },
+      newName = "sumForSignature",
+    })
+    local changes = renamed and renamed.changes
+    local edit_count = 0
+    if changes then
+      for _, edits in pairs(changes) do
+        edit_count = edit_count + #edits
+      end
+    end
+    check("rename(addForSignature) returns workspace edit", edit_count >= 2, vim.inspect(renamed))
+
+    local prepared_calls = request("textDocument/prepareCallHierarchy", {
+      textDocument = { uri = uri },
+      position = { line = rl, character = rc },
+    })
+    local call_item = prepared_calls and prepared_calls[1]
+    check("prepareCallHierarchy returns addForSignature", call_item ~= nil and call_item.name == "addForSignature", vim.inspect(prepared_calls))
+    if call_item then
+      local incoming = request("callHierarchy/incomingCalls", { item = call_item })
+      local has_caller = false
+      for _, call in ipairs(incoming or {}) do
+        if call.from and call.from.name == "callSignature" then
+          has_caller = true
+          break
+        end
+      end
+      check("callHierarchy/incomingCalls returns caller", has_caller, vim.inspect(incoming))
+    end
+  end
+
+  local command_result = request("workspace/executeCommand", {
+    command = "ktlsp.explainResolution",
+    arguments = {
+      {
+        uri = uri,
+        position = { line = rl or 0, character = rc or 0 },
+      },
+    },
+  })
+  check("executeCommand explainResolution returns ok", command_result ~= nil and command_result.status == "ok", vim.inspect(command_result))
 end
 
 -- ---- S3: references on `helper` (declaration + the call in main) ----

@@ -12,6 +12,10 @@ use std::time::Duration;
 
 use tokio::sync::watch;
 use tower_lsp_server::jsonrpc::Result;
+use tower_lsp_server::ls_types::request::{
+    GotoImplementationParams, GotoImplementationResponse, GotoTypeDefinitionParams,
+    GotoTypeDefinitionResponse,
+};
 use tower_lsp_server::ls_types::*;
 use tower_lsp_server::{Client, LanguageServer};
 
@@ -19,6 +23,8 @@ use crate::compile::{self, CompileDiagnostic, CompileOutcome};
 use crate::complete::ShapedItem;
 use crate::daemon::DaemonCompiler;
 use crate::diagnostics::Severity;
+use crate::format::FormatterConfig;
+use crate::hierarchy::HierarchyItem;
 use crate::symbol::{Def, SymbolKind};
 use crate::text::LineIndex;
 use crate::workspace::Workspace;
@@ -66,6 +72,7 @@ pub struct Backend {
     /// Compile-diagnostics backend from `initialization_options.compile_diagnostics.backend`:
     /// `"kotlin-daemon"` uses the warm incremental sidecar; anything else (default) uses gradle.
     use_daemon: Mutex<bool>,
+    formatter: Mutex<Option<FormatterConfig>>,
 }
 
 impl Backend {
@@ -86,6 +93,7 @@ impl Backend {
             coverage_notified: Arc::new(Mutex::new(false)),
             progress_supported: Arc::new(Mutex::new(false)),
             use_daemon: Mutex::new(false),
+            formatter: Mutex::new(None),
         }
     }
 
@@ -422,6 +430,24 @@ fn use_daemon_from(opts: &Option<serde_json::Value>) -> bool {
         == Some("kotlin-daemon")
 }
 
+fn formatter_from(opts: &Option<serde_json::Value>) -> Option<FormatterConfig> {
+    let formatting = opts.as_ref()?.get("formatting")?;
+    let command = formatting.get("command")?.as_str()?.to_string();
+    if command.trim().is_empty() {
+        return None;
+    }
+    let args = formatting
+        .get("args")
+        .and_then(|args| args.as_array())
+        .map(|args| {
+            args.iter()
+                .filter_map(|arg| arg.as_str().map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(FormatterConfig { command, args })
+}
+
 impl LanguageServer for Backend {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         // Remember the workspace root so `initialized` can index it off the request path.
@@ -468,6 +494,8 @@ impl LanguageServer for Backend {
         *self.compile_enabled.lock().unwrap() =
             compile_enabled_from(&params.initialization_options);
         *self.use_daemon.lock().unwrap() = use_daemon_from(&params.initialization_options);
+        let formatter = formatter_from(&params.initialization_options);
+        *self.formatter.lock().unwrap() = formatter.clone();
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -488,10 +516,13 @@ impl LanguageServer for Backend {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                type_definition_provider: Some(TypeDefinitionProviderCapability::Simple(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
                 code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
                     code_action_kinds: Some(vec![
                         CodeActionKind::QUICKFIX,
+                        CodeActionKind::REFACTOR_REWRITE,
                         CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
                         CodeActionKind::SOURCE_FIX_ALL,
                         CodeActionKind::new("source.fixAll.ktlsp"),
@@ -502,8 +533,25 @@ impl LanguageServer for Backend {
                 document_highlight_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![",".to_string()]),
+                    work_done_progress_options: Default::default(),
+                }),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                rename_provider: Some(OneOf::Right(RenameOptions {
+                    prepare_provider: Some(true),
+                    work_done_progress_options: Default::default(),
+                })),
+                document_formatting_provider: formatter
+                    .as_ref()
+                    .map(|_| OneOf::Left(true)),
+                execute_command_provider: Some(ExecuteCommandOptions {
+                    commands: crate::commands::all(),
+                    work_done_progress_options: Default::default(),
+                }),
+                call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
                 semantic_tokens_provider: Some(
                     SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
                         work_done_progress_options: Default::default(),
@@ -522,7 +570,7 @@ impl LanguageServer for Backend {
                 // branch returns nothing in Stage A.
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string()]),
-                    resolve_provider: Some(false),
+                    resolve_provider: Some(true),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -653,6 +701,56 @@ impl LanguageServer for Backend {
         })
     }
 
+    async fn goto_type_definition(
+        &self,
+        params: GotoTypeDefinitionParams,
+    ) -> Result<Option<GotoTypeDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let locations = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            ws.type_definition(&key, offset)
+                .iter()
+                .filter_map(|d| def_to_location(&ws, d))
+                .collect::<Vec<_>>()
+        };
+        Ok(goto_type_response(locations))
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> Result<Option<GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let locations = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            ws.implementation(&key, offset)
+                .iter()
+                .filter_map(|d| def_to_location(&ws, d))
+                .collect::<Vec<_>>()
+        };
+        Ok(goto_implementation_response(locations))
+    }
+
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let start = std::time::Instant::now();
         let uri = params.text_document_position.text_document.uri;
@@ -688,6 +786,25 @@ impl LanguageServer for Backend {
             count,
         );
         Ok((!locations.is_empty()).then_some(locations))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let help = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            ws.signature_help(&key, offset).map(to_lsp_signature_help)
+        };
+        Ok(help)
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
@@ -736,6 +853,244 @@ impl LanguageServer for Backend {
             count,
         );
         Ok((count > 0).then_some(actions))
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let key = match uri_to_key(&params.text_document.uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let Some(config) = self.formatter.lock().unwrap().clone() else {
+            return Ok(None);
+        };
+        let text = {
+            let ws = self.ws.lock().unwrap();
+            match ws.doc_text(&key) {
+                Some(text) => text,
+                None => return Ok(None),
+            }
+        };
+        let edits = crate::format::format_document(&key, &text, &config)
+            .and_then(|edits| to_lsp_text_edits_for_text(&text, edits));
+        Ok(edits.filter(|edits| !edits.is_empty()))
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let pos = params.text_document_position.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let edit = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            ws.rename(&key, offset, &params.new_name)
+                .and_then(|edits| to_lsp_workspace_edit(&ws, edits))
+        };
+        Ok(edit)
+    }
+
+    async fn prepare_rename(
+        &self,
+        params: TextDocumentPositionParams,
+    ) -> Result<Option<PrepareRenameResponse>> {
+        let uri = params.text_document.uri;
+        let pos = params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let prepared = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let line_index = LineIndex::new(&text);
+            let offset = line_index.offset(&text, pos.line, pos.character);
+            ws.prepare_rename(&key, offset).and_then(|prepared| {
+                let target_text = ws.doc_text(&prepared.range.file)?;
+                let target_index = LineIndex::new(&target_text);
+                Some(PrepareRenameResponse::RangeWithPlaceholder {
+                    range: byte_range_to_lsp(
+                        &target_index,
+                        &target_text,
+                        prepared.range.start_byte,
+                        prepared.range.end_byte,
+                    ),
+                    placeholder: prepared.placeholder,
+                })
+            })
+        };
+        Ok(prepared)
+    }
+
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let items = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            ws.hierarchy_item_at(&key, offset)
+                .filter(|item| matches!(item.kind, SymbolKind::Function | SymbolKind::Property))
+                .and_then(|item| to_call_hierarchy_item(&ws, &item))
+                .map(|item| vec![item])
+        };
+        Ok(items)
+    }
+
+    async fn incoming_calls(
+        &self,
+        params: CallHierarchyIncomingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyIncomingCall>>> {
+        let Some(item) = from_call_hierarchy_item(&params.item) else {
+            return Ok(None);
+        };
+        let calls = {
+            let mut ws = self.ws.lock().unwrap();
+            ws.incoming_calls(&item)
+                .into_iter()
+                .filter_map(|call| to_lsp_incoming_call(&ws, call))
+                .collect::<Vec<_>>()
+        };
+        Ok((!calls.is_empty()).then_some(calls))
+    }
+
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let Some(item) = from_call_hierarchy_item(&params.item) else {
+            return Ok(None);
+        };
+        let calls = {
+            let mut ws = self.ws.lock().unwrap();
+            ws.outgoing_calls(&item)
+                .into_iter()
+                .filter_map(|call| to_lsp_outgoing_call(&ws, call))
+                .collect::<Vec<_>>()
+        };
+        Ok((!calls.is_empty()).then_some(calls))
+    }
+
+    async fn prepare_type_hierarchy(
+        &self,
+        params: TypeHierarchyPrepareParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let items = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            ws.hierarchy_item_at(&key, offset)
+                .filter(|item| item.kind.is_type_like())
+                .and_then(|item| to_type_hierarchy_item(&ws, &item))
+                .map(|item| vec![item])
+        };
+        Ok(items)
+    }
+
+    async fn supertypes(
+        &self,
+        params: TypeHierarchySupertypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let Some(item) = from_type_hierarchy_item(&params.item) else {
+            return Ok(None);
+        };
+        let items = {
+            let ws = self.ws.lock().unwrap();
+            ws.type_supertypes(&item)
+                .iter()
+                .filter_map(|item| to_type_hierarchy_item(&ws, item))
+                .collect::<Vec<_>>()
+        };
+        Ok((!items.is_empty()).then_some(items))
+    }
+
+    async fn subtypes(
+        &self,
+        params: TypeHierarchySubtypesParams,
+    ) -> Result<Option<Vec<TypeHierarchyItem>>> {
+        let Some(item) = from_type_hierarchy_item(&params.item) else {
+            return Ok(None);
+        };
+        let items = {
+            let ws = self.ws.lock().unwrap();
+            ws.type_subtypes(&item)
+                .iter()
+                .filter_map(|item| to_type_hierarchy_item(&ws, item))
+                .collect::<Vec<_>>()
+        };
+        Ok((!items.is_empty()).then_some(items))
+    }
+
+    async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<LSPAny>> {
+        match params.command.as_str() {
+            crate::commands::TRACE_PATH => Ok(crate::trace::log_path()
+                .map(|path| serde_json::Value::String(path.to_string_lossy().into_owned()))),
+            crate::commands::REINDEX => {
+                let Some(root) = self.root.lock().unwrap().clone() else {
+                    return Ok(Some(serde_json::json!({ "status": "no-root" })));
+                };
+                let count = self.ws.lock().unwrap().scan(&root);
+                Ok(Some(serde_json::json!({ "status": "ok", "indexedFiles": count })))
+            }
+            crate::commands::EXPLAIN_RESOLUTION | crate::commands::DUMP_SYMBOL => {
+                let Some((uri, position)) = command_uri_position(&params.arguments) else {
+                    return Ok(Some(serde_json::json!({ "status": "invalid-arguments" })));
+                };
+                let Some(key) = uri_to_key(&uri) else {
+                    return Ok(Some(serde_json::json!({ "status": "invalid-uri" })));
+                };
+                let result = {
+                    let mut ws = self.ws.lock().unwrap();
+                    let text = match ws.doc_text(&key) {
+                        Some(t) => t,
+                        None => return Ok(Some(serde_json::json!({ "status": "missing-document" }))),
+                    };
+                    let offset = LineIndex::new(&text).offset(&text, position.line, position.character);
+                    let symbol = crate::trace::ident_at(&text, offset);
+                    let targets = ws
+                        .goto_definition(&key, offset)
+                        .into_iter()
+                        .map(|d| format!("{}:{}..{}", d.file, d.start_byte, d.end_byte))
+                        .collect::<Vec<_>>();
+                    let status = if targets.is_empty() { "empty" } else { "ok" };
+                    serde_json::to_value(crate::commands::ResolutionExplanation {
+                        status,
+                        symbol,
+                        targets,
+                    })
+                    .unwrap_or_else(|_| serde_json::json!({ "status": "error" }))
+                };
+                Ok(Some(result))
+            }
+            _ => Ok(Some(serde_json::json!({ "status": "unknown-command" }))),
+        }
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
@@ -1096,6 +1451,10 @@ impl LanguageServer for Backend {
             CompletionResponse::List(CompletionList { is_incomplete, items })
         }))
     }
+
+    async fn completion_resolve(&self, params: CompletionItem) -> Result<CompletionItem> {
+        Ok(params)
+    }
 }
 
 #[allow(deprecated)]
@@ -1230,6 +1589,7 @@ fn action_kind_allowed(
 fn action_kind_str(kind: crate::actions::ActionKind) -> &'static str {
     match kind {
         crate::actions::ActionKind::QuickFix => "quickfix",
+        crate::actions::ActionKind::RefactorRewrite => "refactor.rewrite",
         crate::actions::ActionKind::SourceOrganizeImports => "source.organizeImports",
         crate::actions::ActionKind::SourceFixAllKtlsp => "source.fixAll.ktlsp",
     }
@@ -1254,6 +1614,7 @@ fn to_lsp_code_action(
 fn to_lsp_code_action_kind(kind: crate::actions::ActionKind) -> CodeActionKind {
     match kind {
         crate::actions::ActionKind::QuickFix => CodeActionKind::QUICKFIX,
+        crate::actions::ActionKind::RefactorRewrite => CodeActionKind::REFACTOR_REWRITE,
         crate::actions::ActionKind::SourceOrganizeImports => CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
         crate::actions::ActionKind::SourceFixAllKtlsp => CodeActionKind::new("source.fixAll.ktlsp"),
     }
@@ -1274,6 +1635,261 @@ fn to_lsp_workspace_edit(
         });
     }
     Some(WorkspaceEdit::new(changes))
+}
+
+fn to_lsp_text_edits_for_text(
+    text: &str,
+    edits: Vec<crate::edit::TextEdit>,
+) -> Option<Vec<TextEdit>> {
+    let line_index = LineIndex::new(text);
+    let mut out = Vec::new();
+    for edit in edits {
+        out.push(TextEdit {
+            range: byte_range_to_lsp(&line_index, text, edit.start_byte, edit.end_byte),
+            new_text: edit.new_text,
+        });
+    }
+    Some(out)
+}
+
+fn goto_type_response(locations: Vec<Location>) -> Option<GotoTypeDefinitionResponse> {
+    match locations.len() {
+        0 => None,
+        1 => Some(GotoTypeDefinitionResponse::Scalar(
+            locations.into_iter().next().unwrap(),
+        )),
+        _ => Some(GotoTypeDefinitionResponse::Array(locations)),
+    }
+}
+
+fn goto_implementation_response(locations: Vec<Location>) -> Option<GotoImplementationResponse> {
+    match locations.len() {
+        0 => None,
+        1 => Some(GotoImplementationResponse::Scalar(
+            locations.into_iter().next().unwrap(),
+        )),
+        _ => Some(GotoImplementationResponse::Array(locations)),
+    }
+}
+
+fn to_lsp_signature_help(help: crate::signature::SignatureHelp) -> SignatureHelp {
+    SignatureHelp {
+        signatures: help
+            .signatures
+            .into_iter()
+            .map(|sig| SignatureInformation {
+                label: sig.label,
+                documentation: None,
+                parameters: Some(
+                    sig.parameters
+                        .into_iter()
+                        .map(|label| ParameterInformation {
+                            label: ParameterLabel::Simple(label),
+                            documentation: None,
+                        })
+                        .collect(),
+                ),
+                active_parameter: None,
+            })
+            .collect(),
+        active_signature: Some(0),
+        active_parameter: help.active_parameter,
+    }
+}
+
+fn to_call_hierarchy_item(ws: &Workspace, item: &HierarchyItem) -> Option<CallHierarchyItem> {
+    let text = ws.doc_text(&item.file)?;
+    let line_index = LineIndex::new(&text);
+    let range = byte_range_to_lsp(&line_index, &text, item.start_byte, item.end_byte);
+    Some(CallHierarchyItem {
+        name: item.name.clone(),
+        kind: to_lsp_symbol_kind(item.kind),
+        tags: None,
+        detail: (!item.package.is_empty()).then(|| item.package.clone()),
+        uri: key_to_uri(&item.file)?,
+        range,
+        selection_range: range,
+        data: Some(serde_json::json!({
+            "file": item.file,
+            "start": item.start_byte,
+            "end": item.end_byte,
+            "name": item.name,
+            "kind": format!("{:?}", item.kind),
+            "package": item.package,
+        })),
+    })
+}
+
+fn from_call_hierarchy_item(item: &CallHierarchyItem) -> Option<HierarchyItem> {
+    if let Some(data) = &item.data {
+        if let Some(item) = hierarchy_item_from_data(data) {
+            return Some(item);
+        }
+    }
+    hierarchy_item_from_parts(
+        &item.uri,
+        &item.name,
+        item.kind,
+        item.detail.as_deref().unwrap_or(""),
+        item.selection_range,
+    )
+}
+
+fn to_type_hierarchy_item(ws: &Workspace, item: &HierarchyItem) -> Option<TypeHierarchyItem> {
+    let text = ws.doc_text(&item.file)?;
+    let line_index = LineIndex::new(&text);
+    let range = byte_range_to_lsp(&line_index, &text, item.start_byte, item.end_byte);
+    Some(TypeHierarchyItem {
+        name: item.name.clone(),
+        kind: to_lsp_symbol_kind(item.kind),
+        tags: None,
+        detail: (!item.package.is_empty()).then(|| item.package.clone()),
+        uri: key_to_uri(&item.file)?,
+        range,
+        selection_range: range,
+        data: Some(serde_json::json!({
+            "file": item.file,
+            "start": item.start_byte,
+            "end": item.end_byte,
+            "name": item.name,
+            "kind": format!("{:?}", item.kind),
+            "package": item.package,
+        })),
+    })
+}
+
+fn from_type_hierarchy_item(item: &TypeHierarchyItem) -> Option<HierarchyItem> {
+    if let Some(data) = &item.data {
+        if let Some(item) = hierarchy_item_from_data(data) {
+            return Some(item);
+        }
+    }
+    hierarchy_item_from_parts(
+        &item.uri,
+        &item.name,
+        item.kind,
+        item.detail.as_deref().unwrap_or(""),
+        item.selection_range,
+    )
+}
+
+fn hierarchy_item_from_parts(
+    uri: &Uri,
+    name: &str,
+    kind: tower_lsp_server::ls_types::SymbolKind,
+    package: &str,
+    selection_range: Range,
+) -> Option<HierarchyItem> {
+    let file = uri_to_key(uri)?;
+    let text = std::fs::read_to_string(&file).ok();
+    let (start_byte, end_byte) = if let Some(text) = text {
+        let line_index = LineIndex::new(&text);
+        (
+            line_index.offset(
+                &text,
+                selection_range.start.line,
+                selection_range.start.character,
+            ),
+            line_index.offset(&text, selection_range.end.line, selection_range.end.character),
+        )
+    } else {
+        (0, 0)
+    };
+    Some(HierarchyItem {
+        name: name.to_string(),
+        kind: from_lsp_symbol_kind(kind),
+        package: package.to_string(),
+        file,
+        start_byte,
+        end_byte,
+    })
+}
+
+fn hierarchy_item_from_data(data: &serde_json::Value) -> Option<HierarchyItem> {
+    let file = data.get("file")?.as_str()?.to_string();
+    let name = data.get("name")?.as_str()?.to_string();
+    let package = data.get("package").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let start_byte = data.get("start")?.as_u64()? as usize;
+    let end_byte = data.get("end")?.as_u64()? as usize;
+    let kind = match data.get("kind").and_then(|v| v.as_str()).unwrap_or("") {
+        "Class" => SymbolKind::Class,
+        "Interface" => SymbolKind::Interface,
+        "Object" => SymbolKind::Object,
+        "EnumClass" => SymbolKind::EnumClass,
+        "EnumEntry" => SymbolKind::EnumEntry,
+        "Function" => SymbolKind::Function,
+        "Property" => SymbolKind::Property,
+        "Parameter" => SymbolKind::Parameter,
+        "TypeParameter" => SymbolKind::TypeParameter,
+        _ => SymbolKind::LocalVariable,
+    };
+    Some(HierarchyItem {
+        name,
+        kind,
+        package,
+        file,
+        start_byte,
+        end_byte,
+    })
+}
+
+fn from_lsp_symbol_kind(kind: tower_lsp_server::ls_types::SymbolKind) -> SymbolKind {
+    match kind {
+        tower_lsp_server::ls_types::SymbolKind::CLASS => SymbolKind::Class,
+        tower_lsp_server::ls_types::SymbolKind::INTERFACE => SymbolKind::Interface,
+        tower_lsp_server::ls_types::SymbolKind::OBJECT => SymbolKind::Object,
+        tower_lsp_server::ls_types::SymbolKind::ENUM => SymbolKind::EnumClass,
+        tower_lsp_server::ls_types::SymbolKind::ENUM_MEMBER => SymbolKind::EnumEntry,
+        tower_lsp_server::ls_types::SymbolKind::FUNCTION => SymbolKind::Function,
+        tower_lsp_server::ls_types::SymbolKind::PROPERTY => SymbolKind::Property,
+        tower_lsp_server::ls_types::SymbolKind::TYPE_PARAMETER => SymbolKind::TypeParameter,
+        _ => SymbolKind::LocalVariable,
+    }
+}
+
+fn to_lsp_incoming_call(
+    ws: &Workspace,
+    call: crate::hierarchy::IncomingCall,
+) -> Option<CallHierarchyIncomingCall> {
+    Some(CallHierarchyIncomingCall {
+        from: to_call_hierarchy_item(ws, &call.from)?,
+        from_ranges: defs_to_ranges(ws, call.ranges)?,
+    })
+}
+
+fn to_lsp_outgoing_call(
+    ws: &Workspace,
+    call: crate::hierarchy::OutgoingCall,
+) -> Option<CallHierarchyOutgoingCall> {
+    Some(CallHierarchyOutgoingCall {
+        to: to_call_hierarchy_item(ws, &call.to)?,
+        from_ranges: defs_to_ranges(ws, call.ranges)?,
+    })
+}
+
+fn defs_to_ranges(ws: &Workspace, defs: Vec<Def>) -> Option<Vec<Range>> {
+    let mut out = Vec::new();
+    for def in defs {
+        let text = ws.doc_text(&def.file)?;
+        let line_index = LineIndex::new(&text);
+        out.push(byte_range_to_lsp(
+            &line_index,
+            &text,
+            def.start_byte,
+            def.end_byte,
+        ));
+    }
+    Some(out)
+}
+
+fn command_uri_position(args: &[serde_json::Value]) -> Option<(Uri, Position)> {
+    let first = args.first()?;
+    let uri = first
+        .get("uri")
+        .and_then(|v| v.as_str())
+        .or_else(|| first.get("textDocument").and_then(|td| td.get("uri")).and_then(|v| v.as_str()))?;
+    let position = first.get("position")?.clone();
+    Some((uri.parse().ok()?, serde_json::from_value(position).ok()?))
 }
 
 fn semantic_tokens_legend() -> SemanticTokensLegend {

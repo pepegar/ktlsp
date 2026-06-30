@@ -1,9 +1,10 @@
 # ktlsp
 
 A small, fast Kotlin language server written in Rust. **Goto-definition**, **find-references**,
-completion, passive symbol intelligence, editor range features, and safe import actions across both
-your own code and your library dependencies. No JVM, no Gradle, no waiting for the compiler-free
-path — goto is sub-millisecond and startup reuses a persistent symbol cache.
+completion, passive symbol intelligence, editor range features, safe import actions, rename,
+signature help, and navigation graph features across both your own code and your library
+dependencies. No JVM, no Gradle, no waiting for the compiler-free path — goto is sub-millisecond and
+startup reuses a persistent symbol cache.
 
 It is built on [tree-sitter](https://tree-sitter.github.io/) for parsing and
 [tower-lsp-server](https://github.com/tower-lsp-community/tower-lsp-server) for the LSP plumbing,
@@ -12,8 +13,9 @@ unreliable for your workflow.
 
 > Status: **goto-definition, find-references, completion, hover, document/workspace symbols,
 > document highlights, semantic tokens, inlay hints, folding/selection ranges, and import code
-> actions** across your own code **and your library dependencies** where the underlying index has
-> facts. Rename/refactorings and hierarchy/signature features are next-stage work.
+> actions, rename, simple refactor rewrites, implementation/type-definition, call/type hierarchy,
+> signature help, workspace commands, and optional external formatting** where the underlying index
+> has facts. Results are conservative: ktlsp returns no result instead of guessing.
 
 ## Performance
 
@@ -120,6 +122,33 @@ index of identifier usages in project files and re-resolves each candidate again
 definition, so results are at the same best-effort precision as goto (a shadowed homonym in another
 scope is excluded). The declaration itself is included when the client asks. Rename and call
 hierarchy are natural follow-ons on the same index.
+
+## Editing and navigation surface
+
+ktlsp also exposes the index through standard editor features:
+
+- `textDocument/rename` and `textDocument/prepareRename` for project/local symbols. Library symbols,
+  invalid Kotlin identifiers, unresolved names, and very broad reference sets are declined.
+- Refactor code actions for simple function-body rewrites: expression body to block body and simple
+  `return` block body to expression body.
+- `textDocument/implementation`, `textDocument/typeDefinition`, call hierarchy, and type hierarchy
+  from indexed supertypes, references, and existing type inference.
+- `textDocument/signatureHelp` for explicit function signatures already present in the index.
+- `workspace/executeCommand` commands: `ktlsp.reindex`, `ktlsp.tracePath`,
+  `ktlsp.explainResolution`, and `ktlsp.dumpSymbol`.
+
+Document formatting is opt-in because it runs an external command. Configure it through
+`initializationOptions`; ktlsp sends the current document on stdin and expects the formatted document
+on stdout:
+
+```lua
+vim.lsp.start({
+  name = "ktlsp", cmd = { "ktlsp" }, root_dir = root,
+  init_options = {
+    formatting = { command = "ktfmt", args = { "--stdin" } },
+  },
+})
+```
 
 ## Fast diagnostics
 
@@ -277,7 +306,8 @@ Useful scenarios:
 - `basic` creates a disposable two-file Kotlin project and checks local + cross-file goto.
 - `features` runs the richer `dev/sample` smoke: references, completion, auto-import, hover,
   document/workspace symbols, highlights, code actions, folding/selection ranges, semantic tokens,
-  inlay hints, member goto, and did-change reparse.
+  inlay hints, member goto, rename, signature help, implementation/type-definition, call/type
+  hierarchy, workspace commands, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
   `kotlin-stdlib` sources.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.

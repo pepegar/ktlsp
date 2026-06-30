@@ -72,6 +72,27 @@ async fn initialize_open_and_goto_definition() {
         init.capabilities.inlay_hint_provider.is_some(),
         "server must advertise inlay hint support"
     );
+    assert!(init.capabilities.rename_provider.is_some(), "server must advertise rename support");
+    assert!(
+        init.capabilities.signature_help_provider.is_some(),
+        "server must advertise signature help support"
+    );
+    assert!(
+        init.capabilities.implementation_provider.is_some(),
+        "server must advertise implementation support"
+    );
+    assert!(
+        init.capabilities.type_definition_provider.is_some(),
+        "server must advertise type definition support"
+    );
+    assert!(
+        init.capabilities.call_hierarchy_provider.is_some(),
+        "server must advertise call hierarchy support"
+    );
+    assert!(
+        init.capabilities.execute_command_provider.is_some(),
+        "server must advertise workspace command support"
+    );
     // and completion support with a `.` trigger character
     let completion = init
         .capabilities
@@ -85,6 +106,7 @@ async fn initialize_open_and_goto_definition() {
             .is_some_and(|chars| chars.iter().any(|c| c == ".")),
         "completion trigger characters must include `.`"
     );
+    assert_eq!(completion.resolve_provider, Some(true));
     backend.initialized(InitializedParams {}).await;
 
     // open a document
@@ -567,6 +589,211 @@ async fn completion_auto_import_edit() {
         .expect("auto-import additionalTextEdits present");
     assert!(edits[0].new_text.starts_with("import "), "edit must insert an import: {edits:?}");
     assert!(edits[0].new_text.contains("lib.HelperXyz"));
+
+    assert!(backend.shutdown().await.is_ok());
+}
+
+#[tokio::test]
+async fn expanded_editor_surface_requests_round_trip() {
+    let (service, _socket) = LspService::new(Backend::new);
+    let backend = service.inner();
+
+    let mut init_params = snippet_capable_params();
+    init_params.initialization_options = Some(serde_json::json!({
+        "formatting": { "command": "/bin/cat", "args": [] }
+    }));
+    let init = backend.initialize(init_params).await.unwrap();
+    assert!(
+        init.capabilities.document_formatting_provider.is_some(),
+        "formatting capability should be advertised when configured"
+    );
+    backend.initialized(InitializedParams {}).await;
+
+    let uri: Uri = "file:///tmp/ktlsp_e2e/Expanded.kt".parse().unwrap();
+    let text = "package app\n\
+                interface Greeter\n\
+                class ConsoleGreeter : Greeter\n\
+                fun add(a: Int, b: Int): Int = a + b\n\
+                fun caller(): Int = add(1, 2)\n\
+                fun main() {\n\
+                \x20\x20\x20\x20val g = ConsoleGreeter()\n\
+                \x20\x20\x20\x20println(g)\n\
+                }\n";
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: uri.clone(),
+                language_id: "kotlin".into(),
+                version: 1,
+                text: text.into(),
+            },
+        })
+        .await;
+
+    let greeter_line = text.lines().position(|line| line.contains("interface Greeter")).unwrap() as u32;
+    let greeter_col = text.lines().nth(greeter_line as usize).unwrap().find("Greeter").unwrap() as u32;
+    let implementation = backend
+        .goto_implementation(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: greeter_line, character: greeter_col },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("implementation should resolve");
+    match implementation {
+        GotoDefinitionResponse::Scalar(loc) => assert_eq!(loc.range.start.line, 2),
+        other => panic!("expected scalar implementation response: {other:?}"),
+    }
+
+    let g_line = text.lines().position(|line| line.contains("println(g)")).unwrap() as u32;
+    let g_col = text.lines().nth(g_line as usize).unwrap().find("g)").unwrap() as u32;
+    let type_def = backend
+        .goto_type_definition(GotoDefinitionParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: g_line, character: g_col },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("type definition should resolve");
+    match type_def {
+        GotoDefinitionResponse::Scalar(loc) => assert_eq!(loc.range.start.line, 2),
+        other => panic!("expected scalar type-definition response: {other:?}"),
+    }
+
+    let call_line = text.lines().position(|line| line.contains("add(1, 2)")).unwrap() as u32;
+    let call_col = text.lines().nth(call_line as usize).unwrap().find("2)").unwrap() as u32;
+    let sig = backend
+        .signature_help(SignatureHelpParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: call_line, character: call_col },
+            },
+            context: None,
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("signature help should resolve");
+    assert_eq!(sig.active_parameter, Some(1));
+    assert!(sig.signatures.iter().any(|s| s.label.contains("add(")), "{sig:?}");
+
+    let prepared = backend
+        .prepare_rename(TextDocumentPositionParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            position: Position { line: call_line, character: text.lines().nth(call_line as usize).unwrap().find("add").unwrap() as u32 },
+        })
+        .await
+        .unwrap()
+        .expect("prepare rename should resolve");
+    match prepared {
+        PrepareRenameResponse::RangeWithPlaceholder { placeholder, .. } => assert_eq!(placeholder, "add"),
+        other => panic!("expected placeholder prepare rename response: {other:?}"),
+    }
+
+    let rename = backend
+        .rename(RenameParams {
+            text_document_position: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: call_line, character: text.lines().nth(call_line as usize).unwrap().find("add").unwrap() as u32 },
+            },
+            new_name: "sum".into(),
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("rename should produce a workspace edit");
+    assert!(
+        rename
+            .changes
+            .as_ref()
+            .and_then(|changes| changes.get(&uri))
+            .is_some_and(|edits| edits.len() >= 2),
+        "rename should edit declaration and call: {rename:?}"
+    );
+
+    let call_items = backend
+        .prepare_call_hierarchy(CallHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 3, character: "fun ".len() as u32 },
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("call hierarchy item should resolve");
+    assert_eq!(call_items[0].name, "add");
+    let incoming = backend
+        .incoming_calls(CallHierarchyIncomingCallsParams {
+            item: call_items[0].clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("incoming calls should resolve");
+    assert!(incoming.iter().any(|call| call.from.name == "caller"), "{incoming:?}");
+
+    let type_items = backend
+        .prepare_type_hierarchy(TypeHierarchyPrepareParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 1, character: greeter_col },
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("type hierarchy item should resolve");
+    let subtypes = backend
+        .subtypes(TypeHierarchySubtypesParams {
+            item: type_items[0].clone(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("subtypes should resolve");
+    assert!(subtypes.iter().any(|item| item.name == "ConsoleGreeter"), "{subtypes:?}");
+
+    let command = backend
+        .execute_command(ExecuteCommandParams {
+            command: "ktlsp.explainResolution".into(),
+            arguments: vec![serde_json::json!({
+                "uri": uri.as_str(),
+                "position": { "line": call_line, "character": text.lines().nth(call_line as usize).unwrap().find("add").unwrap() }
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("command should return a value");
+    assert_eq!(command.get("status").and_then(|v| v.as_str()), Some("ok"));
+
+    let formatting = backend
+        .formatting(DocumentFormattingParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            options: FormattingOptions {
+                tab_size: 4,
+                insert_spaces: true,
+                properties: Default::default(),
+                trim_trailing_whitespace: None,
+                insert_final_newline: None,
+                trim_final_newlines: None,
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    assert!(formatting.is_none(), "cat formatter should produce no edits");
 
     assert!(backend.shutdown().await.is_ok());
 }

@@ -1,7 +1,7 @@
 ---
 title: "feat: Expand LSP editor surface"
 type: feat
-status: active
+status: completed
 date: 2026-06-29
 origin: docs/ideation/2026-06-29-lsp-bells-and-whistles-ideation.md
 ---
@@ -393,7 +393,7 @@ standard LSP requests.
 - Completion auto-import behavior remains unchanged because both paths use shared import helpers.
 - Code actions are absent for uncertain parse states or ambiguous import candidates.
 
-- [ ] **Unit 5: Rename and first refactorings**
+- [x] **Unit 5: Rename and first refactorings**
 
 **Goal:** Add exact rename support and an initial set of structural refactorings that produce safe
 byte edits.
@@ -454,7 +454,7 @@ byte edits.
 - Rename never edits a file outside the project reverse-reference index.
 - Refactor code actions are absent unless their AST preconditions are met.
 
-- [ ] **Unit 6: Navigation graph features**
+- [x] **Unit 6: Navigation graph features**
 
 **Goal:** Add implementation/type-definition navigation and hierarchy requests using indexed
 relationships and references.
@@ -510,7 +510,7 @@ relationships and references.
 - Ambiguous package/type relationships produce no result or multiple explicit results, never a
   fabricated single target.
 
-- [ ] **Unit 7: Signature help and completion resolve**
+- [x] **Unit 7: Signature help and completion resolve**
 
 **Goal:** Add call-site signature help and optional completion item resolution using explicit
 declaration signatures already present in the index.
@@ -565,7 +565,7 @@ declaration signatures already present in the index.
 - Signature help never requires running Gradle or the Kotlin compiler.
 - Completion remains fast and capped.
 
-- [ ] **Unit 8: Formatting, commands, documentation, and editor canaries**
+- [x] **Unit 8: Formatting, commands, documentation, and editor canaries**
 
 **Goal:** Add the remaining operational polish: optional external formatting, workspace commands,
 documented settings, and real-editor smoke coverage for the expanded LSP surface.

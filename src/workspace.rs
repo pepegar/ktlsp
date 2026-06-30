@@ -10,6 +10,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::actions::{self, Action};
 use crate::complete::{self, ScopeCompletion, ShapedCompletions};
+use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
 use crate::index::{Entry, Index, RefEntry, Tier};
 use crate::indexer::{extract_symbols, extract_usages};
 use crate::infer;
@@ -332,6 +333,148 @@ impl Workspace {
         crate::hints::inlay_hints(&self.index, &tree, &text, start_byte, end_byte)
     }
 
+    /// `textDocument/prepareRename`: exact range + current spelling for project/local symbols.
+    pub fn prepare_rename(&mut self, key: &str, offset: usize) -> Option<crate::rename::PreparedRename> {
+        let target = self.rename_target(key, offset)?;
+        let text = self.doc_text(&target.file)?;
+        let placeholder = text.get(target.start_byte..target.end_byte)?.to_string();
+        Some(crate::rename::PreparedRename {
+            range: target,
+            placeholder,
+        })
+    }
+
+    /// `textDocument/rename`: exact reference edits for project/local symbols.
+    pub fn rename(&mut self, key: &str, offset: usize, new_name: &str) -> Option<Vec<crate::edit::TextEdit>> {
+        if !crate::rename::is_valid_identifier(new_name) {
+            return None;
+        }
+        let target = self.rename_target(key, offset)?;
+        let name = self.name_at(key, offset)?;
+        if self.index.lookup_refs(&name).len() > RENAME_REF_CAP {
+            return None;
+        }
+        let refs = self.references(key, offset, true);
+        if refs.is_empty() || !refs.iter().any(|r| *r == target) {
+            return None;
+        }
+        let edits = crate::rename::edits_for_refs(refs, new_name);
+        crate::edit::validate_non_overlapping(&edits).ok()?;
+        Some(edits)
+    }
+
+    fn rename_target(&mut self, key: &str, offset: usize) -> Option<Def> {
+        let target = self.goto_definition(key, offset).into_iter().next()?;
+        if self.is_library_def(&target) {
+            return None;
+        }
+        let text = self.doc_text(key)?;
+        let parsed;
+        let (doc_text, tree): (&str, &Tree) = match self.open_docs.get(key) {
+            Some(doc) => (&doc.text, &doc.tree),
+            None => {
+                parsed = (self.parser.parse(&text), text);
+                (&parsed.1, &parsed.0)
+            }
+        };
+        let ident = identifier_at(tree, offset)?;
+        if has_ancestor_kind(ident, &["import", "package_header"]) || node_text(ident, doc_text).is_empty() {
+            return None;
+        }
+        Some(target)
+    }
+
+    fn is_library_def(&self, def: &Def) -> bool {
+        self.index
+            .entries_for_file(&def.file)
+            .into_iter()
+            .find(|entry| entry.sym.start_byte == def.start_byte && entry.sym.end_byte == def.end_byte)
+            .is_some_and(|entry| entry.tier == Tier::Durable)
+    }
+
+    pub fn implementation(&mut self, key: &str, offset: usize) -> Vec<Def> {
+        let Some(item) = self.hierarchy_item_at(key, offset) else {
+            return Vec::new();
+        };
+        hierarchy::type_implementations(&self.index, &item)
+    }
+
+    pub fn type_definition(&mut self, key: &str, offset: usize) -> Vec<Def> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return hierarchy::type_definition(&self.index, &doc.tree, &doc.text, offset);
+        }
+        let text = match self.doc_text(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        hierarchy::type_definition(&self.index, &tree, &text, offset)
+    }
+
+    pub fn hierarchy_item_at(&mut self, key: &str, offset: usize) -> Option<HierarchyItem> {
+        let target = self.goto_definition(key, offset).into_iter().next()?;
+        hierarchy::entry_for_name_range(&self.index, &target.file, target.start_byte, target.end_byte)
+            .map(|entry| hierarchy::item_from_entry(&entry))
+    }
+
+    pub fn type_supertypes(&self, item: &HierarchyItem) -> Vec<HierarchyItem> {
+        hierarchy::supertypes(&self.index, item)
+    }
+
+    pub fn type_subtypes(&self, item: &HierarchyItem) -> Vec<HierarchyItem> {
+        hierarchy::subtypes(&self.index, item)
+    }
+
+    pub fn incoming_calls(&mut self, item: &HierarchyItem) -> Vec<IncomingCall> {
+        let refs = self.references(&item.file, item.start_byte, true);
+        let mut parser = KotlinParser::new();
+        hierarchy::incoming_calls(&self.index, item, refs, |path| {
+            let text = self.doc_text(path)?;
+            let tree = parser.parse(&text);
+            Some((text, tree))
+        })
+    }
+
+    pub fn outgoing_calls(&mut self, item: &HierarchyItem) -> Vec<OutgoingCall> {
+        if let Some(doc) = self.open_docs.get(&item.file) {
+            return hierarchy::outgoing_calls(&self.index, &item.file, &doc.tree, &doc.text, item);
+        }
+        let text = match self.doc_text(&item.file) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        hierarchy::outgoing_calls(&self.index, &item.file, &tree, &text, item)
+    }
+
+    pub fn signature_help(&mut self, key: &str, offset: usize) -> Option<crate::signature::SignatureHelp> {
+        let text = self.doc_text(key)?;
+        let parsed;
+        let (doc_text, tree): (&str, &Tree) = match self.open_docs.get(key) {
+            Some(doc) => (&doc.text, &doc.tree),
+            None => {
+                parsed = (self.parser.parse(&text), text);
+                (&parsed.1, &parsed.0)
+            }
+        };
+        let (callee, name, active_parameter) = crate::signature::call_at(tree, doc_text, offset)?;
+        let defs = resolve::goto(&self.index, key, doc_text, tree, callee.start_byte());
+        let mut entries = defs
+            .into_iter()
+            .filter_map(|def| hierarchy::entry_for_name_range(&self.index, &def.file, def.start_byte, def.end_byte))
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
+            entries = self
+                .index
+                .lookup_by_name(&name)
+                .iter()
+                .filter(|entry| entry.sym.kind == SymbolKind::Function)
+                .cloned()
+                .collect();
+        }
+        crate::signature::signatures_for_entries(entries, active_parameter)
+    }
+
     /// Stage B assembly: member completion after a dot. Receiver-type inference reuses the S6
     /// machinery; the trailing-dot parse collapse is handled by splicing a synthetic placeholder
     /// selector in at the cursor and reparsing (the partial-selector text becomes the prefix).
@@ -609,6 +752,12 @@ impl Workspace {
         if let Some(action) = actions::organize_imports_action(key, text, tree) {
             out.push(action);
         }
+        out.extend(crate::refactor::function_rewrite_actions(
+            key,
+            text,
+            tree,
+            cursor_offset,
+        ));
         if unresolved {
             if let Some((name, fqn)) = self.unambiguous_import_candidate(key, text, tree, cursor_offset) {
                 if let Some(action) = actions::add_import_action(key, text, tree, &name, &fqn) {
@@ -768,6 +917,8 @@ impl Workspace {
 /// enough that a common prefix rarely truncates useful names; editors re-request as the prefix
 /// narrows. Equals `complete::RESULT_CAP` (the post-ranking cap), so assembly never starves shaping.
 const MAX_COMPLETIONS: usize = complete::RESULT_CAP;
+
+const RENAME_REF_CAP: usize = 5000;
 
 /// Depth cap on the supertype walk for member assembly: guards a pathologically deep (or cyclic,
 /// alongside the visited set) chain. Mirrors `complete::assemble_members`' cap.
