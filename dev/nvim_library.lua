@@ -2,8 +2,8 @@
 -- Headless Neovim test for *library* goto-definition.
 --
 -- Drives the real ktlsp server against a project (arg[1]) whose `gradle/libs.versions.toml`
--- declares kotlin-stdlib, and asserts that goto on a `listOf(...)` call jumps into the indexed
--- kotlin-stdlib source. Run via dev/smoke_library.sh (which sets up the temp project).
+-- declares kotlin-stdlib, and asserts that goto on `listOf(...)` and `java.sql.Connection` jumps
+-- into indexed stdlib/JDK source. Run via dev/smoke_library.sh (which sets up the temp project).
 --
 --     nvim -l dev/nvim_library.lua <project-dir>
 
@@ -27,45 +27,72 @@ vim.wait(8000, function()
   return c ~= nil and (c.initialized == true or (c.server_capabilities and c.server_capabilities.definitionProvider))
 end, 50)
 
--- Locate the `listOf` call site.
-local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
-local line, col
-for i, text in ipairs(lines) do
-  local s = text:find("listOf", 1, true)
-  if s then
-    line, col = i - 1, s - 1
-    break
-  end
-end
-assert(line, "no `listOf` usage found in Main.kt")
-
--- Poll for the result: dependency indexing runs asynchronously after `initialize` (it may need to
--- download + extract + parse the stdlib sources), so retry until it warms up.
-local params = { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }
-local loc
-for _ = 1, 250 do
-  local r = vim.lsp.buf_request_sync(bufnr, "textDocument/definition", params, 1000) or {}
-  for _, v in pairs(r) do
-    if v.result and (v.result.uri or v.result[1]) then
-      loc = v.result
-      if loc[1] then
-        loc = loc[1]
+local function find_token(token, occurrence)
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local seen = 0
+  for i, text in ipairs(lines) do
+    local start = 1
+    while true do
+      local s = text:find(token, start, true)
+      if not s then
+        break
       end
-      break
+      seen = seen + 1
+      if seen == occurrence then
+        return i - 1, s - 1
+      end
+      start = s + #token
     end
   end
-  if loc then
-    break
-  end
-  vim.wait(200)
+  error(("no `%s` occurrence %d found in Main.kt"):format(token, occurrence))
 end
 
-if loc and loc.uri:match("kotlin%-stdlib") and loc.uri:match("%.kt$") then
-  local short = loc.uri:gsub("^.*/%.cache/ktlsp/extracted/", "…/")
-  print(("PASS  goto listOf -> %s:%d"):format(short, loc.range.start.line))
+local function definition_for(token, occurrence)
+  local line, col = find_token(token, occurrence)
+  local params = { textDocument = { uri = vim.uri_from_bufnr(bufnr) }, position = { line = line, character = col } }
+  local loc
+  -- Dependency and JDK indexing run asynchronously after `initialize`, so retry until warm.
+  for _ = 1, 250 do
+    local r = vim.lsp.buf_request_sync(bufnr, "textDocument/definition", params, 1000) or {}
+    for _, v in pairs(r) do
+      if v.result and (v.result.uri or v.result[1]) then
+        loc = v.result
+        if loc[1] then
+          loc = loc[1]
+        end
+        break
+      end
+    end
+    if loc then
+      break
+    end
+    vim.wait(200)
+  end
+  return loc
+end
+
+local function check_definition(desc, token, occurrence, predicate)
+  local loc = definition_for(token, occurrence)
+  if loc and predicate(loc) then
+    local short = loc.uri:gsub("^.*/ktlsp%-harness/", ".../ktlsp-harness/")
+    print(("PASS  %s -> %s:%d"):format(desc, short, loc.range.start.line))
+    return true
+  end
+  print(("FAIL  %s -> %s"):format(desc, vim.inspect(loc)))
+  return false
+end
+
+local ok = true
+ok = check_definition("goto listOf", "listOf", 1, function(loc)
+  return loc.uri:match("kotlin%-stdlib") and loc.uri:match("%.kt$")
+end) and ok
+ok = check_definition("goto java.sql.Connection", "Connection", 3, function(loc)
+  return loc.uri:match("Connection%.java$")
+end) and ok
+
+if ok then
   os.exit(0)
 else
-  print("FAIL  goto listOf -> " .. vim.inspect(loc))
   print("(LSP log under: " .. vim.fn.stdpath("log") .. "/lsp.log)")
   os.exit(1)
 end

@@ -167,9 +167,15 @@ TOML
   cat > "$project/Main.kt" <<'KOTLIN'
 package app
 
+import java.sql.Connection
+
 fun main() {
     val xs = listOf(1, 2, 3)
     println(xs)
+}
+
+fun useConnection(connection: Connection) {
+    connection.close()
 }
 KOTLIN
   printf '%s\n' "$project"

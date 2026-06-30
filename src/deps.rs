@@ -13,6 +13,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -144,6 +145,7 @@ pub fn is_gradle_project(root: &Path) -> bool {
 }
 
 pub const CACHE_DIR_ENV: &str = "KTLSP_CACHE_DIR";
+pub const JDK_SRC_ENV: &str = "KTLSP_JDK_SRC";
 
 /// ktlsp's cache root (`KTLSP_CACHE_DIR`, `~/.cache/ktlsp`, or under the temp dir if HOME is unset).
 pub fn cache_home() -> PathBuf {
@@ -163,6 +165,85 @@ fn cache_home_from(cache_dir: Option<OsString>, home: Option<OsString>) -> PathB
 /// Where extracted library sources live (the goto targets).
 pub fn extract_root() -> PathBuf {
     cache_home().join("extracted")
+}
+
+/// Locate the current JDK's `src.zip`, if available. `KTLSP_JDK_SRC` is an explicit override for
+/// scripted tests or unusual installations; otherwise try `JAVA_HOME`, macOS' `java_home`, then
+/// common JDK install directories.
+pub fn jdk_src_zip() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(JDK_SRC_ENV).and_then(existing_src_zip) {
+        return Some(path);
+    }
+    if let Some(path) = std::env::var_os("JAVA_HOME")
+        .map(PathBuf::from)
+        .and_then(src_zip_for_home)
+    {
+        return Some(path);
+    }
+    if let Some(path) = macos_java_home_src_zip() {
+        return Some(path);
+    }
+    common_jdk_src_zip()
+}
+
+fn existing_src_zip(path: OsString) -> Option<PathBuf> {
+    let path = PathBuf::from(path);
+    path.is_file().then_some(path)
+}
+
+fn src_zip_for_home(home: PathBuf) -> Option<PathBuf> {
+    let candidates = [home.join("lib/src.zip"), home.join("src.zip")];
+    candidates.into_iter().find(|p| p.is_file())
+}
+
+fn macos_java_home_src_zip() -> Option<PathBuf> {
+    let tool = Path::new("/usr/libexec/java_home");
+    if !tool.is_file() {
+        return None;
+    }
+    let output = Command::new(tool).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let home = String::from_utf8(output.stdout).ok()?;
+    src_zip_for_home(PathBuf::from(home.trim()))
+}
+
+fn common_jdk_src_zip() -> Option<PathBuf> {
+    let mut roots = vec![
+        PathBuf::from("/Library/Java/JavaVirtualMachines"),
+        PathBuf::from("/usr/lib/jvm"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        roots.push(PathBuf::from(home).join("Library/Java/JavaVirtualMachines"));
+    }
+    for root in roots {
+        if let Some(path) = find_src_zip_under(&root) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn find_src_zip_under(root: &Path) -> Option<PathBuf> {
+    let mut entries: Vec<PathBuf> = fs::read_dir(root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .collect();
+    entries.sort();
+    for entry in entries {
+        for candidate in [
+            entry.join("Contents/Home/lib/src.zip"),
+            entry.join("lib/src.zip"),
+            entry.join("src.zip"),
+        ] {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
 }
 
 /// Where serialized per-jar symbol tables live.
@@ -308,6 +389,37 @@ pub fn resolve_coordinate(
     }
 
     parse_dir(&dest, kotlin, java)
+}
+
+/// Resolve the local JDK `src.zip` into indexed Java symbols. JDK sources are not Maven
+/// dependencies, but imported JDK types (`java.sql.Connection`, `java.time.Instant`, …) need the
+/// same durable index path as dependency source jars.
+pub fn resolve_jdk_sources(
+    src_zip: &Path,
+    extract_root: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Vec<FileSymbols> {
+    if !src_zip.is_file() {
+        return Vec::new();
+    }
+    let fingerprint = jar_fingerprint(src_zip).unwrap_or_else(|| "unknown".to_string());
+    let dest = extract_root.join("jdk").join(&fingerprint);
+
+    if !dest.is_dir() {
+        if let Err(e) = jar::extract_sources(src_zip, &dest) {
+            tracing::warn!("extract JDK sources {} failed: {e}", src_zip.display());
+            return Vec::new();
+        }
+    }
+
+    if let Some(cached) = symcache_load(&fingerprint) {
+        return cached;
+    }
+
+    let symbols = parse_dir(&dest, kotlin, java);
+    symcache_store(&fingerprint, &symbols);
+    symbols
 }
 
 #[cfg(test)]

@@ -123,6 +123,41 @@ fn goto_into_indexed_library_kotlin_and_java() {
     let _ = fs::remove_dir_all(&tmp);
 }
 
+#[test]
+fn goto_into_indexed_jdk_source() {
+    let tmp = unique_tmp("jdkgoto");
+    let src_zip = tmp.join("jdk/lib/src.zip");
+    write_sources_jar(
+        &src_zip,
+        &[(
+            "java.sql/java/sql/Connection.java",
+            "package java.sql;\n\npublic interface Connection {\n    void close();\n}\n",
+        )],
+    );
+
+    let extract_root = tmp.join("extracted");
+    let mut kotlin = KotlinParser::new();
+    let mut java = JavaParser::new();
+    let batches = deps::resolve_jdk_sources(&src_zip, &extract_root, &mut kotlin, &mut java);
+    assert!(!batches.is_empty(), "expected indexed JDK source files");
+
+    let mut ws = Workspace::new();
+    for batch in batches {
+        ws.index.replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
+    }
+
+    let key = tmp.join("app/Main.kt").to_string_lossy().into_owned();
+    let src = "package app\n\
+               import java.sql.Connection\n\
+               \n\
+               class UsesConnection(private val conn: Connection)\n";
+    ws.open(key.clone(), src.to_string());
+
+    assert_goto_into_library(&mut ws, &key, src, "Connection", "Connection.java");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
 /// Stage B: supertype + extension data recorded by the indexer must survive into the **Durable**
 /// tier, so member completion on a user-file receiver of a library type offers inherited members
 /// and library extensions. This proves the supertype/extension index is populated for libraries

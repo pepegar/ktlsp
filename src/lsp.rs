@@ -278,6 +278,8 @@ struct DepStats {
     files: usize,
     symbols: usize,
     failed: usize,
+    jdk_files: usize,
+    jdk_symbols: usize,
 }
 
 /// Index every dependency declared in the project's version catalog into the shared index.
@@ -301,14 +303,42 @@ fn index_dependencies(
     let mut java = JavaParser::new();
 
     let total = coords.len();
+    let jdk_src = deps::jdk_src_zip();
+    let has_jdk_src = jdk_src.is_some();
+    let progress_total = total + usize::from(has_jdk_src);
     let mut stats = DepStats {
         coordinates: coords.len(),
         ..Default::default()
     };
+    if let Some(src_zip) = jdk_src {
+        if let Some(tx) = progress {
+            let _ = tx.send((1, progress_total, "JDK sources".to_string()));
+        }
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            deps::resolve_jdk_sources(&src_zip, &extract_root, &mut kotlin, &mut java)
+        }));
+        match resolved {
+            Ok(batches) => {
+                for batch in batches {
+                    let mut guard = ws.lock().unwrap();
+                    stats.symbols += batch.symbols.len();
+                    stats.files += 1;
+                    stats.jdk_symbols += batch.symbols.len();
+                    stats.jdk_files += 1;
+                    guard.index.replace_file(&batch.file, batch.symbols, Tier::Durable);
+                }
+            }
+            Err(_) => {
+                tracing::warn!("indexing JDK sources panicked; skipping");
+                stats.failed += 1;
+            }
+        }
+    }
+    let progress_offset = usize::from(has_jdk_src);
     for (i, coord) in coords.iter().enumerate() {
         // Report before resolving so the UI names the coordinate currently being worked on.
         if let Some(tx) = progress {
-            let _ = tx.send((i + 1, total, coord.label()));
+            let _ = tx.send((i + 1 + progress_offset, progress_total, coord.label()));
         }
         // Isolate each coordinate: a panic while parsing one library's sources must not abort
         // indexing of the rest.
@@ -385,9 +415,17 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
     }
     let stats = handle.await.unwrap_or_default();
 
+    let jdk_summary = if stats.jdk_files > 0 {
+        format!(
+            ", including {} JDK files ({} symbols)",
+            stats.jdk_files, stats.jdk_symbols
+        )
+    } else {
+        String::new()
+    };
     let summary = format!(
-        "ktlsp indexed {} library files ({} symbols) from {} dependencies ({} skipped)",
-        stats.files, stats.symbols, stats.coordinates, stats.failed
+        "ktlsp indexed {} library files ({} symbols) from {} dependencies{} ({} skipped)",
+        stats.files, stats.symbols, stats.coordinates, jdk_summary, stats.failed
     );
     client.log_message(MessageType::INFO, summary.clone()).await;
     if let Some(p) = ongoing {

@@ -109,6 +109,9 @@ ktlsp jumps into your dependencies' source, not just your own code:
   or **downloads it from Maven Central**, then extracts the `.kt`/`.java` sources into
   `~/.cache/ktlsp/extracted/` and indexes them like any other file. Set `KTLSP_CACHE_DIR` to use a
   different writable cache root for extracted sources, symbol caches, trust, and default logs.
+- It also indexes the local JDK's `src.zip` when available, so imported Java platform types such as
+  `java.sql.Connection` jump to the JDK source. Set `KTLSP_JDK_SRC` to point at a specific `src.zip`
+  if your JDK is installed in a non-standard location.
 - goto then returns a `file://` location into that extracted source — so jumping to `listOf` lands
   in `kotlin-stdlib`'s `Collections.kt`, and jumping to a library type lands in its real source.
 
@@ -273,7 +276,7 @@ cargo run --example dump_java -- f.java # dump a Java parse tree
 RUST_LOG=ktlsp=debug cargo run          # run the server on stdio
 dev/ktlsp-harness.sh basic              # one-command editor harness with logs/traces under /tmp
 dev/ktlsp-harness.sh features           # editor surface smoke through Neovim
-dev/ktlsp-harness.sh library            # generated project + goto into kotlin-stdlib sources
+dev/ktlsp-harness.sh library            # generated project + goto into kotlin-stdlib and JDK sources
 dev/smoke.sh                            # real-editor check: project-local goto via Neovim
 dev/smoke_library.sh                    # real-editor check: goto into kotlin-stdlib via Neovim
 ```
@@ -309,7 +312,7 @@ Useful scenarios:
   inlay hints, member goto, rename, signature help, implementation/type-definition, call/type
   hierarchy, workspace commands, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
-  `kotlin-stdlib` sources.
+  `kotlin-stdlib` and JDK sources.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.
 - `gradle-live`, `gradle-compile`, and `comprehensive` exercise `dev/gradle-sample`; compile
   diagnostics remain opt-in because they run Gradle/the sidecar.
