@@ -1,6 +1,7 @@
 /target
 /result
 /.agent-shell/
+/.context/
 
 # Gradle build output in the dev/ sample projects (the pinned wrapper is committed; output is not)
 dev/**/.gradle/
