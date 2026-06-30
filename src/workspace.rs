@@ -5,19 +5,21 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use tree_sitter::Tree;
+use tree_sitter::{Node, Tree};
 use walkdir::{DirEntry, WalkDir};
 
-use crate::complete::{self, ImportAnchor, ScopeCompletion, ShapedCompletions};
+use crate::actions::{self, Action};
+use crate::complete::{self, ScopeCompletion, ShapedCompletions};
 use crate::index::{Entry, Index, RefEntry, Tier};
 use crate::indexer::{extract_symbols, extract_usages};
 use crate::infer;
-use crate::parser::{
-    compute_edit, identifier_at, imports_of, join_identifiers, node_text, package_of, Import,
-    KotlinParser,
-};
+use crate::imports::{self, ImportLayout};
+use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_of, Import, KotlinParser};
+use crate::ranges::{self, FoldRange, SelectionRange};
 use crate::resolve;
+use crate::semantic;
 use crate::symbol::{Def, SymbolKind};
+use crate::symbols::SymbolSummary;
 
 /// An open buffer: its current text plus the parsed tree, kept in sync so goto-definition reads an
 /// already-current tree instead of re-parsing on every request.
@@ -207,6 +209,129 @@ impl Workspace {
         (!shaped.items.is_empty()).then_some(shaped)
     }
 
+    /// Declarations for `textDocument/documentSymbol` and future passive symbol features. Results
+    /// are flat, source-ordered summaries over the current authoritative text for `key`.
+    pub fn document_symbols(&self, key: &str) -> Vec<SymbolSummary> {
+        self.index
+            .entries_for_file(key)
+            .iter()
+            .map(SymbolSummary::from_entry)
+            .collect()
+    }
+
+    /// The indexed symbol resolved at `offset`, for hover and future symbol-aware features. Local
+    /// declarations are intentionally omitted for now because they are not in the cross-file index.
+    pub fn symbol_at(&mut self, key: &str, offset: usize) -> Option<SymbolSummary> {
+        let target = self.goto_definition(key, offset).into_iter().next()?;
+        self.index
+            .entries_for_file(&target.file)
+            .iter()
+            .find(|entry| {
+                entry.sym.start_byte == target.start_byte && entry.sym.end_byte == target.end_byte
+            })
+            .map(SymbolSummary::from_entry)
+    }
+
+    /// Project/library symbols matching `query`, capped and ordered for workspace/symbol.
+    pub fn workspace_symbols(&self, query: &str) -> Vec<SymbolSummary> {
+        const CAP: usize = 200;
+        let mut out: Vec<SymbolSummary> = self
+            .index
+            .all_entries()
+            .iter()
+            .map(SymbolSummary::from_entry)
+            .filter(|s| s.matches_query(query))
+            .collect();
+        out.sort_by(|a, b| {
+            tier_rank(a.tier)
+                .cmp(&tier_rank(b.tier))
+                .then(a.name.len().cmp(&b.name.len()))
+                .then(a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                .then(a.package.cmp(&b.package))
+                .then(a.file.cmp(&b.file))
+                .then(a.start_byte.cmp(&b.start_byte))
+        });
+        out.truncate(CAP);
+        out
+    }
+
+    /// Same-file highlights for the exact symbol at `offset`, using goto-grade reference filtering.
+    pub fn document_highlights(&mut self, key: &str, offset: usize) -> Vec<Def> {
+        self.references(key, offset, true)
+            .into_iter()
+            .filter(|d| d.file == key)
+            .collect()
+    }
+
+    /// `textDocument/foldingRange`: AST-only folds over the current authoritative document.
+    pub fn folding_ranges(&mut self, key: &str) -> Vec<FoldRange> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return ranges::folding_ranges(&doc.tree, &doc.text);
+        }
+        let text = match self.doc_text(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        ranges::folding_ranges(&tree, &text)
+    }
+
+    /// `textDocument/selectionRange`: one parent chain for each requested byte offset.
+    pub fn selection_ranges(&mut self, key: &str, offsets: &[usize]) -> Vec<Option<SelectionRange>> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return offsets
+                .iter()
+                .map(|offset| ranges::selection_range(&doc.tree, &doc.text, *offset))
+                .collect();
+        }
+        let text = match self.doc_text(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        offsets
+            .iter()
+            .map(|offset| ranges::selection_range(&tree, &text, *offset))
+            .collect()
+    }
+
+    /// `textDocument/semanticTokens/full`: parser-only semantic classifications.
+    pub fn semantic_tokens(&mut self, key: &str) -> Vec<semantic::SemanticToken> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return semantic::semantic_tokens(&doc.tree, &doc.text);
+        }
+        let text = match self.doc_text(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        semantic::semantic_tokens(&tree, &text)
+    }
+
+    /// `textDocument/inlayHint`: conservative type hints within the requested byte range.
+    pub fn inlay_hints(
+        &mut self,
+        key: &str,
+        start_byte: usize,
+        end_byte: usize,
+    ) -> Vec<crate::hints::InlayHint> {
+        if let Some(doc) = self.open_docs.get(key) {
+            return crate::hints::inlay_hints(
+                &self.index,
+                &doc.tree,
+                &doc.text,
+                start_byte,
+                end_byte,
+            );
+        }
+        let text = match self.doc_text(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        crate::hints::inlay_hints(&self.index, &tree, &text, start_byte, end_byte)
+    }
+
     /// Stage B assembly: member completion after a dot. Receiver-type inference reuses the S6
     /// machinery; the trailing-dot parse collapse is handled by splicing a synthetic placeholder
     /// selector in at the cursor and reparsing (the partial-selector text becomes the prefix).
@@ -235,7 +360,7 @@ impl Workspace {
         let ty_pkg = ty.package().map(str::to_string);
 
         let vis = Visibility::new(&ctx.package, &ctx.imports);
-        let layout = import_layout(&tree, &synthetic);
+        let layout = imports::import_layout(&tree, &synthetic);
 
         let candidates = self.member_candidates(&ty_name, ty_pkg, &prefix, &vis);
         // Silent omission: an inferable type with zero matching members is treated as no result.
@@ -336,7 +461,7 @@ impl Workspace {
             let items = complete::complete_scope(tree, text, offset, &prefix);
             let pkg = package_of(tree, text);
             let imports = imports_of(tree, text);
-            let layout = import_layout(tree, text);
+            let layout = imports::import_layout(tree, text);
             (prefix, items, pkg, imports, layout)
         };
 
@@ -427,6 +552,108 @@ impl Workspace {
         };
         let tree = self.parser.parse(&text);
         crate::diagnostics::compute(&text, &tree)
+    }
+
+    /// `textDocument/codeAction`: conservative import actions over the current document.
+    pub fn code_actions(
+        &mut self,
+        key: &str,
+        range_start: usize,
+        range_end: usize,
+        cursor_offset: usize,
+    ) -> Vec<Action> {
+        let unresolved = self.goto_definition(key, cursor_offset).is_empty();
+        if let Some(doc) = self.open_docs.get(key) {
+            return self.code_actions_for_tree(
+                key,
+                &doc.text,
+                &doc.tree,
+                range_start,
+                range_end,
+                cursor_offset,
+                unresolved,
+            );
+        }
+        let text = match self.doc_text(key) {
+            Some(t) => t,
+            None => return Vec::new(),
+        };
+        let tree = self.parser.parse(&text);
+        self.code_actions_for_tree(
+            key,
+            &text,
+            &tree,
+            range_start,
+            range_end,
+            cursor_offset,
+            unresolved,
+        )
+    }
+
+    fn code_actions_for_tree(
+        &self,
+        key: &str,
+        text: &str,
+        tree: &Tree,
+        range_start: usize,
+        range_end: usize,
+        cursor_offset: usize,
+        unresolved: bool,
+    ) -> Vec<Action> {
+        if tree.root_node().has_error() {
+            return Vec::new();
+        }
+        let diagnostics = crate::diagnostics::compute(text, tree);
+        let mut out =
+            actions::unused_import_actions(key, text, tree, &diagnostics, range_start, range_end);
+        if let Some(action) = actions::organize_imports_action(key, text, tree) {
+            out.push(action);
+        }
+        if unresolved {
+            if let Some((name, fqn)) = self.unambiguous_import_candidate(key, text, tree, cursor_offset) {
+                if let Some(action) = actions::add_import_action(key, text, tree, &name, &fqn) {
+                    out.push(action);
+                }
+            }
+        }
+        out
+    }
+
+    fn unambiguous_import_candidate(
+        &self,
+        _key: &str,
+        text: &str,
+        tree: &Tree,
+        offset: usize,
+    ) -> Option<(String, String)> {
+        let ident = identifier_at(tree, offset)?;
+        if is_declaration_identifier(ident) || has_ancestor_kind(ident, &["import", "package_header"]) {
+            return None;
+        }
+        let name = node_text(ident, text);
+        if name.is_empty() || KOTLIN_KEYWORDS.contains(&name) {
+            return None;
+        }
+        let imports = imports_of(tree, text);
+        let visibility = Visibility::new(&package_of(tree, text), &imports);
+        let mut candidates = self
+            .index
+            .all_entries()
+            .into_iter()
+            .filter(|entry| {
+                entry.sym.name == name
+                    && entry.sym.container.is_none()
+                    && !entry.sym.package.is_empty()
+                    && !visibility.is_visible(&entry.sym.package, &entry.sym.name)
+            })
+            .map(|entry| fqn(&entry.sym.package, &entry.sym.name))
+            .collect::<Vec<_>>();
+        candidates.sort();
+        candidates.dedup();
+        match candidates.as_slice() {
+            [fqn] => Some((name.to_string(), fqn.clone())),
+            _ => None,
+        }
     }
 
     /// `textDocument/references`: all usage sites (as `Def` locations) of the symbol at `offset`.
@@ -546,11 +773,6 @@ const MAX_COMPLETIONS: usize = complete::RESULT_CAP;
 /// alongside the visited set) chain. Mirrors `complete::assemble_members`' cap.
 const SUPERTYPE_DEPTH_CAP: usize = 32;
 
-/// The file's import layout for auto-import line resolution: the alphabetically-sorted existing
-/// import `(path, 0-based row)` pairs plus the anchor (where to insert when there are no imports).
-/// `None` is used by member completion (which never auto-imports).
-type ImportLayout = Option<(Vec<(String, u32)>, ImportAnchor)>;
-
 /// A symbol's fully-qualified name (`package.name`), or the bare `name` when the package is empty.
 fn fqn(package: &str, name: &str) -> String {
     if package.is_empty() {
@@ -558,6 +780,30 @@ fn fqn(package: &str, name: &str) -> String {
     } else {
         format!("{package}.{name}")
     }
+}
+
+fn is_declaration_identifier(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "variable_declaration" | "parameter" | "class_parameter" | "type_parameter" | "enum_entry" => true,
+        "class_declaration" | "object_declaration" | "function_declaration" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| name.start_byte() == node.start_byte() && name.end_byte() == node.end_byte()),
+        _ => false,
+    }
+}
+
+fn has_ancestor_kind(node: Node<'_>, kinds: &[&str]) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if kinds.contains(&parent.kind()) {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
 }
 
 /// Stamp an indexed member/extension `Entry` into a completion candidate, prefix-filtered and
@@ -585,6 +831,13 @@ fn push_member_candidate(
     c.container = e.sym.container.clone();
     c.import_path = import_path;
     out.push(c);
+}
+
+fn tier_rank(tier: Tier) -> u8 {
+    match tier {
+        Tier::Volatile => 0,
+        Tier::Durable => 1,
+    }
 }
 
 /// The current file's name-visibility context, mirroring the rules `resolve_cross_file` /
@@ -615,57 +868,6 @@ impl Visibility {
             || self.star_pkgs.iter().any(|p| p == package)
             || resolve::is_default_import_pkg(package)
     }
-}
-
-/// Compute the file's import layout from the tree: the sorted `(import_path, 0-based row)` pairs and
-/// the `ImportAnchor`. The anchor decision tree (no ambiguity): (1) ≥1 import → anchor line =
-/// `last_import_row + 1`; (2) else a `package_header` → `package_row + 1`; (3) else → `0`. We derive
-/// every line from tree rows (one method — no "tree rows vs byte→line" ambiguity).
-fn import_layout(tree: &Tree, src: &str) -> ImportLayout {
-    let root = tree.root_node();
-    let mut imports: Vec<(String, u32)> = Vec::new();
-    let mut last_import_row: Option<u32> = None;
-    let mut package_row: Option<u32> = None;
-    let mut cursor = root.walk();
-    for child in root.named_children(&mut cursor) {
-        match child.kind() {
-            "package_header" => package_row = Some(child.start_position().row as u32),
-            "import" => {
-                let row = child.start_position().row as u32;
-                // Reuse `imports_of`'s per-node parse shape via a single Import.
-                let imp = parse_single_import(child, src);
-                imports.push((imp.path, row));
-                last_import_row = Some(row);
-            }
-            _ => {}
-        }
-    }
-    let anchor = ImportAnchor {
-        line: match (last_import_row, package_row) {
-            (Some(r), _) => r + 1,
-            (None, Some(r)) => r + 1,
-            (None, None) => 0,
-        },
-    };
-    imports.sort_by(|a, b| a.0.cmp(&b.0));
-    Some((imports, anchor))
-}
-
-/// Parse one `import` node into an `Import` (path/alias/wildcard). Mirrors `imports_of`'s per-node
-/// logic; kept local so `import_layout` can pair each path with its row.
-fn parse_single_import(node: tree_sitter::Node, src: &str) -> Import {
-    let wildcard = node_text(node, src).trim_end().ends_with('*');
-    let mut path = String::new();
-    let mut alias = None;
-    let mut c = node.walk();
-    for sub in node.named_children(&mut c) {
-        match sub.kind() {
-            "qualified_identifier" => path = join_identifiers(sub, src),
-            "identifier" => alias = Some(node_text(sub, src).to_string()),
-            _ => {}
-        }
-    }
-    Import { path, alias, wildcard }
 }
 
 /// Kotlin keywords valid as a leading token in a scope-name position. Soft / context-sensitive

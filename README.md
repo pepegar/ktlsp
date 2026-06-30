@@ -1,17 +1,19 @@
 # ktlsp
 
-A small, fast Kotlin language server written in Rust. **goto-definition** and
-**find-references**, across both your own code and your library dependencies. No JVM, no Gradle,
-no waiting — goto is sub-millisecond and startup reuses a persistent symbol cache.
+A small, fast Kotlin language server written in Rust. **Goto-definition**, **find-references**,
+completion, passive symbol intelligence, editor range features, and safe import actions across both
+your own code and your library dependencies. No JVM, no Gradle, no waiting for the compiler-free
+path — goto is sub-millisecond and startup reuses a persistent symbol cache.
 
 It is built on [tree-sitter](https://tree-sitter.github.io/) for parsing and
 [tower-lsp-server](https://github.com/tower-lsp-community/tower-lsp-server) for the LSP plumbing,
 and is meant as a lightweight alternative when the official `kotlin-lsp` is too heavy or
 unreliable for your workflow.
 
-> Status: **goto-definition + find-references**, across your own code **and your library
-> dependencies** (it downloads/indexes `-sources.jar` artifacts). Hover, completion, and rename
-> are out of scope for now (the architecture leaves room for them).
+> Status: **goto-definition, find-references, completion, hover, document/workspace symbols,
+> document highlights, semantic tokens, inlay hints, folding/selection ranges, and import code
+> actions** across your own code **and your library dependencies** where the underlying index has
+> facts. Rename/refactorings and hierarchy/signature features are next-stage work.
 
 ## Performance
 
@@ -241,7 +243,7 @@ cargo run --example dump -- file.kt     # dump a Kotlin parse tree (grammar/quer
 cargo run --example dump_java -- f.java # dump a Java parse tree
 RUST_LOG=ktlsp=debug cargo run          # run the server on stdio
 dev/ktlsp-harness.sh basic              # one-command editor harness with logs/traces under /tmp
-dev/ktlsp-harness.sh features           # refs/completion/auto-import/edit smoke through Neovim
+dev/ktlsp-harness.sh features           # editor surface smoke through Neovim
 dev/ktlsp-harness.sh library            # generated project + goto into kotlin-stdlib sources
 dev/smoke.sh                            # real-editor check: project-local goto via Neovim
 dev/smoke_library.sh                    # real-editor check: goto into kotlin-stdlib via Neovim
@@ -273,8 +275,9 @@ KTLSP_LIVE_COMPILE=1 dev/ktlsp-harness.sh gradle-live
 Useful scenarios:
 
 - `basic` creates a disposable two-file Kotlin project and checks local + cross-file goto.
-- `features` runs the richer `dev/sample` smoke: references, completion, auto-import, member goto,
-  and did-change reparse.
+- `features` runs the richer `dev/sample` smoke: references, completion, auto-import, hover,
+  document/workspace symbols, highlights, code actions, folding/selection ranges, semantic tokens,
+  inlay hints, member goto, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
   `kotlin-stdlib` sources.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.

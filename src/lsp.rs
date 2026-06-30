@@ -486,8 +486,38 @@ impl LanguageServer for Backend {
                         ..Default::default()
                     },
                 )),
+                hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(CodeActionOptions {
+                    code_action_kinds: Some(vec![
+                        CodeActionKind::QUICKFIX,
+                        CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+                        CodeActionKind::SOURCE_FIX_ALL,
+                        CodeActionKind::new("source.fixAll.ktlsp"),
+                    ]),
+                    work_done_progress_options: Default::default(),
+                    resolve_provider: Some(false),
+                })),
+                document_highlight_provider: Some(OneOf::Left(true)),
+                document_symbol_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
+                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
+                selection_range_provider: Some(SelectionRangeProviderCapability::Simple(true)),
+                semantic_tokens_provider: Some(
+                    SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                        work_done_progress_options: Default::default(),
+                        legend: semantic_tokens_legend(),
+                        range: None,
+                        full: Some(SemanticTokensFullOptions::Bool(true)),
+                    }),
+                ),
+                inlay_hint_provider: Some(OneOf::Right(InlayHintServerCapabilities::Options(
+                    InlayHintOptions {
+                        work_done_progress_options: Default::default(),
+                        resolve_provider: Some(false),
+                    },
+                ))),
                 // `.` is registered now so the capability is correct for Stage B; the after-dot
                 // branch returns nothing in Stage A.
                 completion_provider: Some(CompletionOptions {
@@ -660,6 +690,363 @@ impl LanguageServer for Backend {
         Ok((!locations.is_empty()).then_some(locations))
     }
 
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let start = std::time::Instant::now();
+        let key = match uri_to_key(&params.text_document.uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let requested = params.context.only;
+
+        let (actions, symbol, line, character) = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let line_index = LineIndex::new(&text);
+            let range_start =
+                line_index.offset(&text, params.range.start.line, params.range.start.character);
+            let range_end =
+                line_index.offset(&text, params.range.end.line, params.range.end.character);
+            let symbol = crate::trace::ident_at(&text, range_start);
+            let actions = ws
+                .code_actions(&key, range_start, range_end, range_start)
+                .into_iter()
+                .filter(|action| action_kind_allowed(action.kind, requested.as_ref()))
+                .filter_map(|action| to_lsp_code_action(&ws, action))
+                .collect::<Vec<_>>();
+            (
+                actions,
+                symbol,
+                params.range.start.line,
+                params.range.start.character,
+            )
+        };
+
+        let count = actions.len();
+        crate::trace::request(
+            "code_action",
+            start,
+            &key,
+            line,
+            character,
+            symbol.as_deref(),
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok((count > 0).then_some(actions))
+    }
+
+    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
+        let start = std::time::Instant::now();
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let (hover, symbol) = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let symbol = crate::trace::ident_at(&text, offset);
+            let hover = ws.symbol_at(&key, offset).map(|s| Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::PlainText,
+                    value: s.hover_text(),
+                }),
+                range: None,
+            });
+            (hover, symbol)
+        };
+
+        let count = usize::from(hover.is_some());
+        crate::trace::request(
+            "hover",
+            start,
+            &key,
+            pos.line,
+            pos.character,
+            symbol.as_deref(),
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok(hover)
+    }
+
+    async fn document_highlight(
+        &self,
+        params: DocumentHighlightParams,
+    ) -> Result<Option<Vec<DocumentHighlight>>> {
+        let start = std::time::Instant::now();
+        let uri = params.text_document_position_params.text_document.uri;
+        let pos = params.text_document_position_params.position;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let (highlights, symbol) = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
+            let symbol = crate::trace::ident_at(&text, offset);
+            let defs = ws.document_highlights(&key, offset);
+            let highlights = defs
+                .iter()
+                .filter_map(|d| def_to_range(&ws, d))
+                .map(|range| DocumentHighlight {
+                    range,
+                    kind: Some(DocumentHighlightKind::TEXT),
+                })
+                .collect::<Vec<_>>();
+            (highlights, symbol)
+        };
+
+        let count = highlights.len();
+        crate::trace::request(
+            "document_highlight",
+            start,
+            &key,
+            pos.line,
+            pos.character,
+            symbol.as_deref(),
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok((!highlights.is_empty()).then_some(highlights))
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let start = std::time::Instant::now();
+        let uri = params.text_document.uri;
+        let key = match uri_to_key(&uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let (symbols, text) = {
+            let ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            (ws.document_symbols(&key), text)
+        };
+
+        let line_index = LineIndex::new(&text);
+        let items = symbols
+            .into_iter()
+            .map(|s| to_document_symbol(&line_index, &text, s))
+            .collect::<Vec<_>>();
+        let count = items.len();
+        crate::trace::request(
+            "document_symbol",
+            start,
+            &key,
+            0,
+            0,
+            None,
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok((count > 0).then_some(DocumentSymbolResponse::Nested(items)))
+    }
+
+    async fn symbol(&self, params: WorkspaceSymbolParams) -> Result<Option<WorkspaceSymbolResponse>> {
+        let start = std::time::Instant::now();
+        let items = {
+            let ws = self.ws.lock().unwrap();
+            ws.workspace_symbols(&params.query)
+                .into_iter()
+                .filter_map(|s| to_symbol_information(&ws, s))
+                .collect::<Vec<_>>()
+        };
+        let count = items.len();
+        crate::trace::request(
+            "workspace_symbol",
+            start,
+            "",
+            0,
+            0,
+            Some(&params.query),
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok((count > 0).then_some(WorkspaceSymbolResponse::Flat(items)))
+    }
+
+    async fn folding_range(
+        &self,
+        params: FoldingRangeParams,
+    ) -> Result<Option<Vec<FoldingRange>>> {
+        let start = std::time::Instant::now();
+        let key = match uri_to_key(&params.text_document.uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let ranges = {
+            let mut ws = self.ws.lock().unwrap();
+            ws.folding_ranges(&key)
+                .into_iter()
+                .map(to_lsp_folding_range)
+                .collect::<Vec<_>>()
+        };
+
+        let count = ranges.len();
+        crate::trace::request(
+            "folding_range",
+            start,
+            &key,
+            0,
+            0,
+            None,
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok((count > 0).then_some(ranges))
+    }
+
+    async fn selection_range(
+        &self,
+        params: SelectionRangeParams,
+    ) -> Result<Option<Vec<SelectionRange>>> {
+        let start = std::time::Instant::now();
+        let key = match uri_to_key(&params.text_document.uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+        let positions = params.positions;
+
+        let (ranges, first_symbol, first_line, first_character, requested) = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let line_index = LineIndex::new(&text);
+            let offsets = positions
+                .iter()
+                .map(|pos| line_index.offset(&text, pos.line, pos.character))
+                .collect::<Vec<_>>();
+            let first_symbol = offsets
+                .first()
+                .and_then(|offset| crate::trace::ident_at(&text, *offset));
+            let ranges = ws
+                .selection_ranges(&key, &offsets)
+                .into_iter()
+                .filter_map(|range| range.map(|r| to_lsp_selection_range(&line_index, &text, r)))
+                .collect::<Vec<_>>();
+            let first = positions.first().copied().unwrap_or_default();
+            (
+                ranges,
+                first_symbol,
+                first.line,
+                first.character,
+                positions.len(),
+            )
+        };
+
+        let count = ranges.len();
+        crate::trace::request(
+            "selection_range",
+            start,
+            &key,
+            first_line,
+            first_character,
+            first_symbol.as_deref(),
+            if count == requested && count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok((count == requested && count > 0).then_some(ranges))
+    }
+
+    async fn semantic_tokens_full(
+        &self,
+        params: SemanticTokensParams,
+    ) -> Result<Option<SemanticTokensResult>> {
+        let start = std::time::Instant::now();
+        let key = match uri_to_key(&params.text_document.uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let data = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let line_index = LineIndex::new(&text);
+            to_lsp_semantic_tokens(&line_index, &text, ws.semantic_tokens(&key))
+        };
+
+        let count = data.len();
+        crate::trace::request(
+            "semantic_tokens_full",
+            start,
+            &key,
+            0,
+            0,
+            None,
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok(Some(SemanticTokensResult::Tokens(SemanticTokens {
+            result_id: None,
+            data,
+        })))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let start = std::time::Instant::now();
+        let key = match uri_to_key(&params.text_document.uri) {
+            Some(k) => k,
+            None => return Ok(None),
+        };
+
+        let hints = {
+            let mut ws = self.ws.lock().unwrap();
+            let text = match ws.doc_text(&key) {
+                Some(t) => t,
+                None => return Ok(None),
+            };
+            let line_index = LineIndex::new(&text);
+            let start_byte =
+                line_index.offset(&text, params.range.start.line, params.range.start.character);
+            let end_byte = line_index.offset(&text, params.range.end.line, params.range.end.character);
+            ws.inlay_hints(&key, start_byte, end_byte)
+                .into_iter()
+                .map(|hint| to_lsp_inlay_hint(&line_index, &text, hint))
+                .collect::<Vec<_>>()
+        };
+
+        let count = hints.len();
+        crate::trace::request(
+            "inlay_hint",
+            start,
+            &key,
+            params.range.start.line,
+            params.range.start.character,
+            None,
+            if count > 0 { "ok" } else { "empty" },
+            count,
+        );
+        Ok((count > 0).then_some(hints))
+    }
+
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let start = std::time::Instant::now();
         let uri = params.text_document_position.text_document.uri;
@@ -708,6 +1095,280 @@ impl LanguageServer for Backend {
         Ok((!items.is_empty()).then(|| {
             CompletionResponse::List(CompletionList { is_incomplete, items })
         }))
+    }
+}
+
+#[allow(deprecated)]
+fn to_symbol_information(
+    ws: &Workspace,
+    symbol: crate::symbols::SymbolSummary,
+) -> Option<SymbolInformation> {
+    Some(SymbolInformation {
+        name: symbol.name.clone(),
+        kind: to_lsp_symbol_kind(symbol.kind),
+        tags: None,
+        deprecated: None,
+        location: symbol_to_location(ws, &symbol)?,
+        container_name: symbol.detail(),
+    })
+}
+
+#[allow(deprecated)]
+fn to_document_symbol(
+    line_index: &LineIndex,
+    text: &str,
+    symbol: crate::symbols::SymbolSummary,
+) -> DocumentSymbol {
+    let (sl, sc) = line_index.position(text, symbol.start_byte);
+    let (el, ec) = line_index.position(text, symbol.end_byte);
+    let range = Range {
+        start: Position { line: sl, character: sc },
+        end: Position { line: el, character: ec },
+    };
+    let detail = symbol.detail();
+    DocumentSymbol {
+        name: symbol.name,
+        detail,
+        kind: to_lsp_symbol_kind(symbol.kind),
+        tags: None,
+        deprecated: None,
+        range,
+        selection_range: range,
+        children: None,
+    }
+}
+
+fn symbol_to_location(ws: &Workspace, symbol: &crate::symbols::SymbolSummary) -> Option<Location> {
+    let text = ws.doc_text(&symbol.file)?;
+    let line_index = LineIndex::new(&text);
+    let (sl, sc) = line_index.position(&text, symbol.start_byte);
+    let (el, ec) = line_index.position(&text, symbol.end_byte);
+    Some(Location::new(
+        key_to_uri(&symbol.file)?,
+        Range {
+            start: Position { line: sl, character: sc },
+            end: Position { line: el, character: ec },
+        },
+    ))
+}
+
+fn to_lsp_symbol_kind(kind: SymbolKind) -> tower_lsp_server::ls_types::SymbolKind {
+    match kind {
+        SymbolKind::Class => tower_lsp_server::ls_types::SymbolKind::CLASS,
+        SymbolKind::Interface => tower_lsp_server::ls_types::SymbolKind::INTERFACE,
+        SymbolKind::Object => tower_lsp_server::ls_types::SymbolKind::OBJECT,
+        SymbolKind::EnumClass => tower_lsp_server::ls_types::SymbolKind::ENUM,
+        SymbolKind::EnumEntry => tower_lsp_server::ls_types::SymbolKind::ENUM_MEMBER,
+        SymbolKind::Function => tower_lsp_server::ls_types::SymbolKind::FUNCTION,
+        SymbolKind::Property => tower_lsp_server::ls_types::SymbolKind::PROPERTY,
+        SymbolKind::Parameter => tower_lsp_server::ls_types::SymbolKind::VARIABLE,
+        SymbolKind::TypeParameter => tower_lsp_server::ls_types::SymbolKind::TYPE_PARAMETER,
+        SymbolKind::LocalVariable => tower_lsp_server::ls_types::SymbolKind::VARIABLE,
+    }
+}
+
+fn to_lsp_folding_range(range: crate::ranges::FoldRange) -> FoldingRange {
+    FoldingRange {
+        start_line: range.start_line,
+        start_character: None,
+        end_line: range.end_line,
+        end_character: None,
+        kind: range.kind.map(to_lsp_folding_range_kind),
+        collapsed_text: None,
+    }
+}
+
+fn to_lsp_folding_range_kind(kind: crate::ranges::FoldKind) -> FoldingRangeKind {
+    match kind {
+        crate::ranges::FoldKind::Imports => FoldingRangeKind::Imports,
+        crate::ranges::FoldKind::Comment => FoldingRangeKind::Comment,
+    }
+}
+
+fn to_lsp_selection_range(
+    line_index: &LineIndex,
+    text: &str,
+    range: crate::ranges::SelectionRange,
+) -> SelectionRange {
+    SelectionRange {
+        range: byte_range_to_lsp(line_index, text, range.start_byte, range.end_byte),
+        parent: range
+            .parent
+            .map(|parent| Box::new(to_lsp_selection_range(line_index, text, *parent))),
+    }
+}
+
+fn byte_range_to_lsp(line_index: &LineIndex, text: &str, start: usize, end: usize) -> Range {
+    let (sl, sc) = line_index.position(text, start);
+    let (el, ec) = line_index.position(text, end);
+    Range {
+        start: Position {
+            line: sl,
+            character: sc,
+        },
+        end: Position {
+            line: el,
+            character: ec,
+        },
+    }
+}
+
+fn action_kind_allowed(
+    kind: crate::actions::ActionKind,
+    requested: Option<&Vec<CodeActionKind>>,
+) -> bool {
+    let Some(requested) = requested else {
+        return true;
+    };
+    let action = action_kind_str(kind);
+    requested.iter().any(|wanted| {
+        let wanted = wanted.as_str();
+        action == wanted || action.strip_prefix(wanted).is_some_and(|rest| rest.starts_with('.'))
+    })
+}
+
+fn action_kind_str(kind: crate::actions::ActionKind) -> &'static str {
+    match kind {
+        crate::actions::ActionKind::QuickFix => "quickfix",
+        crate::actions::ActionKind::SourceOrganizeImports => "source.organizeImports",
+        crate::actions::ActionKind::SourceFixAllKtlsp => "source.fixAll.ktlsp",
+    }
+}
+
+fn to_lsp_code_action(
+    ws: &Workspace,
+    action: crate::actions::Action,
+) -> Option<CodeActionOrCommand> {
+    Some(CodeActionOrCommand::CodeAction(CodeAction {
+        title: action.title,
+        kind: Some(to_lsp_code_action_kind(action.kind)),
+        diagnostics: None,
+        edit: Some(to_lsp_workspace_edit(ws, action.edits)?),
+        command: None,
+        is_preferred: Some(action.is_preferred),
+        disabled: None,
+        data: None,
+    }))
+}
+
+fn to_lsp_code_action_kind(kind: crate::actions::ActionKind) -> CodeActionKind {
+    match kind {
+        crate::actions::ActionKind::QuickFix => CodeActionKind::QUICKFIX,
+        crate::actions::ActionKind::SourceOrganizeImports => CodeActionKind::SOURCE_ORGANIZE_IMPORTS,
+        crate::actions::ActionKind::SourceFixAllKtlsp => CodeActionKind::new("source.fixAll.ktlsp"),
+    }
+}
+
+fn to_lsp_workspace_edit(
+    ws: &Workspace,
+    edits: Vec<crate::edit::TextEdit>,
+) -> Option<WorkspaceEdit> {
+    let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+    for edit in edits {
+        let text = ws.doc_text(&edit.file)?;
+        let line_index = LineIndex::new(&text);
+        let uri = key_to_uri(&edit.file)?;
+        changes.entry(uri).or_default().push(TextEdit {
+            range: byte_range_to_lsp(&line_index, &text, edit.start_byte, edit.end_byte),
+            new_text: edit.new_text,
+        });
+    }
+    Some(WorkspaceEdit::new(changes))
+}
+
+fn semantic_tokens_legend() -> SemanticTokensLegend {
+    SemanticTokensLegend {
+        token_types: vec![
+            SemanticTokenType::NAMESPACE,
+            SemanticTokenType::CLASS,
+            SemanticTokenType::INTERFACE,
+            SemanticTokenType::new("object"),
+            SemanticTokenType::ENUM,
+            SemanticTokenType::FUNCTION,
+            SemanticTokenType::PROPERTY,
+            SemanticTokenType::VARIABLE,
+            SemanticTokenType::PARAMETER,
+            SemanticTokenType::TYPE_PARAMETER,
+            SemanticTokenType::ENUM_MEMBER,
+            SemanticTokenType::KEYWORD,
+            SemanticTokenType::STRING,
+            SemanticTokenType::NUMBER,
+            SemanticTokenType::COMMENT,
+        ],
+        token_modifiers: vec![SemanticTokenModifier::DECLARATION],
+    }
+}
+
+fn to_lsp_semantic_tokens(
+    line_index: &LineIndex,
+    text: &str,
+    tokens: Vec<crate::semantic::SemanticToken>,
+) -> Vec<SemanticToken> {
+    let mut out = Vec::new();
+    let mut prev_line = 0;
+    let mut prev_start = 0;
+    for token in tokens {
+        let (line, start) = line_index.position(text, token.start_byte);
+        let (end_line, end) = line_index.position(text, token.end_byte);
+        if line != end_line || end <= start {
+            continue;
+        }
+        let delta_line = line - prev_line;
+        let delta_start = if delta_line == 0 {
+            start.saturating_sub(prev_start)
+        } else {
+            start
+        };
+        out.push(SemanticToken {
+            delta_line,
+            delta_start,
+            length: end - start,
+            token_type: semantic_token_type_index(token.kind),
+            token_modifiers_bitset: u32::from(token.declaration),
+        });
+        prev_line = line;
+        prev_start = start;
+    }
+    out
+}
+
+fn semantic_token_type_index(kind: crate::semantic::SemanticTokenKind) -> u32 {
+    match kind {
+        crate::semantic::SemanticTokenKind::Namespace => 0,
+        crate::semantic::SemanticTokenKind::Class => 1,
+        crate::semantic::SemanticTokenKind::Interface => 2,
+        crate::semantic::SemanticTokenKind::Object => 3,
+        crate::semantic::SemanticTokenKind::Enum => 4,
+        crate::semantic::SemanticTokenKind::Function => 5,
+        crate::semantic::SemanticTokenKind::Property => 6,
+        crate::semantic::SemanticTokenKind::Variable => 7,
+        crate::semantic::SemanticTokenKind::Parameter => 8,
+        crate::semantic::SemanticTokenKind::TypeParameter => 9,
+        crate::semantic::SemanticTokenKind::EnumMember => 10,
+        crate::semantic::SemanticTokenKind::Keyword => 11,
+        crate::semantic::SemanticTokenKind::String => 12,
+        crate::semantic::SemanticTokenKind::Number => 13,
+        crate::semantic::SemanticTokenKind::Comment => 14,
+    }
+}
+
+fn to_lsp_inlay_hint(
+    line_index: &LineIndex,
+    text: &str,
+    hint: crate::hints::InlayHint,
+) -> InlayHint {
+    let (line, character) = line_index.position(text, hint.position_byte);
+    InlayHint {
+        position: Position { line, character },
+        label: InlayHintLabel::String(hint.label),
+        kind: Some(match hint.kind {
+            crate::hints::InlayHintKind::Type => InlayHintKind::TYPE,
+        }),
+        text_edits: None,
+        tooltip: None,
+        padding_left: Some(true),
+        padding_right: None,
+        data: None,
     }
 }
 
@@ -772,6 +1433,9 @@ fn to_lsp_diagnostic(
             end: Position { line: el, character: ec },
         },
         severity: Some(severity_to_lsp(d.severity)),
+        code: d
+            .code
+            .map(|code| NumberOrString::String(code.as_str().to_string())),
         source: Some("ktlsp".into()),
         message: d.message.clone(),
         ..Default::default()
@@ -1005,6 +1669,10 @@ fn def_to_location(ws: &Workspace, d: &Def) -> Option<Location> {
             end: Position { line: el, character: ec },
         },
     ))
+}
+
+fn def_to_range(ws: &Workspace, d: &Def) -> Option<Range> {
+    def_to_location(ws, d).map(|l| l.range)
 }
 
 #[cfg(test)]

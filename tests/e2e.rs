@@ -39,6 +39,39 @@ async fn initialize_open_and_goto_definition() {
         init.capabilities.definition_provider.is_some(),
         "server must advertise definition support"
     );
+    assert!(init.capabilities.hover_provider.is_some(), "server must advertise hover support");
+    assert!(
+        init.capabilities.document_highlight_provider.is_some(),
+        "server must advertise document highlight support"
+    );
+    assert!(
+        init.capabilities.code_action_provider.is_some(),
+        "server must advertise code action support"
+    );
+    assert!(
+        init.capabilities.document_symbol_provider.is_some(),
+        "server must advertise document symbol support"
+    );
+    assert!(
+        init.capabilities.workspace_symbol_provider.is_some(),
+        "server must advertise workspace symbol support"
+    );
+    assert!(
+        init.capabilities.folding_range_provider.is_some(),
+        "server must advertise folding range support"
+    );
+    assert!(
+        init.capabilities.selection_range_provider.is_some(),
+        "server must advertise selection range support"
+    );
+    assert!(
+        init.capabilities.semantic_tokens_provider.is_some(),
+        "server must advertise semantic token support"
+    );
+    assert!(
+        init.capabilities.inlay_hint_provider.is_some(),
+        "server must advertise inlay hint support"
+    );
     // and completion support with a `.` trigger character
     let completion = init
         .capabilities
@@ -108,6 +141,137 @@ async fn initialize_open_and_goto_definition() {
         .expect("references should be present");
     assert_eq!(refs.len(), 2, "decl + one call: {refs:?}");
     assert!(refs.iter().all(|l| l.uri.as_str() == uri.as_str()));
+
+    // textDocument/documentSymbol returns indexed declarations for the open buffer.
+    let symbols = backend
+        .document_symbol(DocumentSymbolParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("document symbols should be present");
+    let symbols = match symbols {
+        DocumentSymbolResponse::Nested(symbols) => symbols,
+        DocumentSymbolResponse::Flat(flat) => {
+            panic!("expected nested document symbols, got flat: {flat:?}")
+        }
+    };
+    assert!(
+        symbols.iter().any(|s| s.name == "helper" && s.kind == SymbolKind::FUNCTION),
+        "document symbols must include `helper`: {symbols:?}"
+    );
+
+    // textDocument/hover on the `helper()` call reports the indexed declaration facts.
+    let hover = backend
+        .hover(HoverParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 1, character },
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("hover should be present");
+    match hover.contents {
+        HoverContents::Markup(markup) => {
+            assert!(markup.value.contains("fun helper()"), "{markup:?}");
+        }
+        other => panic!("expected markup hover, got {other:?}"),
+    }
+
+    // textDocument/documentHighlight on `helper` returns declaration + call in this file.
+    let highlights = backend
+        .document_highlight(DocumentHighlightParams {
+            text_document_position_params: TextDocumentPositionParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                position: Position { line: 1, character },
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("document highlights should be present");
+    assert_eq!(highlights.len(), 2, "declaration + call: {highlights:?}");
+
+    // workspace/symbol returns indexed project symbols matching the query.
+    let workspace_symbols = backend
+        .symbol(WorkspaceSymbolParams {
+            query: "help".into(),
+            partial_result_params: Default::default(),
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("workspace symbols should be present");
+    let workspace_symbols = match workspace_symbols {
+        WorkspaceSymbolResponse::Flat(symbols) => symbols,
+        WorkspaceSymbolResponse::Nested(symbols) => {
+            panic!("expected flat workspace symbols, got nested: {symbols:?}")
+        }
+    };
+    assert!(
+        workspace_symbols
+            .iter()
+            .any(|s| s.name == "helper" && s.kind == SymbolKind::FUNCTION),
+        "workspace symbols must include `helper`: {workspace_symbols:?}"
+    );
+
+    // textDocument/codeAction returns a WorkspaceEdit for a provably unused import.
+    let action_uri: Uri = "file:///tmp/ktlsp_e2e/Actions.kt".parse().unwrap();
+    let action_text = "import a.b.Unused\nfun main() {}\n";
+    backend
+        .did_open(DidOpenTextDocumentParams {
+            text_document: TextDocumentItem {
+                uri: action_uri.clone(),
+                language_id: "kotlin".into(),
+                version: 1,
+                text: action_text.into(),
+            },
+        })
+        .await;
+    let code_actions = backend
+        .code_action(CodeActionParams {
+            text_document: TextDocumentIdentifier {
+                uri: action_uri.clone(),
+            },
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: "import a.b.".len() as u32,
+                },
+                end: Position {
+                    line: 0,
+                    character: "import a.b.Unused".len() as u32,
+                },
+            },
+            context: CodeActionContext {
+                diagnostics: Vec::new(),
+                only: Some(vec![CodeActionKind::QUICKFIX]),
+                trigger_kind: None,
+            },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("code actions should be present");
+    let remove_unused = code_actions
+        .iter()
+        .find_map(|item| match item {
+            CodeActionOrCommand::CodeAction(action) => {
+                (action.title == "Remove unused import `Unused`").then_some(action)
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("missing remove-unused code action: {code_actions:?}"));
+    assert!(
+        remove_unused.edit.is_some(),
+        "remove-unused code action should carry a workspace edit"
+    );
 
     // textDocument/completion at a `h` prefix on line 1 (inside the `helper()` call): the response
     // must include the top-level `helper`.
@@ -183,6 +347,99 @@ async fn initialize_open_and_goto_definition() {
     assert_eq!(open.kind, Some(CompletionItemKind::FUNCTION));
     assert_eq!(open.insert_text_format, Some(InsertTextFormat::SNIPPET));
     assert_eq!(open.insert_text.as_deref(), Some("open()$0"));
+
+    // textDocument/foldingRange returns AST body folds for the class and `main` block.
+    let folds = backend
+        .folding_range(FoldingRangeParams {
+            text_document: TextDocumentIdentifier { uri: uri2.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("folding ranges should be present");
+    assert!(
+        folds.iter().any(|r| r.start_line == 0 && r.end_line == 2),
+        "class body fold should be present: {folds:?}"
+    );
+    assert!(
+        folds.iter().any(|r| r.start_line == 3 && r.end_line == 6),
+        "main body fold should be present: {folds:?}"
+    );
+
+    // textDocument/selectionRange on `Box()` starts at the identifier and expands outward.
+    let box_line = text2.lines().position(|l| l.contains("Box()")).unwrap() as u32;
+    let box_col = text2.lines().nth(box_line as usize).unwrap().find("Box").unwrap() as u32;
+    let selections = backend
+        .selection_range(SelectionRangeParams {
+            text_document: TextDocumentIdentifier { uri: uri2.clone() },
+            positions: vec![Position {
+                line: box_line,
+                character: box_col,
+            }],
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("selection range should be present");
+    assert_eq!(selections.len(), 1);
+    let selection = &selections[0];
+    assert_eq!(
+        selection.range.start,
+        Position {
+            line: box_line,
+            character: box_col,
+        }
+    );
+    assert!(
+        selection.parent.is_some(),
+        "selection should include an expanding parent chain: {selection:?}"
+    );
+
+    // textDocument/semanticTokens/full returns encoded semantic tokens for the open buffer.
+    let semantic = backend
+        .semantic_tokens_full(SemanticTokensParams {
+            text_document: TextDocumentIdentifier { uri: uri2.clone() },
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("semantic tokens should be present");
+    match semantic {
+        SemanticTokensResult::Tokens(tokens) => {
+            assert!(!tokens.data.is_empty(), "semantic tokens should not be empty");
+        }
+        other => panic!("expected full semantic token response, got {other:?}"),
+    }
+
+    // textDocument/inlayHint returns a type hint for the unannotated local `b`.
+    let inlay_hints = backend
+        .inlay_hint(InlayHintParams {
+            text_document: TextDocumentIdentifier { uri: uri2.clone() },
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: text2.lines().count() as u32,
+                    character: 0,
+                },
+            },
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("inlay hints should be present");
+    assert!(
+        inlay_hints.iter().any(|hint| {
+            matches!(&hint.label, InlayHintLabel::String(label) if label == ": Box")
+                && hint.kind == Some(InlayHintKind::TYPE)
+        }),
+        "inlay hints should include `: Box`: {inlay_hints:?}"
+    );
 
     assert!(backend.shutdown().await.is_ok());
 }

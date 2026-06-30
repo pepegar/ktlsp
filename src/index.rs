@@ -153,6 +153,52 @@ impl Index {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// All entries in deterministic file/start order. Returns owned `Entry`s so callers cannot
+    /// mutate the index internals.
+    pub fn all_entries(&self) -> Vec<Entry> {
+        let mut out = Vec::new();
+        for (path, (tier, symbols)) in &self.files {
+            for sym in symbols {
+                out.push(Entry {
+                    path: path.clone(),
+                    tier: *tier,
+                    sym: sym.clone(),
+                });
+            }
+        }
+        out.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.sym.start_byte.cmp(&b.sym.start_byte))
+                .then(a.sym.end_byte.cmp(&b.sym.end_byte))
+                .then(a.sym.name.cmp(&b.sym.name))
+        });
+        out
+    }
+
+    /// Entries contributed by a single file in source order.
+    pub fn entries_for_file(&self, path: &str) -> Vec<Entry> {
+        let Some((tier, symbols)) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let mut out: Vec<Entry> = symbols
+            .iter()
+            .map(|sym| Entry {
+                path: path.to_string(),
+                tier: *tier,
+                sym: sym.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| {
+            a.sym
+                .start_byte
+                .cmp(&b.sym.start_byte)
+                .then(a.sym.end_byte.cmp(&b.sym.end_byte))
+                .then(a.sym.name.cmp(&b.sym.name))
+        });
+        out
+    }
+
     /// All entries whose `container == type_name` — members declared directly on the type (instance
     /// members, companion members, enum entries; both tiers merged). Borrowed.
     pub fn members_of(&self, type_name: &str) -> &[Entry] {

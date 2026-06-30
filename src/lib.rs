@@ -5,6 +5,7 @@
 //! in milliseconds — and a thin LSP layer (`lsp`) that is the only place aware of `tower-lsp`.
 
 pub mod artifacts;
+pub mod actions;
 pub mod catalog;
 pub mod classpath;
 pub mod compile;
@@ -13,17 +14,23 @@ pub mod daemon;
 pub mod coords;
 pub mod deps;
 pub mod diagnostics;
+pub mod edit;
+pub mod hints;
 pub mod index;
 pub mod indexer;
 pub mod infer;
+pub mod imports;
 pub mod jar;
 pub mod java;
 pub mod lsp;
 pub mod parser;
+pub mod ranges;
 pub mod resolve;
+pub mod semantic;
 pub mod sidecar;
 pub mod solve;
 pub mod symbol;
+pub mod symbols;
 pub mod telemetry;
 pub mod text;
 pub mod trace;

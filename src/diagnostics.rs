@@ -23,12 +23,26 @@ pub enum Severity {
     Hint,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiagnosticCode {
+    UnusedImport,
+}
+
+impl DiagnosticCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DiagnosticCode::UnusedImport => "unused_import",
+        }
+    }
+}
+
 /// A diagnostic over a byte range (converted to an LSP `Range` at the LSP boundary, like `Def`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
     pub start_byte: usize,
     pub end_byte: usize,
     pub severity: Severity,
+    pub code: Option<DiagnosticCode>,
     pub message: String,
 }
 
@@ -70,6 +84,7 @@ fn unused_imports(tree: &Tree, src: &str) -> Vec<Diagnostic> {
                     start_byte: child.start_byte(),
                     end_byte: child.end_byte(),
                     severity: Severity::Hint,
+                    code: Some(DiagnosticCode::UnusedImport),
                     message: format!("Unused import: {local}"),
                 });
             }
@@ -212,6 +227,7 @@ fn record_duplicate(
             start_byte: binding.start_byte,
             end_byte: binding.end_byte,
             severity: Severity::Error,
+            code: None,
             message: format!("Duplicate {}: {}", binding.kind.label(), binding.name),
         });
     } else {

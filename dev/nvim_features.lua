@@ -2,14 +2,17 @@
 -- Headless Neovim checks for S1 (incremental reparse via did_change) and S3 (references),
 -- driven through Neovim's real LSP client against dev/sample. Run via dev/smoke_features.sh.
 --
---     nvim -l dev/nvim_features.lua <project-dir>
+--     nvim -l dev/nvim_features.lua <project-dir> [ktlsp-bin]
 
 local project = arg[1]
-assert(project and project ~= "", "usage: nvim -l dev/nvim_features.lua <project-dir>")
+assert(project and project ~= "", "usage: nvim -l dev/nvim_features.lua <project-dir> [ktlsp-bin]")
 
-local bin = vim.fn.getcwd() .. "/target/release/ktlsp"
-if vim.fn.filereadable(bin) == 0 then
-  bin = vim.fn.getcwd() .. "/target/debug/ktlsp"
+local bin = arg[2] or os.getenv("KTLSP_BIN")
+if not bin or bin == "" then
+  bin = vim.fn.getcwd() .. "/target/release/ktlsp"
+  if vim.fn.filereadable(bin) == 0 then
+    bin = vim.fn.getcwd() .. "/target/debug/ktlsp"
+  end
 end
 assert(vim.fn.filereadable(bin) == 1, "ktlsp binary not found — run `cargo build` first")
 
@@ -37,6 +40,15 @@ end, 50)
 local client = vim.lsp.get_client_by_id(id)
 check("advertises referencesProvider", client and client.server_capabilities.referencesProvider ~= nil)
 check("advertises completionProvider", client and client.server_capabilities.completionProvider ~= nil)
+check("advertises hoverProvider", client and client.server_capabilities.hoverProvider ~= nil)
+check("advertises documentHighlightProvider", client and client.server_capabilities.documentHighlightProvider ~= nil)
+check("advertises documentSymbolProvider", client and client.server_capabilities.documentSymbolProvider ~= nil)
+check("advertises workspaceSymbolProvider", client and client.server_capabilities.workspaceSymbolProvider ~= nil)
+check("advertises codeActionProvider", client and client.server_capabilities.codeActionProvider ~= nil)
+check("advertises foldingRangeProvider", client and client.server_capabilities.foldingRangeProvider ~= nil)
+check("advertises selectionRangeProvider", client and client.server_capabilities.selectionRangeProvider ~= nil)
+check("advertises semanticTokensProvider", client and client.server_capabilities.semanticTokensProvider ~= nil)
+check("advertises inlayHintProvider", client and client.server_capabilities.inlayHintProvider ~= nil)
 
 -- locate (0-indexed) line/col of `token` on the buffer line containing `anchor`
 local function find(anchor, token)
@@ -68,6 +80,114 @@ local function request(method, params)
 end
 
 local uri = vim.uri_from_bufnr(bufnr)
+
+-- Add one unused import through the editor so code actions exercise the real didChange path.
+vim.api.nvim_buf_set_lines(bufnr, 1, 1, false, { "import a.b.Unused" })
+vim.wait(800)
+
+-- ---- Passive symbol surface: document symbols, hover, highlights, workspace symbols ----
+do
+  local res = request("textDocument/documentSymbol", { textDocument = { uri = uri } })
+  local has_helper, has_main = false, false
+  for _, item in ipairs(res or {}) do
+    if item.name == "helper" then has_helper = true end
+    if item.name == "main" then has_main = true end
+  end
+  check("documentSymbol includes helper", has_helper, vim.inspect(res))
+  check("documentSymbol includes main", has_main, vim.inspect(res))
+end
+
+do
+  local l, c = find("println(helper())", "helper")
+  check("found helper() call for passive requests", l ~= nil)
+  if l then
+    local hover = request("textDocument/hover", {
+      textDocument = { uri = uri },
+      position = { line = l, character = c },
+    })
+    local hover_text = hover and hover.contents and (hover.contents.value or hover.contents)
+    check("hover(helper) reports function facts", hover_text ~= nil and tostring(hover_text):find("helper", 1, true) ~= nil, vim.inspect(hover))
+
+    local highlights = request("textDocument/documentHighlight", {
+      textDocument = { uri = uri },
+      position = { line = l, character = c },
+    })
+    check("documentHighlight(helper) returns declaration + usage", highlights ~= nil and #highlights >= 2, vim.inspect(highlights))
+  end
+end
+
+do
+  local res = request("workspace/symbol", { query = "helper" })
+  local has_helper = false
+  for _, item in ipairs(res or {}) do
+    if item.name == "helper" then
+      has_helper = true
+      break
+    end
+  end
+  check("workspace/symbol finds helper", has_helper, vim.inspect(res))
+end
+
+-- ---- Source/code actions: remove unused import as an LSP WorkspaceEdit ----
+do
+  local l, c = find("import a.b.Unused", "Unused")
+  check("found unused import for codeAction", l ~= nil)
+  if l then
+    local actions = request("textDocument/codeAction", {
+      textDocument = { uri = uri },
+      range = {
+        start = { line = l, character = c },
+        ["end"] = { line = l, character = c + #"Unused" },
+      },
+      context = {
+        diagnostics = {},
+        only = { "quickfix" },
+      },
+    })
+    local found = false
+    for _, action in ipairs(actions or {}) do
+      if action.title == "Remove unused import `Unused`" and action.edit ~= nil then
+        found = true
+        break
+      end
+    end
+    check("codeAction removes unused import", found, vim.inspect(actions))
+  end
+end
+
+-- ---- Visual editor features: folding, selection ranges, semantic tokens, inlay hints ----
+do
+  local folds = request("textDocument/foldingRange", { textDocument = { uri = uri } })
+  check("foldingRange returns body folds", folds ~= nil and #folds >= 1, vim.inspect(folds))
+
+  local l, c = find("println(helper())", "helper")
+  if l then
+    local selections = request("textDocument/selectionRange", {
+      textDocument = { uri = uri },
+      positions = { { line = l, character = c } },
+    })
+    check("selectionRange returns parent chain", selections ~= nil and selections[1] ~= nil and selections[1].parent ~= nil, vim.inspect(selections))
+  end
+
+  local semantic = request("textDocument/semanticTokens/full", { textDocument = { uri = uri } })
+  check("semanticTokens/full returns encoded tokens", semantic ~= nil and semantic.data ~= nil and #semantic.data > 0, vim.inspect(semantic))
+
+  local hints = request("textDocument/inlayHint", {
+    textDocument = { uri = uri },
+    range = {
+      start = { line = 0, character = 0 },
+      ["end"] = { line = vim.api.nvim_buf_line_count(bufnr), character = 0 },
+    },
+  })
+  local has_type_hint = false
+  for _, hint in ipairs(hints or {}) do
+    if hint.label == ": String" or hint.label == ": Greeter" then
+      has_type_hint = true
+      break
+    end
+  end
+  check("inlayHint returns local type hint", has_type_hint, vim.inspect(hints))
+end
 
 -- ---- S3: references on `helper` (declaration + the call in main) ----
 do
