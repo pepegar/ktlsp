@@ -103,7 +103,8 @@ ktlsp jumps into your dependencies' source, not just your own code:
 - It reads the project's Gradle **version catalog** (`gradle/libs.versions.toml`) for coordinates.
 - For each, it finds the `-sources.jar` in your local **Gradle/Maven cache** (`~/.gradle`, `~/.m2`)
   or **downloads it from Maven Central**, then extracts the `.kt`/`.java` sources into
-  `~/.cache/ktlsp/extracted/` and indexes them like any other file.
+  `~/.cache/ktlsp/extracted/` and indexes them like any other file. Set `KTLSP_CACHE_DIR` to use a
+  different writable cache root for extracted sources, symbol caches, trust, and default logs.
 - goto then returns a `file://` location into that extracted source — so jumping to `listOf` lands
   in `kotlin-stdlib`'s `Collections.kt`, and jumping to a library type lands in its real source.
 
@@ -155,7 +156,8 @@ What to expect when enabled:
   `~/.cache/ktlsp/trusted_roots` (delete that file to reset). An untrusted project never spawns a
   build. **Non-interactive/headless clients** that can't answer the `window/showMessageRequest`
   prompt can pre-authorize a project by appending its canonical path (`realpath <root>`) as a line to
-  `~/.cache/ktlsp/trusted_roots` before starting the server.
+  `~/.cache/ktlsp/trusted_roots` before starting the server. When `KTLSP_CACHE_DIR` is set, the trust
+  file is `$KTLSP_CACHE_DIR/trusted_roots`.
 - **Cold-start latency.** A cold gradle daemon can take 30s–2min for the first diagnostics; a
   "compiling…" status is logged while a run is in flight. On-save only — never per keystroke.
 - **`compileKotlin` coverage only (spike).** Errors surface for the main JVM source set. Saving a
@@ -224,7 +226,8 @@ simpler than an embedded SQL engine for a by-name workload. It is split into two
 once and never disturbed by an edit). Durability isn't full persistence of the *live* index, but
 the parse cost behind the durable tier *is* persisted: library symbols are serialized to a
 per-jar cache (`~/.cache/ktlsp/symcache/`, keyed by a jar fingerprint), so startup deserializes
-them instead of re-parsing. LSIF was rejected outright — it's a static/batch dump format, wrong for
+them instead of re-parsing. With `KTLSP_CACHE_DIR`, the symcache moves to
+`$KTLSP_CACHE_DIR/symcache`. LSIF was rejected outright — it's a static/batch dump format, wrong for
 live editing.
 
 ## Development
@@ -237,6 +240,9 @@ cargo test --test library_goto -- --ignored   # + real Maven Central download (n
 cargo run --example dump -- file.kt     # dump a Kotlin parse tree (grammar/query work)
 cargo run --example dump_java -- f.java # dump a Java parse tree
 RUST_LOG=ktlsp=debug cargo run          # run the server on stdio
+dev/ktlsp-harness.sh basic              # one-command editor harness with logs/traces under /tmp
+dev/ktlsp-harness.sh features           # refs/completion/auto-import/edit smoke through Neovim
+dev/ktlsp-harness.sh library            # generated project + goto into kotlin-stdlib sources
 dev/smoke.sh                            # real-editor check: project-local goto via Neovim
 dev/smoke_library.sh                    # real-editor check: goto into kotlin-stdlib via Neovim
 ```
@@ -248,6 +254,64 @@ dev/smoke_library.sh                    # real-editor check: goto into kotlin-st
 that `.kt`→`kotlin` detection, client initialization, `definitionProvider`, and both local and
 cross-file goto-definition all work — exercising the real editor path, not a hand-rolled JSON-RPC
 driver. Requires `nvim` (0.8+) on `PATH`.
+
+### Scriptable editor harness
+
+`dev/ktlsp-harness.sh` is the agent-friendly entrypoint for exercising ktlsp through a real editor
+client. It builds ktlsp and the bench helper, creates a run directory under `/tmp/ktlsp-harness/`,
+sets debug-friendly environment variables, runs a headless Neovim scenario, and leaves artifacts in
+one place:
+
+```sh
+dev/ktlsp-harness.sh basic
+dev/ktlsp-harness.sh features
+dev/ktlsp-harness.sh library
+dev/ktlsp-harness.sh project --root /path/to/project --file /path/to/project/src/main/kotlin/App.kt
+KTLSP_LIVE_COMPILE=1 dev/ktlsp-harness.sh gradle-live
+```
+
+Useful scenarios:
+
+- `basic` creates a disposable two-file Kotlin project and checks local + cross-file goto.
+- `features` runs the richer `dev/sample` smoke: references, completion, auto-import, member goto,
+  and did-change reparse.
+- `library` creates a disposable Gradle-like project with a version catalog and checks goto into
+  `kotlin-stdlib` sources.
+- `project` opens an existing Kotlin file and checks LSP health/capabilities.
+- `gradle-live`, `gradle-compile`, and `comprehensive` exercise `dev/gradle-sample`; compile
+  diagnostics remain opt-in because they run Gradle/the sidecar.
+
+For new editor-visible features, add the pure Rust tests first, then extend or add a Neovim probe
+that exercises the behavior through a real LSP client. Route that probe through
+`dev/ktlsp-harness.sh` so future agents can run it with the same run-directory logging. Use
+disposable generated projects for narrow cases; commit a `dev/` fixture only when the setup is
+reused across scenarios or too expensive to generate.
+
+Each run prints its artifact directory. The important files are:
+
+- `artifacts/summary.txt` — scenario, status, binary, cache, and log paths.
+- `xdg-state/nvim/lsp.log` — Neovim LSP log, including ktlsp stderr.
+- `artifacts/trace-events.jsonl` — per-request ktlsp events from `KTLSP_TRACE`.
+- `artifacts/trace.json` — Perfetto/Chrome trace generated by `bench trace` when events exist.
+- `artifacts/compile-timing.jsonl` — compile timing records from `KTLSP_COMPILE_LOG` when compile
+  diagnostics are enabled.
+- `cache/` — the run-local `KTLSP_CACHE_DIR` containing extracted sources, symcache, and trusted
+  roots.
+
+The harness sets `RUST_LOG=ktlsp=debug`, `KTLSP_CACHE_DIR`, `KTLSP_TRACE`,
+`KTLSP_COMPILE_LOG`, and `XDG_STATE_HOME` for each run. If you override `HOME` manually, keep
+`CARGO_HOME` and `RUSTUP_HOME` pointed at real caches unless you intentionally want Cargo/Rustup to
+start from scratch.
+
+Common failure clues:
+
+| Symptom | First place to check |
+|---|---|
+| Empty goto result | `artifacts/trace-events.jsonl` for `outcome:"empty"` and the symbol/cursor |
+| Dependency-source goto fails | `xdg-state/nvim/lsp.log` for resolve/extract warnings |
+| Neovim writes `nvim.log` in the repo | Run through `dev/ktlsp-harness.sh` so `XDG_STATE_HOME` is set |
+| Compile diagnostics never start | `cache/trusted_roots`, `KTLSP_LIVE_COMPILE`, and `xdg-state/nvim/lsp.log` |
+| Kotlin daemon backend unavailable | Build the sidecar or set `KTLSP_SIDECAR_BIN` |
 
 ### The test harness
 

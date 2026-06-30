@@ -7,9 +7,11 @@
 //! Written as JSON-lines (one event per line, append-only, crash-safe). `bench trace` converts the
 //! log into a Chrome-trace JSON file loadable at <https://ui.perfetto.dev>.
 //!
-//! Destination: `KTLSP_TRACE` if set, else `~/.cache/ktlsp/trace-events.jsonl`. No env and no HOME
-//! disables it. Writing is best-effort and never disturbs request handling.
+//! Destination: `KTLSP_TRACE` if set, else `KTLSP_CACHE_DIR/trace-events.jsonl`, else
+//! `~/.cache/ktlsp/trace-events.jsonl`. No env and no HOME disables it. Writing is best-effort and
+//! never disturbs request handling.
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -40,8 +42,22 @@ pub fn log_path() -> Option<PathBuf> {
             return Some(PathBuf::from(p));
         }
     }
-    let home = std::env::var_os("HOME")?;
-    Some(Path::new(&home).join(".cache/ktlsp/trace-events.jsonl"))
+    default_log_path(
+        std::env::var_os(crate::deps::CACHE_DIR_ENV),
+        std::env::var_os("HOME"),
+        "trace-events.jsonl",
+    )
+}
+
+fn default_log_path(
+    cache_dir: Option<OsString>,
+    home: Option<OsString>,
+    file_name: &str,
+) -> Option<PathBuf> {
+    if let Some(path) = cache_dir.filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path).join(file_name));
+    }
+    home.map(|h| Path::new(&h).join(".cache/ktlsp").join(file_name))
 }
 
 fn record(event: &TraceEvent) {
@@ -163,5 +179,29 @@ mod tests {
         let back: TraceEvent = serde_json::from_str(&s).unwrap();
         assert_eq!(back.name, "goto_definition");
         assert!(s.contains("\"cat\":\"lsp\""));
+    }
+
+    #[test]
+    fn default_log_path_prefers_cache_dir() {
+        assert_eq!(
+            default_log_path(
+                Some(OsString::from("/tmp/ktlsp-cache")),
+                Some(OsString::from("/home/me")),
+                "trace-events.jsonl",
+            ),
+            Some(PathBuf::from("/tmp/ktlsp-cache/trace-events.jsonl"))
+        );
+    }
+
+    #[test]
+    fn default_log_path_ignores_empty_cache_dir() {
+        assert_eq!(
+            default_log_path(
+                Some(OsString::from("")),
+                Some(OsString::from("/home/me")),
+                "trace-events.jsonl",
+            ),
+            Some(PathBuf::from("/home/me/.cache/ktlsp/trace-events.jsonl"))
+        );
     }
 }
