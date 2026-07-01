@@ -262,6 +262,38 @@ fn goto_on_imported_member_type_name() {
 }
 
 #[test]
+fn explicit_imported_nested_type_usage() {
+    check(
+        "//- Notifications.kt\npackage lib\nclass Notification {\n    class /*def*/Updated\n}\n\
+         //- Main.kt\npackage app\nimport lib.Notification.Updated\nfun main(value: /*^*/Updated) {}\n",
+    );
+}
+
+#[test]
+fn goto_on_imported_companion_property_name() {
+    check(
+        "//- DocumentDatabaseService.kt\npackage lib\nclass DocumentPageModel {\n    companion object {\n        val /*def*/WHITEBOARD_EMPTY_TEMPLATE_UUID = \"none\"\n    }\n}\n\
+         //- Main.kt\npackage app\nimport lib.DocumentPageModel.Companion./*^*/WHITEBOARD_EMPTY_TEMPLATE_UUID\nfun main() {}\n",
+    );
+}
+
+#[test]
+fn explicit_imported_companion_property_usage() {
+    check(
+        "//- DocumentDatabaseService.kt\npackage lib\nclass DocumentPageModel {\n    companion object {\n        val /*def*/WHITEBOARD_EMPTY_TEMPLATE_UUID = \"none\"\n    }\n}\n\
+         //- Main.kt\npackage app\nimport lib.DocumentPageModel.Companion.WHITEBOARD_EMPTY_TEMPLATE_UUID\nfun main() { val template = /*^*/WHITEBOARD_EMPTY_TEMPLATE_UUID }\n",
+    );
+}
+
+#[test]
+fn aliased_imported_companion_property_usage() {
+    check(
+        "//- DocumentDatabaseService.kt\npackage lib\nclass DocumentPageModel {\n    companion object {\n        val /*def*/WHITEBOARD_EMPTY_TEMPLATE_UUID = \"none\"\n    }\n}\n\
+         //- Main.kt\npackage app\nimport lib.DocumentPageModel.Companion.WHITEBOARD_EMPTY_TEMPLATE_UUID as EmptyTemplate\nfun main() { val template = /*^*/EmptyTemplate }\n",
+    );
+}
+
+#[test]
 fn goto_on_imported_type_alias_name() {
     check(
         "//- Target.kt\npackage lib\nclass /*def*/Target\n\

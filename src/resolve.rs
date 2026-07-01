@@ -20,7 +20,7 @@ use crate::index::{Entry, Index};
 use crate::infer;
 use crate::parser::{
     child_of_kind, class_kind, first_ident, identifier_at, imports_of, name_field, node_text,
-    package_of,
+    package_of, Import,
 };
 use crate::symbol::{Def, SymbolKind};
 
@@ -488,15 +488,11 @@ fn resolve_qualified(
     uk: UseKind,
     src: &str,
 ) -> Option<Vec<Def>> {
-    let (package, qkind) = qualified_package_and_kind(usage, uk, src)?;
-    Some(
-        index
-            .lookup_by_name(name)
-            .iter()
-            .filter(|e| e.sym.package == package && kind_ok(qkind, e.sym.kind))
-            .map(to_def)
-            .collect(),
-    )
+    let (parts, qkind) = qualified_path_and_kind(usage, uk, src)?;
+    if !parts.last().is_some_and(|part| part == name) {
+        return Some(Vec::new());
+    }
+    Some(resolve_absolute_path(index, &parts, |kind| kind_ok(qkind, kind)))
 }
 
 fn resolve_nested_type(index: &Index, tree: &Tree, src: &str, usage: Node) -> Option<Vec<Def>> {
@@ -544,12 +540,12 @@ fn resolve_nested_type(index: &Index, tree: &Tree, src: &str, usage: Node) -> Op
     None
 }
 
-fn qualified_package_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(String, UseKind)> {
+fn qualified_path_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(Vec<String>, UseKind)> {
     let parent = usage.parent()?;
     if parent.kind() == "user_type" {
         let parts = direct_identifier_parts(parent, src);
-        if parts.len() > 1 && parts.last().is_some_and(|(_, n)| n == node_text(usage, src)) {
-            return Some((join_part_names(&parts[..parts.len() - 1]), UseKind::Type));
+        if parts.len() > 1 && parts.last().is_some_and(|(node, _)| *node == usage) {
+            return Some((part_names(&parts), UseKind::Type));
         }
     }
     if parent.kind() == "navigation_expression" {
@@ -569,7 +565,7 @@ fn qualified_package_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(St
                     }
                 }
             };
-            return Some((join_part_names(&parts[..parts.len() - 1]), qkind));
+            return Some((part_names(&parts), qkind));
         }
     }
     None
@@ -616,14 +612,6 @@ fn navigation_parts<'t>(node: Node<'t>, src: &str) -> Option<Vec<(Node<'t>, Stri
     }
 }
 
-fn join_part_names(parts: &[(Node, String)]) -> String {
-    parts
-        .iter()
-        .map(|(_, name)| name.as_str())
-        .collect::<Vec<_>>()
-        .join(".")
-}
-
 fn resolve_absolute_path(
     index: &Index,
     parts: &[String],
@@ -642,12 +630,30 @@ fn resolve_absolute_path(
         .collect()
 }
 
+fn import_path_matches_entry(import: &Import, entry: &Entry) -> bool {
+    if import.wildcard || import.simple_name() != entry.sym.name {
+        return false;
+    }
+    let parts: Vec<String> = import.path.split('.').map(str::to_string).collect();
+    let prefix = &parts[..parts.len().saturating_sub(1)];
+    absolute_path_matches(entry, prefix)
+}
+
 fn absolute_path_matches(entry: &Entry, prefix: &[String]) -> bool {
     if let Some(container) = &entry.sym.container {
         let Some((last, package_parts)) = prefix.split_last() else {
             return false;
         };
-        container == last && entry.sym.package == package_parts.join(".")
+        if container == last && entry.sym.package == package_parts.join(".") {
+            return true;
+        }
+        if last == "Companion" {
+            let Some((enclosing, package_parts)) = package_parts.split_last() else {
+                return false;
+            };
+            return container == enclosing && entry.sym.package == package_parts.join(".");
+        }
+        false
     } else {
         entry.sym.package == prefix.join(".")
     }
@@ -710,12 +716,11 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
     // `as`-alias: the usage name is an import alias; resolve the *real* name in that package.
     for imp in &imports {
         if imp.alias.as_deref() == Some(name) {
-            let pkg = imp.package();
             let real = imp.simple_name();
             return index
                 .lookup_by_name(real)
                 .iter()
-                .filter(|e| e.sym.package == pkg && kind_ok(uk, e.sym.kind))
+                .filter(|e| kind_ok(uk, e.sym.kind) && import_path_matches_entry(imp, e))
                 .map(to_def)
                 .collect();
         }
@@ -732,12 +737,13 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
     }
 
     // Explicit (non-wildcard) import of this exact name.
-    let explicit_pkgs: Vec<String> = imports
+    let explicit_imports: Vec<&Import> = imports
         .iter()
         .filter(|i| !i.wildcard && i.local_name() == Some(name))
-        .map(|i| i.package())
         .collect();
-    if let Some(hits) = pick(&candidates, |e| explicit_pkgs.contains(&e.sym.package)) {
+    if let Some(hits) = pick(&candidates, |e| {
+        explicit_imports.iter().any(|imp| import_path_matches_entry(imp, e))
+    }) {
         return hits;
     }
 
