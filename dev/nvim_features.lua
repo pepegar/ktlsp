@@ -178,6 +178,7 @@ do
     })
     local hover_text = hover and hover.contents and (hover.contents.value or hover.contents)
     check("hover(helper) reports function facts", hover_text ~= nil and tostring(hover_text):find("helper", 1, true) ~= nil, vim.inspect(hover))
+    check("hover(helper) includes KDoc", hover_text ~= nil and tostring(hover_text):find("Helpful hover docs.", 1, true) ~= nil, vim.inspect(hover))
 
     local highlights = request("textDocument/documentHighlight", {
       textDocument = { uri = uri },

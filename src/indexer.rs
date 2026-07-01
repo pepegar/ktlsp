@@ -124,15 +124,19 @@ fn push(
     kind: SymbolKind,
     package: &str,
     container: Option<&str>,
+    documentation: Option<&str>,
 ) {
-    out.push(IndexedSymbol::new(
-        node_text(name_node, src),
-        kind,
-        package,
-        container.map(str::to_string),
-        name_node.start_byte(),
-        name_node.end_byte(),
-    ));
+    out.push(IndexedSymbol {
+        documentation: documentation.map(str::to_string),
+        ..IndexedSymbol::new(
+            node_text(name_node, src),
+            kind,
+            package,
+            container.map(str::to_string),
+            name_node.start_byte(),
+            name_node.end_byte(),
+        )
+    });
 }
 
 /// Push the name(s) bound by a `property_declaration`, handling `val (a, b) = ...` destructuring.
@@ -144,6 +148,7 @@ fn push_property_names(
     package: &str,
     container: Option<&str>,
     ext_receiver: Option<&str>,
+    documentation: Option<&str>,
     scope: &TypeScope,
     out: &mut Vec<IndexedSymbol>,
 ) {
@@ -161,6 +166,7 @@ fn push_property_names(
                         package,
                         container,
                         ext_receiver,
+                        documentation,
                         vt,
                     );
                 }
@@ -179,6 +185,7 @@ fn push_property_names(
                                 package,
                                 container,
                                 ext_receiver,
+                                documentation,
                                 vt,
                             );
                         }
@@ -200,10 +207,12 @@ fn push_ext(
     package: &str,
     container: Option<&str>,
     ext_receiver: Option<&str>,
+    documentation: Option<&str>,
     value_type: Option<TypeRef>,
 ) {
     out.push(IndexedSymbol {
         ext_receiver: ext_receiver.map(str::to_string),
+        documentation: documentation.map(str::to_string),
         value_type,
         ..IndexedSymbol::new(
             node_text(name_node, src),
@@ -227,10 +236,12 @@ fn push_function(
     package: &str,
     container: Option<&str>,
     ext_receiver: Option<&str>,
+    documentation: Option<&str>,
     scope: &TypeScope,
 ) {
     out.push(IndexedSymbol {
         ext_receiver: ext_receiver.map(str::to_string),
+        documentation: documentation.map(str::to_string),
         arity: Some(value_param_count(decl)),
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
@@ -273,8 +284,10 @@ fn push_type(
     container: Option<&str>,
     supertypes: Vec<String>,
     type_params: Vec<String>,
+    documentation: Option<&str>,
 ) {
     out.push(IndexedSymbol {
+        documentation: documentation.map(str::to_string),
         supertypes,
         type_params,
         ..IndexedSymbol::new(
@@ -563,7 +576,17 @@ fn push_ctor_properties(
         }
         if let Some(id) = first_ident(cp) {
             let vt = value_type_of_scoped(cp, src, Some(scope));
-            push_ext(out, id, src, SymbolKind::Property, package, Some(container), None, vt);
+            push_ext(
+                out,
+                id,
+                src,
+                SymbolKind::Property,
+                package,
+                Some(container),
+                None,
+                None,
+                vt,
+            );
         }
     }
 }
@@ -631,14 +654,30 @@ fn walk(
     out: &mut Vec<IndexedSymbol>,
 ) {
     let mut cursor = node.walk();
+    let mut pending_kdoc: Option<String> = None;
     for child in node.named_children(&mut cursor) {
         match child.kind() {
+            "block_comment" => {
+                pending_kdoc = normalize_kdoc(child, src);
+            }
+            "line_comment" => pending_kdoc = None,
             "class_declaration" => {
                 let kind = class_kind(child);
                 if let Some(name) = name_field(child) {
                     let sts = supertypes_of(child, src);
                     let tps = type_params_of(child, src);
-                    push_type(out, name, src, kind, package, container, sts, tps);
+                    let documentation = pending_kdoc.take();
+                    push_type(
+                        out,
+                        name,
+                        src,
+                        kind,
+                        package,
+                        container,
+                        sts,
+                        tps,
+                        documentation.as_deref(),
+                    );
                     let cname = node_text(name, src).to_string();
                     // Primary-constructor `val`/`var` parameters ARE properties of the class (this is
                     // every data-class property). Index them as members; plain params (no val/var) are
@@ -656,7 +695,18 @@ fn walk(
                 if let Some(name) = name_field(child) {
                     let sts = supertypes_of(child, src);
                     // Objects can't be generic -> no type parameters.
-                    push_type(out, name, src, SymbolKind::Object, package, container, sts, Vec::new());
+                    let documentation = pending_kdoc.take();
+                    push_type(
+                        out,
+                        name,
+                        src,
+                        SymbolKind::Object,
+                        package,
+                        container,
+                        sts,
+                        Vec::new(),
+                        documentation.as_deref(),
+                    );
                     let cname = node_text(name, src).to_string();
                     if let Some(body) = child_of_kind(child, "class_body") {
                         walk(body, src, package, Some(&cname), scope, out);
@@ -665,6 +715,7 @@ fn walk(
             }
             // Companion members belong to the enclosing class (keep `container`).
             "companion_object" => {
+                pending_kdoc = None;
                 if let Some(body) = child_of_kind(child, "class_body") {
                     walk(body, src, package, container, scope, out);
                 }
@@ -676,21 +727,52 @@ fn walk(
                     // different shape, but `extension_receiver` keys off the `name:` boundary so it
                     // is correct either way. We record it unconditionally.
                     let recv = extension_receiver(child, src);
-                    push_function(out, child, name, src, package, container, recv.as_deref(), scope);
+                    let documentation = pending_kdoc.take();
+                    push_function(
+                        out,
+                        child,
+                        name,
+                        src,
+                        package,
+                        container,
+                        recv.as_deref(),
+                        documentation.as_deref(),
+                        scope,
+                    );
                 }
                 // Do NOT recurse into the body: it only contains locals.
             }
             "property_declaration" => {
                 let recv = extension_receiver(child, src);
-                push_property_names(child, src, package, container, recv.as_deref(), scope, out);
+                let documentation = pending_kdoc.take();
+                push_property_names(
+                    child,
+                    src,
+                    package,
+                    container,
+                    recv.as_deref(),
+                    documentation.as_deref(),
+                    scope,
+                    out,
+                );
             }
             "enum_entry" => {
                 if let Some(id) = first_ident(child) {
-                    push(out, id, src, SymbolKind::EnumEntry, package, container);
+                    let documentation = pending_kdoc.take();
+                    push(
+                        out,
+                        id,
+                        src,
+                        SymbolKind::EnumEntry,
+                        package,
+                        container,
+                        documentation.as_deref(),
+                    );
                 }
             }
             "ERROR" => {
                 if let Some(name) = recover_value_class_name(child, src) {
+                    let documentation = pending_kdoc.take();
                     push_type(
                         out,
                         name,
@@ -700,6 +782,7 @@ fn walk(
                         container,
                         Vec::new(),
                         Vec::new(),
+                        documentation.as_deref(),
                     );
                 }
                 walk(child, src, package, container, scope, out);
@@ -707,9 +790,42 @@ fn walk(
             // Structural wrappers, `package_header`, `import`, and crucially `ERROR` nodes:
             // recurse to recover declarations nested inside. We never reach function bodies this
             // way (function_declaration is handled above without recursion), so locals stay out.
-            _ => walk(child, src, package, container, scope, out),
+            _ => {
+                pending_kdoc = None;
+                walk(child, src, package, container, scope, out)
+            }
         }
     }
+}
+
+fn normalize_kdoc(node: Node, src: &str) -> Option<String> {
+    let raw = node_text(node, src);
+    if !raw.starts_with("/**") {
+        return None;
+    }
+    let body = raw.strip_prefix("/**")?.strip_suffix("*/")?;
+    let lines: Vec<&str> = body.lines().collect();
+    let mut normalized = Vec::new();
+    let mut saw_content = false;
+
+    for line in lines {
+        let mut line = line.trim_start();
+        if let Some(rest) = line.strip_prefix('*') {
+            line = rest.strip_prefix(' ').unwrap_or(rest);
+        }
+        let line = line.trim_end();
+        if line.is_empty() && !saw_content {
+            continue;
+        }
+        if !line.is_empty() {
+            saw_content = true;
+        }
+        normalized.push(line);
+    }
+    while normalized.last().is_some_and(|line| line.is_empty()) {
+        normalized.pop();
+    }
+    (!normalized.is_empty()).then(|| normalized.join("\n"))
 }
 
 #[cfg(test)]

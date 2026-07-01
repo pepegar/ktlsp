@@ -1,5 +1,6 @@
 package demo
 
+/** Helpful hover docs. */
 fun helper(): Int = 42
 
 fun main() {

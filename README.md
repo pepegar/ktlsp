@@ -308,9 +308,9 @@ KTLSP_LIVE_COMPILE=1 dev/ktlsp-harness.sh gradle-live
 Useful scenarios:
 
 - `basic` creates a disposable two-file Kotlin project and checks local + cross-file goto.
-- `features` runs the richer `dev/sample` smoke: references, completion, auto-import, hover,
-  document/workspace symbols, highlights, syntax diagnostics, code actions, folding/selection
-  ranges, semantic tokens, inlay hints, member goto, rename, signature help,
+- `features` runs the richer `dev/sample` smoke: references, completion, auto-import, hover
+  signatures plus KDoc, document/workspace symbols, highlights, syntax diagnostics, code actions,
+  folding/selection ranges, semantic tokens, inlay hints, member goto, rename, signature help,
   implementation/type-definition, call/type hierarchy, workspace commands, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
   `kotlin-stdlib` and JDK sources.

@@ -111,7 +111,7 @@ async fn initialize_open_and_goto_definition() {
 
     // open a document
     let uri: Uri = "file:///tmp/ktlsp_e2e/Main.kt".parse().unwrap();
-    let text = "fun helper() {}\nfun main() { helper() }\n";
+    let text = "/** Helpful hover docs. */\nfun helper() {}\nfun main() { helper() }\n";
     backend
         .did_open(DidOpenTextDocumentParams {
             text_document: TextDocumentItem {
@@ -124,12 +124,12 @@ async fn initialize_open_and_goto_definition() {
         .await;
 
     // goto-definition on the `helper()` call on line 1
-    let character = text.lines().nth(1).unwrap().find("helper").unwrap() as u32;
+    let character = text.lines().nth(2).unwrap().find("helper").unwrap() as u32;
     let resp = backend
         .goto_definition(GotoDefinitionParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: Position { line: 1, character },
+                position: Position { line: 2, character },
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),
@@ -140,19 +140,19 @@ async fn initialize_open_and_goto_definition() {
     match resp {
         Some(GotoDefinitionResponse::Scalar(loc)) => {
             assert_eq!(loc.uri.as_str(), uri.as_str());
-            // `helper` is defined on line 0
-            assert_eq!(loc.range.start.line, 0);
+            // `helper` is defined on line 1
+            assert_eq!(loc.range.start.line, 1);
             assert_eq!(loc.range.start.character, "fun ".len() as u32);
         }
         other => panic!("expected a single definition location, got: {other:?}"),
     }
 
-    // textDocument/references on `helper` (declaration on line 0 + one call on line 1).
+    // textDocument/references on `helper` (declaration on line 1 + one call on line 2).
     let refs = backend
         .references(ReferenceParams {
             text_document_position: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: Position { line: 1, character },
+                position: Position { line: 2, character },
             },
             context: ReferenceContext { include_declaration: true },
             work_done_progress_params: Default::default(),
@@ -185,12 +185,12 @@ async fn initialize_open_and_goto_definition() {
         "document symbols must include `helper`: {symbols:?}"
     );
 
-    // textDocument/hover on the `helper()` call reports the indexed declaration facts.
+    // textDocument/hover on the `helper()` call reports the indexed declaration facts and KDoc.
     let hover = backend
         .hover(HoverParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: Position { line: 1, character },
+                position: Position { line: 2, character },
             },
             work_done_progress_params: Default::default(),
         })
@@ -200,6 +200,7 @@ async fn initialize_open_and_goto_definition() {
     match hover.contents {
         HoverContents::Markup(markup) => {
             assert!(markup.value.contains("fun helper()"), "{markup:?}");
+            assert!(markup.value.contains("Helpful hover docs."), "{markup:?}");
         }
         other => panic!("expected markup hover, got {other:?}"),
     }
@@ -209,7 +210,7 @@ async fn initialize_open_and_goto_definition() {
         .document_highlight(DocumentHighlightParams {
             text_document_position_params: TextDocumentPositionParams {
                 text_document: TextDocumentIdentifier { uri: uri.clone() },
-                position: Position { line: 1, character },
+                position: Position { line: 2, character },
             },
             work_done_progress_params: Default::default(),
             partial_result_params: Default::default(),

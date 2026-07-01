@@ -78,7 +78,7 @@ fn index_iteration_returns_project_and_durable_symbols() {
 fn symbol_at_resolves_indexed_usage_for_hover() {
     let mut ws = Workspace::new();
     let key = "mem:///Main.kt".to_string();
-    let src = "package app\nfun helper(): Int = 1\nfun main() { helper() }\n";
+    let src = "package app\n/**\n * Adds docs for helper.\n * Second line.\n */\nfun helper(): Int = 1\nfun main() { helper() }\n";
     ws.open(key.clone(), src.to_string());
     let offset = src.rfind("helper").unwrap();
 
@@ -86,8 +86,43 @@ fn symbol_at_resolves_indexed_usage_for_hover() {
 
     assert_eq!(symbol.name, "helper");
     assert_eq!(symbol.kind, SymbolKind::Function);
+    assert_eq!(
+        symbol.documentation.as_deref(),
+        Some("Adds docs for helper.\nSecond line.")
+    );
     assert!(symbol.hover_text().contains("fun helper(): Int"));
     assert!(symbol.hover_text().contains("app"));
+    assert!(symbol.hover_text().contains("Adds docs for helper.\nSecond line."));
+}
+
+#[test]
+fn kotlin_kdoc_is_indexed_but_plain_block_comments_are_ignored() {
+    let mut ws = Workspace::new();
+    let key = "mem:///Main.kt".to_string();
+    let src = "package app\n/** Documented helper. */\nfun helper(): Int = 1\n/* Not KDoc. */\nfun plain(): Int = 2\n";
+    ws.open(key.clone(), src.to_string());
+
+    let symbols = ws.document_symbols(&key);
+    let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
+    let plain = symbols.iter().find(|s| s.name == "plain").unwrap();
+
+    assert_eq!(helper.documentation.as_deref(), Some("Documented helper."));
+    assert_eq!(plain.documentation, None);
+}
+
+#[test]
+fn kdoc_is_consumed_once_and_not_reused_by_the_next_declaration() {
+    let mut ws = Workspace::new();
+    let key = "mem:///Main.kt".to_string();
+    let src = "package app\n/** First helper docs. */\nfun helper(): Int = 1\nfun plain(): Int = 2\n";
+    ws.open(key.clone(), src.to_string());
+
+    let symbols = ws.document_symbols(&key);
+    let helper = symbols.iter().find(|s| s.name == "helper").unwrap();
+    let plain = symbols.iter().find(|s| s.name == "plain").unwrap();
+
+    assert_eq!(helper.documentation.as_deref(), Some("First helper docs."));
+    assert_eq!(plain.documentation, None);
 }
 
 #[test]

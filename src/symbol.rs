@@ -57,6 +57,11 @@ pub struct IndexedSymbol {
     pub container: Option<String>,
     pub start_byte: usize,
     pub end_byte: usize,
+    /// Normalized KDoc text from an immediately preceding `/** ... */` block comment. `None` when
+    /// the declaration is undocumented or the source language/extractor does not support docs for
+    /// that declaration kind yet. `#[serde(default)]` so older symcaches still deserialize.
+    #[serde(default)]
+    pub documentation: Option<String>,
     /// For a `Class`/`Interface`/`Object`/`EnumClass`: the simple names of its declared
     /// supertypes (the `extends`/`implements` list). Empty for everything else. Used by member
     /// completion (Stage B) to walk the inheritance chain. `#[serde(default)]` so older symcaches
@@ -114,6 +119,7 @@ impl IndexedSymbol {
             container,
             start_byte,
             end_byte,
+            documentation: None,
             supertypes: Vec::new(),
             ext_receiver: None,
             arity: None,

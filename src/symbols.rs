@@ -13,6 +13,7 @@ pub struct SymbolSummary {
     pub container: Option<String>,
     pub start_byte: usize,
     pub end_byte: usize,
+    pub documentation: Option<String>,
     pub tier: Tier,
     pub supertypes: Vec<String>,
     pub ext_receiver: Option<String>,
@@ -33,6 +34,7 @@ impl SymbolSummary {
             container: entry.sym.container.clone(),
             start_byte: entry.sym.start_byte,
             end_byte: entry.sym.end_byte,
+            documentation: entry.sym.documentation.clone(),
             tier: entry.tier,
             supertypes: entry.sym.supertypes.clone(),
             ext_receiver: entry.sym.ext_receiver.clone(),
@@ -80,6 +82,11 @@ impl SymbolSummary {
         };
         if let Some(detail) = self.detail() {
             line.push_str(&format!("\n{detail}"));
+        }
+        if let Some(doc) = &self.documentation {
+            if !doc.is_empty() {
+                line.push_str(&format!("\n\n{doc}"));
+            }
         }
         line
     }
