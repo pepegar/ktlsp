@@ -41,10 +41,15 @@ fn index_into_workspace(coord: &Coordinate, repos: &Repos, extract_root: &Path) 
     let mut kotlin = KotlinParser::new();
     let mut java = JavaParser::new();
     let batches = deps::resolve_coordinate(coord, repos, extract_root, &mut kotlin, &mut java);
-    assert!(!batches.is_empty(), "expected indexed library files for {}", coord.label());
+    assert!(
+        !batches.is_empty(),
+        "expected indexed library files for {}",
+        coord.label()
+    );
     let mut ws = Workspace::new();
     for batch in batches {
-        ws.index.replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
+        ws.index
+            .replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
     }
     ws
 }
@@ -86,8 +91,14 @@ fn goto_into_indexed_library_kotlin_and_java() {
     write_sources_jar(
         &jar,
         &[
-            ("acme/lib/Lib.kt", "package acme.lib\n\nfun libFunc(): Int = 1\n\nclass Widget(val size: Int)\n"),
-            ("acme/jlib/JThing.java", "package acme.jlib;\n\npublic class JThing {\n    public void run() {}\n}\n"),
+            (
+                "acme/lib/Lib.kt",
+                "package acme.lib\n\nfun libFunc(): Int = 1\n\nclass Widget(val size: Int)\n",
+            ),
+            (
+                "acme/jlib/JThing.java",
+                "package acme.jlib;\n\npublic class JThing {\n    public void run() {}\n}\n",
+            ),
         ],
     );
 
@@ -124,6 +135,52 @@ fn goto_into_indexed_library_kotlin_and_java() {
 }
 
 #[test]
+fn goto_into_jvm_variant_sources_for_multiplatform_coordinate() {
+    let tmp = unique_tmp("libgoto_jvm_variant");
+    let coord = Coordinate::parse("io.ktor:ktor-client-apache5:3.5.0").unwrap();
+    let jvm_coord = Coordinate::parse("io.ktor:ktor-client-apache5-jvm:3.5.0").unwrap();
+
+    let gradle_cache = tmp.join("gradle/caches");
+    let jar = gradle_cache
+        .join("modules-2/files-2.1")
+        .join(&jvm_coord.group)
+        .join(&jvm_coord.artifact)
+        .join(&jvm_coord.version)
+        .join("deadbeef")
+        .join(jvm_coord.sources_jar_name());
+    write_sources_jar(
+        &jar,
+        &[(
+            "io/ktor/client/engine/apache5/Apache5.kt",
+            "package io.ktor.client.engine.apache5\n\nobject Apache5\n",
+        )],
+    );
+
+    let repos = Repos {
+        gradle_cache,
+        m2: tmp.join("m2"),
+        central_base: "http://127.0.0.1:0/unused".to_string(),
+        download_dir: tmp.join("dl"),
+        allow_download: false,
+    };
+    let extract_root = tmp.join("extracted");
+    let mut ws = index_into_workspace(&coord, &repos, &extract_root);
+
+    let key = tmp.join("app/Main.kt").to_string_lossy().into_owned();
+    let src = "package app\n\
+               import io.ktor.client.engine.apache5.Apache5\n\
+               \n\
+               fun main() {\n\
+               \x20\x20\x20\x20val engine = Apache5\n\
+               }\n";
+    ws.open(key.clone(), src.to_string());
+
+    assert_goto_into_library(&mut ws, &key, src, "Apache5", "Apache5.kt");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn goto_into_indexed_jdk_source() {
     let tmp = unique_tmp("jdkgoto");
     let src_zip = tmp.join("jdk/lib/src.zip");
@@ -143,7 +200,8 @@ fn goto_into_indexed_jdk_source() {
 
     let mut ws = Workspace::new();
     for batch in batches {
-        ws.index.replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
+        ws.index
+            .replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
     }
 
     let key = tmp.join("app/Main.kt").to_string_lossy().into_owned();
@@ -225,8 +283,14 @@ fn member_completion_into_indexed_library() {
         .map(|c| c.label)
         .collect();
     assert!(labels.contains("click"), "own member: {labels:?}");
-    assert!(labels.contains("render"), "inherited from View (Durable supertype walk): {labels:?}");
-    assert!(labels.contains("highlight"), "library extension on View: {labels:?}");
+    assert!(
+        labels.contains("render"),
+        "inherited from View (Durable supertype walk): {labels:?}"
+    );
+    assert!(
+        labels.contains("highlight"),
+        "library extension on View: {labels:?}"
+    );
 
     let _ = fs::remove_dir_all(&tmp);
 }

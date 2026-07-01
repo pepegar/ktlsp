@@ -46,16 +46,34 @@ impl Repos {
 /// Find or download the sources jar for `c`. `Ok(None)` means "no sources jar exists" (a normal,
 /// non-fatal outcome — many artifacts don't publish sources).
 pub fn sources_jar(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<PathBuf>> {
-    if let Some(p) = find_in_gradle_cache(&repos.gradle_cache, c) {
-        return Ok(Some(p));
-    }
-    if let Some(p) = find_in_m2(&repos.m2, c) {
-        return Ok(Some(p));
+    let candidates = source_candidates(c);
+    for candidate in &candidates {
+        if let Some(p) = find_in_gradle_cache(&repos.gradle_cache, candidate) {
+            return Ok(Some(p));
+        }
+        if let Some(p) = find_in_m2(&repos.m2, candidate) {
+            return Ok(Some(p));
+        }
     }
     if repos.allow_download {
-        return download_sources(repos, c);
+        for candidate in &candidates {
+            if let Some(p) = download_sources(repos, candidate)? {
+                return Ok(Some(p));
+            }
+        }
     }
     Ok(None)
+}
+
+fn source_candidates(c: &Coordinate) -> Vec<Coordinate> {
+    let mut candidates = vec![c.clone()];
+    if !c.artifact.ends_with("-jvm") {
+        candidates.push(Coordinate {
+            artifact: format!("{}-jvm", c.artifact),
+            ..c.clone()
+        });
+    }
+    candidates
 }
 
 /// `~/.gradle/caches/modules-2/files-2.1/{group}/{artifact}/{version}/{sha1}/{name}` — the group
@@ -109,8 +127,14 @@ fn download_sources(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<Path
 
 /// Blocking HTTPS GET to a file (ureq + rustls). Follows redirects; errors on non-2xx.
 fn http_download(url: &str, dest: &Path) -> anyhow::Result<()> {
-    let mut resp = ureq::get(url).call().with_context(|| format!("GET {url}"))?;
-    anyhow::ensure!(resp.status().is_success(), "HTTP {} for {url}", resp.status());
+    let mut resp = ureq::get(url)
+        .call()
+        .with_context(|| format!("GET {url}"))?;
+    anyhow::ensure!(
+        resp.status().is_success(),
+        "HTTP {} for {url}",
+        resp.status()
+    );
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -146,7 +170,8 @@ mod tests {
         let jar = dir.join(c.sources_jar_name());
         let f = fs::File::create(&jar).unwrap();
         let mut zip = zip::ZipWriter::new(f);
-        zip.start_file("demo/Lib.kt", SimpleFileOptions::default()).unwrap();
+        zip.start_file("demo/Lib.kt", SimpleFileOptions::default())
+            .unwrap();
         zip.write_all(b"package demo\nfun x() {}\n").unwrap();
         zip.finish().unwrap();
 
@@ -163,6 +188,45 @@ mod tests {
         // A coordinate not in the cache, with downloads disabled, resolves to None (no panic).
         let missing = Coordinate::parse("com.example:absent:9.9").unwrap();
         assert_eq!(sources_jar(&repos, &missing).unwrap(), None);
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn falls_back_to_jvm_variant_sources() {
+        let tmp = std::env::temp_dir().join(format!("ktlsp_art_jvm_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let c = Coordinate::parse("io.ktor:ktor-client-apache5:3.5.0").unwrap();
+        let jvm = Coordinate::parse("io.ktor:ktor-client-apache5-jvm:3.5.0").unwrap();
+
+        let dir = tmp
+            .join(".gradle/caches/modules-2/files-2.1")
+            .join(&jvm.group)
+            .join(&jvm.artifact)
+            .join(&jvm.version)
+            .join("deadbeef");
+        fs::create_dir_all(&dir).unwrap();
+        let jar = dir.join(jvm.sources_jar_name());
+        let f = fs::File::create(&jar).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        zip.start_file(
+            "io/ktor/client/engine/apache5/Apache5.kt",
+            SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"package io.ktor.client.engine.apache5\nobject Apache5\n")
+            .unwrap();
+        zip.finish().unwrap();
+
+        let repos = Repos {
+            gradle_cache: tmp.join(".gradle/caches"),
+            m2: tmp.join(".m2/repository"),
+            central_base: "http://127.0.0.1:0/unused".to_string(),
+            download_dir: tmp.join("dl"),
+            allow_download: false,
+        };
+        let found = sources_jar(&repos, &c).unwrap();
+        assert_eq!(found.as_deref(), Some(jar.as_path()));
 
         let _ = fs::remove_dir_all(&tmp);
     }
