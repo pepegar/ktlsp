@@ -10,6 +10,8 @@
 //! fingerprint (path + mtime + size); a cache hit deserializes the symbols and skips parsing
 //! entirely, turning that ~10s into a one-time-per-jar cost.
 
+use std::cmp::Ordering;
+use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,7 +23,7 @@ use walkdir::{DirEntry, WalkDir};
 
 use crate::artifacts::{self, Repos};
 use crate::catalog;
-use crate::coords::Coordinate;
+use crate::coords::{compare_versions, Coordinate};
 use crate::indexer;
 use crate::jar;
 use crate::java::{self, JavaParser};
@@ -56,6 +58,66 @@ pub fn coordinates_for_root(root: &Path) -> Vec<Coordinate> {
     coords.dedup();
     inject_stdlib(&mut coords, is_gradle_project(root));
     coords
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ModuleKey {
+    group: String,
+    artifact: String,
+}
+
+impl From<&Coordinate> for ModuleKey {
+    fn from(coord: &Coordinate) -> Self {
+        ModuleKey {
+            group: coord.group.clone(),
+            artifact: coord.artifact.clone(),
+        }
+    }
+}
+
+/// Decision for a coordinate considered by [`CoordinateSelector`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CoordinateDecision {
+    /// This coordinate is currently the selected version for its `group:artifact`.
+    Selected,
+    /// This coordinate superseded a lower selected version; callers should remove any symbols
+    /// already indexed for `previous` before indexing the new coordinate.
+    Replaces(Coordinate),
+    /// A newer or equal coordinate for this `group:artifact` is already selected.
+    ShadowedBy(Coordinate),
+}
+
+/// Gradle-style fixed-version conflict collapse for dependency source indexing.
+///
+/// ktlsp's dependency index is advisory and intentionally avoids executing Gradle during startup.
+/// This selector applies the one piece that matters for duplicate source definitions: for a Maven
+/// module (`group:artifact`), keep only one selected version, preferring the newer fixed version in
+/// the same way Gradle's default conflict resolution does for ordinary releases.
+#[derive(Default)]
+pub struct CoordinateSelector {
+    selected: BTreeMap<ModuleKey, Coordinate>,
+}
+
+impl CoordinateSelector {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn consider(&mut self, coord: Coordinate) -> CoordinateDecision {
+        let key = ModuleKey::from(&coord);
+        let Some(current) = self.selected.get(&key).cloned() else {
+            self.selected.insert(key, coord);
+            return CoordinateDecision::Selected;
+        };
+
+        match compare_versions(&coord.version, &current.version) {
+            Ordering::Greater => {
+                self.selected.insert(key, coord);
+                CoordinateDecision::Replaces(current)
+            }
+            Ordering::Equal | Ordering::Less => CoordinateDecision::ShadowedBy(current),
+        }
+    }
 }
 
 fn catalog_paths(root: &Path) -> Vec<PathBuf> {
@@ -428,6 +490,26 @@ mod tests {
 
     fn coord(s: &str) -> Coordinate {
         Coordinate::parse(s).unwrap()
+    }
+
+    #[test]
+    fn coordinate_selector_keeps_newest_module_version() {
+        let mut selector = CoordinateSelector::new();
+        let older = coord("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2");
+        let newest = coord("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.11.0");
+        let lower = coord("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.9.0");
+        let other = coord("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.10.2");
+
+        assert_eq!(selector.consider(older.clone()), CoordinateDecision::Selected);
+        assert_eq!(
+            selector.consider(newest.clone()),
+            CoordinateDecision::Replaces(older)
+        );
+        assert_eq!(
+            selector.consider(lower),
+            CoordinateDecision::ShadowedBy(newest)
+        );
+        assert_eq!(selector.consider(other), CoordinateDecision::Selected);
     }
 
     #[test]

@@ -4,7 +4,6 @@
 //! into ktlsp's own cache. Downloads are themselves cached on disk, so a coordinate is fetched
 //! at most once.
 
-use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
@@ -13,7 +12,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 use serde_json::Value;
 
-use crate::coords::Coordinate;
+use crate::coords::{compare_versions, Coordinate};
 
 /// Where to look for / store artifacts.
 pub struct Repos {
@@ -468,27 +467,6 @@ fn best_cached_version(repos: &Repos, group: &str, artifact: &str) -> Option<Str
         }
     }
     versions.into_iter().max_by(|a, b| compare_versions(a, b))
-}
-
-fn compare_versions(a: &str, b: &str) -> Ordering {
-    let mut ai = a.split(['.', '-', '_']);
-    let mut bi = b.split(['.', '-', '_']);
-    loop {
-        match (ai.next(), bi.next()) {
-            (Some(x), Some(y)) => {
-                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
-                    (Ok(xn), Ok(yn)) => xn.cmp(&yn),
-                    _ => x.cmp(y),
-                };
-                if ord != Ordering::Equal {
-                    return ord;
-                }
-            }
-            (Some(_), None) => return Ordering::Greater,
-            (None, Some(_)) => return Ordering::Less,
-            (None, None) => return Ordering::Equal,
-        }
-    }
 }
 
 #[cfg(test)]

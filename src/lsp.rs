@@ -278,8 +278,15 @@ struct DepStats {
     files: usize,
     symbols: usize,
     failed: usize,
+    shadowed: usize,
     jdk_files: usize,
     jdk_symbols: usize,
+}
+
+#[derive(Clone)]
+struct IndexedDependencyFile {
+    path: String,
+    symbols: usize,
 }
 
 /// Index version-catalog dependencies and locally discoverable transitive source dependencies into
@@ -290,16 +297,19 @@ fn index_dependencies(
     root: &std::path::Path,
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
 ) -> DepStats {
-    use std::collections::{BTreeSet, VecDeque};
+    use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
     use crate::artifacts::Repos;
-    use crate::deps;
+    use crate::coords::Coordinate;
+    use crate::deps::{self, CoordinateDecision, CoordinateSelector};
     use crate::index::Tier;
     use crate::java::JavaParser;
     use crate::parser::KotlinParser;
 
     let mut queue: VecDeque<_> = deps::coordinates_for_root(root).into();
     let mut seen = BTreeSet::new();
+    let mut selected = CoordinateSelector::new();
+    let mut indexed_files: BTreeMap<Coordinate, Vec<IndexedDependencyFile>> = BTreeMap::new();
     let repos = Repos::defaults();
     let extract_root = deps::extract_root();
     let mut kotlin = KotlinParser::new();
@@ -339,6 +349,24 @@ fn index_dependencies(
         if !seen.insert(coord.clone()) {
             continue;
         }
+        match selected.consider(coord.clone()) {
+            CoordinateDecision::Selected => {}
+            CoordinateDecision::Replaces(previous) => {
+                stats.shadowed += 1;
+                if let Some(files) = indexed_files.remove(&previous) {
+                    let mut guard = ws.lock().unwrap();
+                    for file in files {
+                        guard.index.remove_file(&file.path);
+                        stats.files = stats.files.saturating_sub(1);
+                        stats.symbols = stats.symbols.saturating_sub(file.symbols);
+                    }
+                }
+            }
+            CoordinateDecision::ShadowedBy(_) => {
+                stats.shadowed += 1;
+                continue;
+            }
+        }
         stats.coordinates = seen.len();
         progress_total = progress_offset + seen.len() + queue.len();
         // Report before resolving so the UI names the coordinate currently being worked on.
@@ -360,12 +388,19 @@ fn index_dependencies(
         };
         // Insert each file under its own brief lock so goto_definition can interleave (a single
         // coordinate like kotlin-stdlib can contribute hundreds of files).
+        let mut files_for_coord = Vec::new();
         for batch in batches {
             let mut guard = ws.lock().unwrap();
-            stats.symbols += batch.symbols.len();
+            let symbol_count = batch.symbols.len();
+            stats.symbols += symbol_count;
+            files_for_coord.push(IndexedDependencyFile {
+                path: batch.file.clone(),
+                symbols: symbol_count,
+            });
             guard.index.replace_file(&batch.file, batch.symbols, Tier::Durable);
             stats.files += 1;
         }
+        indexed_files.insert(coord.clone(), files_for_coord);
         let discovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::artifacts::dependency_coordinates(&repos, &coord)
         }))
@@ -441,8 +476,8 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         String::new()
     };
     let summary = format!(
-        "ktlsp indexed {} library files ({} symbols) from {} dependencies{} ({} skipped)",
-        stats.files, stats.symbols, stats.coordinates, jdk_summary, stats.failed
+        "ktlsp indexed {} library files ({} symbols) from {} dependencies{} ({} failed, {} shadowed)",
+        stats.files, stats.symbols, stats.coordinates, jdk_summary, stats.failed, stats.shadowed
     );
     client.log_message(MessageType::INFO, summary.clone()).await;
     if let Some(p) = ongoing {

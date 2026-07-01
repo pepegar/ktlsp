@@ -3,7 +3,7 @@
 //! source. The hermetic test builds a fake Gradle cache (no network); the `#[ignore]`d test
 //! exercises the real Maven Central download path.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -82,6 +82,42 @@ fn index_coordinate_closure_into_workspace(
     ws
 }
 
+fn index_coordinates_with_selection(
+    coords: &[Coordinate],
+    repos: &Repos,
+    extract_root: &Path,
+) -> Workspace {
+    let mut selector = deps::CoordinateSelector::new();
+    let mut indexed_files: BTreeMap<Coordinate, Vec<String>> = BTreeMap::new();
+    let mut kotlin = KotlinParser::new();
+    let mut java = JavaParser::new();
+    let mut ws = Workspace::new();
+
+    for coord in coords {
+        match selector.consider(coord.clone()) {
+            deps::CoordinateDecision::Selected => {}
+            deps::CoordinateDecision::Replaces(previous) => {
+                if let Some(files) = indexed_files.remove(&previous) {
+                    for file in files {
+                        ws.index.remove_file(&file);
+                    }
+                }
+            }
+            deps::CoordinateDecision::ShadowedBy(_) => continue,
+        }
+
+        let mut files = Vec::new();
+        for batch in deps::resolve_coordinate(coord, repos, extract_root, &mut kotlin, &mut java) {
+            files.push(batch.file.clone());
+            ws.index
+                .replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
+        }
+        indexed_files.insert(coord.clone(), files);
+    }
+
+    ws
+}
+
 /// Assert goto at the (last) usage of `token` lands on `token` in a file ending with `suffix`.
 fn assert_goto_into_library(ws: &mut Workspace, key: &str, src: &str, token: &str, suffix: &str) {
     let offset = src.rfind(token).expect("token present in source");
@@ -100,6 +136,61 @@ fn assert_goto_into_library(ws: &mut Workspace, key: &str, src: &str, token: &st
         "goto on `{token}` landed on the wrong identifier in {}",
         d.file
     );
+}
+
+#[test]
+fn goto_uses_newest_selected_library_version() {
+    let tmp = unique_tmp("libgoto_version_conflict");
+    let older = Coordinate::parse("acme:demo:1.10.2").unwrap();
+    let newer = Coordinate::parse("acme:demo:1.11.0").unwrap();
+
+    let gradle_cache = tmp.join("gradle/caches");
+    for (coord, value) in [(&older, "10"), (&newer, "11")] {
+        let jar = gradle_cache
+            .join("modules-2/files-2.1")
+            .join(&coord.group)
+            .join(&coord.artifact)
+            .join(&coord.version)
+            .join("deadbeef")
+            .join(coord.sources_jar_name());
+        write_sources_jar(
+            &jar,
+            &[(
+                "acme/lib/Lib.kt",
+                &format!("package acme.lib\n\nfun shared(): Int = {value}\n"),
+            )],
+        );
+    }
+
+    let repos = Repos {
+        gradle_cache,
+        m2: tmp.join("m2"),
+        central_base: "http://127.0.0.1:0/unused".to_string(),
+        download_dir: tmp.join("dl"),
+        allow_download: false,
+    };
+    let extract_root = tmp.join("extracted");
+    let mut ws = index_coordinates_with_selection(&[older, newer], &repos, &extract_root);
+
+    let key = tmp.join("app/Main.kt").to_string_lossy().into_owned();
+    let src = "package app\n\
+               import acme.lib.shared\n\
+               \n\
+               fun main() {\n\
+               \x20\x20\x20\x20shared()\n\
+               }\n";
+    ws.open(key.clone(), src.to_string());
+
+    let offset = src.rfind("shared").expect("token present");
+    let defs = ws.goto_definition(&key, offset);
+    assert_eq!(defs.len(), 1, "older library version should be shadowed: {defs:?}");
+    assert!(
+        defs[0].file.contains("/1.11.0/"),
+        "goto should land in the newer source tree, got {}",
+        defs[0].file
+    );
+
+    let _ = fs::remove_dir_all(&tmp);
 }
 
 #[test]

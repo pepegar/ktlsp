@@ -1,5 +1,7 @@
 //! Maven coordinates and the repository/cache paths derived from them.
 
+use std::cmp::Ordering;
+
 /// A Maven coordinate `group:artifact:version`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Coordinate {
@@ -55,6 +57,32 @@ impl Coordinate {
     }
 }
 
+/// Compare Maven-ish version strings in the same broad way Gradle's default conflict resolution
+/// matters to ktlsp: split on common separators, compare numeric parts numerically, then fall back
+/// to lexical ordering for qualifiers. This is not a substitute for Gradle's full resolver
+/// (constraints, forces, BOMs, capabilities), but it matches the "newer module version wins"
+/// behavior for ordinary fixed versions such as `1.11.0` vs `1.10.2`.
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
+    let mut ai = a.split(['.', '-', '_']);
+    let mut bi = b.split(['.', '-', '_']);
+    loop {
+        match (ai.next(), bi.next()) {
+            (Some(x), Some(y)) => {
+                let ord = match (x.parse::<u64>(), y.parse::<u64>()) {
+                    (Ok(xn), Ok(yn)) => xn.cmp(&yn),
+                    _ => x.cmp(y),
+                };
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+            }
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
 /// A coordinate component is restricted to Maven's safe charset (alphanumerics and `. - _`) and
 /// may not be `.`/`..`, so it can never contribute a path separator or traversal segment to a
 /// filesystem path or URL.
@@ -100,5 +128,13 @@ mod tests {
         assert!(Coordinate::parse("g:a:1.0\\..\\x").is_none());
         // ordinary coordinates still parse
         assert!(Coordinate::parse("org.jetbrains.kotlin:kotlin-stdlib:2.2.20").is_some());
+    }
+
+    #[test]
+    fn version_comparison_handles_numeric_segments() {
+        assert_eq!(compare_versions("1.11.0", "1.10.2"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("1.9.0", "1.10.2"), std::cmp::Ordering::Less);
+        assert_eq!(compare_versions("2.0.0", "1.99.99"), std::cmp::Ordering::Greater);
+        assert_eq!(compare_versions("1.0.0", "1.0.0"), std::cmp::Ordering::Equal);
     }
 }
