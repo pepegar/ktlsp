@@ -199,6 +199,8 @@ async fn initialize_open_and_goto_definition() {
         .expect("hover should be present");
     match hover.contents {
         HoverContents::Markup(markup) => {
+            assert_eq!(markup.kind, MarkupKind::Markdown);
+            assert!(markup.value.contains("```kotlin"), "{markup:?}");
             assert!(markup.value.contains("fun helper()"), "{markup:?}");
             assert!(markup.value.contains("Helpful hover docs."), "{markup:?}");
         }

@@ -67,8 +67,8 @@ impl SymbolSummary {
                 .is_some_and(|d| d.to_lowercase().contains(&query.to_lowercase()))
     }
 
-    pub fn hover_text(&self) -> String {
-        let mut line = match self.kind {
+    pub fn hover_markdown(&self) -> String {
+        let signature = match self.kind {
             SymbolKind::Class => format!("class {}", self.name),
             SymbolKind::Interface => format!("interface {}", self.name),
             SymbolKind::Object => format!("object {}", self.name),
@@ -80,15 +80,16 @@ impl SymbolSummary {
             SymbolKind::TypeParameter => format!("type parameter {}", self.name),
             SymbolKind::LocalVariable => format!("local {}", self.name),
         };
+        let mut sections = vec![format!("```kotlin\n{signature}\n```")];
         if let Some(detail) = self.detail() {
-            line.push_str(&format!("\n{detail}"));
+            sections.push(detail);
         }
         if let Some(doc) = &self.documentation {
             if !doc.is_empty() {
-                line.push_str(&format!("\n\n{doc}"));
+                sections.push(format_kdoc(doc));
             }
         }
-        line
+        sections.join("\n\n")
     }
 
     fn function_label(&self) -> String {
@@ -132,4 +133,123 @@ fn type_label(ty: &TypeRef) -> String {
         s.push('?');
     }
     s
+}
+
+fn format_kdoc(doc: &str) -> String {
+    let mut body = Vec::new();
+    let mut params = Vec::new();
+    let mut returns = Vec::new();
+    let mut throws = Vec::new();
+    let mut sees = Vec::new();
+    let mut authors = Vec::new();
+    let mut since = Vec::new();
+    let mut unknown = Vec::new();
+
+    for line in doc.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("@param ") {
+            let (name, desc) = split_tag_target(rest);
+            params.push((name.to_string(), desc.to_string()));
+        } else if let Some(rest) = trimmed.strip_prefix("@return ") {
+            returns.push(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@throws ") {
+            let (name, desc) = split_tag_target(rest);
+            throws.push((name.to_string(), desc.to_string()));
+        } else if let Some(rest) = trimmed.strip_prefix("@exception ") {
+            let (name, desc) = split_tag_target(rest);
+            throws.push((name.to_string(), desc.to_string()));
+        } else if let Some(rest) = trimmed.strip_prefix("@see ") {
+            sees.push(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@author ") {
+            authors.push(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix("@since ") {
+            since.push(rest.trim().to_string());
+        } else if let Some(rest) = trimmed.strip_prefix('@') {
+            let (tag, desc) = split_tag_target(rest);
+            unknown.push((tag.to_string(), desc.to_string()));
+        } else {
+            body.push(line.to_string());
+        }
+    }
+
+    let mut sections = Vec::new();
+    let body = trim_blank_lines(&body);
+    if !body.is_empty() {
+        sections.push(body.join("\n"));
+    }
+    if !params.is_empty() {
+        sections.push(render_named_section("Parameters", &params));
+    }
+    if !returns.is_empty() {
+        sections.push(render_list_section("Returns", &returns));
+    }
+    if !throws.is_empty() {
+        sections.push(render_named_section("Throws", &throws));
+    }
+    if !sees.is_empty() {
+        sections.push(render_list_section("See also", &sees));
+    }
+    if !authors.is_empty() {
+        sections.push(render_list_section("Authors", &authors));
+    }
+    if !since.is_empty() {
+        sections.push(render_list_section("Since", &since));
+    }
+    for (tag, desc) in unknown {
+        sections.push(format!("**{}**\n- {}", title_case(&tag), desc));
+    }
+    sections.join("\n\n")
+}
+
+fn split_tag_target(input: &str) -> (&str, &str) {
+    let trimmed = input.trim();
+    match trimmed.find(char::is_whitespace) {
+        Some(idx) => {
+            let name = &trimmed[..idx];
+            let desc = trimmed[idx..].trim();
+            (name, desc)
+        }
+        None => (trimmed, ""),
+    }
+}
+
+fn trim_blank_lines(lines: &[String]) -> Vec<String> {
+    let start = lines.iter().position(|line| !line.trim().is_empty());
+    let end = lines.iter().rposition(|line| !line.trim().is_empty());
+    match (start, end) {
+        (Some(start), Some(end)) => lines[start..=end].to_vec(),
+        _ => Vec::new(),
+    }
+}
+
+fn render_named_section(title: &str, items: &[(String, String)]) -> String {
+    let mut out = vec![format!("**{title}**")];
+    for (name, desc) in items {
+        if desc.is_empty() {
+            out.push(format!("- `{name}`"));
+        } else {
+            out.push(format!("- `{name}`: {desc}"));
+        }
+    }
+    out.join("\n")
+}
+
+fn render_list_section(title: &str, items: &[String]) -> String {
+    let mut out = vec![format!("**{title}**")];
+    for item in items {
+        out.push(format!("- {item}"));
+    }
+    out.join("\n")
+}
+
+fn title_case(tag: &str) -> String {
+    let mut chars = tag.chars();
+    match chars.next() {
+        Some(first) => {
+            let mut out = first.to_uppercase().collect::<String>();
+            out.push_str(chars.as_str());
+            out
+        }
+        None => String::new(),
+    }
 }

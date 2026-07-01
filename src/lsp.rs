@@ -1349,8 +1349,8 @@ impl LanguageServer for Backend {
             let symbol = crate::trace::ident_at(&text, offset);
             let hover = ws.symbol_at(&key, offset).map(|s| Hover {
                 contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::PlainText,
-                    value: s.hover_text(),
+                    kind: MarkupKind::Markdown,
+                    value: s.hover_markdown(),
                 }),
                 range: None,
             });

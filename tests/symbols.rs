@@ -78,7 +78,7 @@ fn index_iteration_returns_project_and_durable_symbols() {
 fn symbol_at_resolves_indexed_usage_for_hover() {
     let mut ws = Workspace::new();
     let key = "mem:///Main.kt".to_string();
-    let src = "package app\n/**\n * Adds docs for helper.\n * Second line.\n */\nfun helper(): Int = 1\nfun main() { helper() }\n";
+    let src = "package app\n/**\n * Adds docs for helper.\n * Second line.\n * @param name target name\n * @return shown in docs\n */\nfun helper(name: String): Int = 1\nfun main() { helper(\"x\") }\n";
     ws.open(key.clone(), src.to_string());
     let offset = src.rfind("helper").unwrap();
 
@@ -88,11 +88,14 @@ fn symbol_at_resolves_indexed_usage_for_hover() {
     assert_eq!(symbol.kind, SymbolKind::Function);
     assert_eq!(
         symbol.documentation.as_deref(),
-        Some("Adds docs for helper.\nSecond line.")
+        Some("Adds docs for helper.\nSecond line.\n@param name target name\n@return shown in docs")
     );
-    assert!(symbol.hover_text().contains("fun helper(): Int"));
-    assert!(symbol.hover_text().contains("app"));
-    assert!(symbol.hover_text().contains("Adds docs for helper.\nSecond line."));
+    let hover = symbol.hover_markdown();
+    assert!(hover.contains("```kotlin\nfun helper(String): Int\n```"));
+    assert!(hover.contains("\n\napp\n\n"));
+    assert!(hover.contains("Adds docs for helper.\nSecond line."));
+    assert!(hover.contains("**Parameters**\n- `name`: target name"));
+    assert!(hover.contains("**Returns**\n- shown in docs"));
 }
 
 #[test]
@@ -123,6 +126,27 @@ fn kdoc_is_consumed_once_and_not_reused_by_the_next_declaration() {
 
     assert_eq!(helper.documentation.as_deref(), Some("First helper docs."));
     assert_eq!(plain.documentation, None);
+}
+
+#[test]
+fn hover_markdown_formats_common_kdoc_tags_into_sections() {
+    let mut ws = Workspace::new();
+    let key = "mem:///Main.kt".to_string();
+    let src = "package app\n/**\n * Render markdown.\n *\n * @param value the input value\n * @throws IllegalStateException on bad state\n * @see otherSymbol\n */\nfun helper(value: String): Int = 1\n";
+    ws.open(key.clone(), src.to_string());
+
+    let symbol = ws
+        .document_symbols(&key)
+        .into_iter()
+        .find(|s| s.name == "helper")
+        .expect("helper symbol");
+    let hover = symbol.hover_markdown();
+
+    assert!(hover.contains("```kotlin\nfun helper(String): Int\n```"));
+    assert!(hover.contains("Render markdown."));
+    assert!(hover.contains("**Parameters**\n- `value`: the input value"));
+    assert!(hover.contains("**Throws**\n- `IllegalStateException`: on bad state"));
+    assert!(hover.contains("**See also**\n- otherSymbol"));
 }
 
 #[test]
