@@ -17,6 +17,7 @@ use crate::index::{Entry, Index, RefEntry, Tier, Usage};
 use crate::indexer::{extract_symbols, extract_usages};
 use crate::infer;
 use crate::imports::{self, ImportLayout};
+use crate::java::JavaParser;
 use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_of, Import, KotlinParser};
 use crate::ranges::{self, FoldRange, SelectionRange};
 use crate::resolve;
@@ -116,8 +117,9 @@ impl Workspace {
         }
     }
 
-    /// Index every `.kt`/`.kts` under `root`, skipping build output and dot directories and any
-    /// files currently open (their dirty buffers are authoritative). Returns the count indexed.
+    /// Index every project `.kt`/`.kts`/`.java` under `root`, skipping build output except Gradle
+    /// generated source roots and any files currently open (their dirty buffers are authoritative).
+    /// Returns the count indexed.
     pub fn scan(&mut self, root: &Path) -> usize {
         let mut paths = Vec::new();
         for path in project_source_files(root) {
@@ -1053,7 +1055,11 @@ fn relative_path_has_excluded_dir(path: &str) -> bool {
 }
 
 fn project_source_files(root: &Path) -> Vec<std::path::PathBuf> {
-    git_source_files(root).unwrap_or_else(|| walk_source_files(root))
+    let mut out = git_source_files(root).unwrap_or_else(|| walk_source_files(root));
+    out.extend(generated_source_files(root));
+    out.sort();
+    out.dedup();
+    out
 }
 
 fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> {
@@ -1062,10 +1068,11 @@ fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> 
     }
     let workers = project_index_threads().min(paths.len());
     if workers <= 1 {
-        let mut parser = KotlinParser::new();
+        let mut kotlin = KotlinParser::new();
+        let mut java = JavaParser::new();
         let mut out: Vec<_> = paths
             .into_iter()
-            .filter_map(|path| parse_project_file(&path, &mut parser))
+            .filter_map(|path| parse_project_file(&path, &mut kotlin, &mut java))
             .collect();
         out.sort_by(|a, b| a.key.cmp(&b.key));
         return out;
@@ -1078,7 +1085,8 @@ fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> 
         let queue = queue.clone();
         let tx = tx.clone();
         handles.push(std::thread::spawn(move || {
-            let mut parser = KotlinParser::new();
+            let mut kotlin = KotlinParser::new();
+            let mut java = JavaParser::new();
             loop {
                 let path = {
                     let mut guard = queue.lock().unwrap();
@@ -1087,7 +1095,7 @@ fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> 
                 let Some(path) = path else {
                     break;
                 };
-                if let Some(batch) = parse_project_file(&path, &mut parser) {
+                if let Some(batch) = parse_project_file(&path, &mut kotlin, &mut java) {
                     let _ = tx.send(batch);
                 }
             }
@@ -1102,12 +1110,24 @@ fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> 
     out
 }
 
-fn parse_project_file(path: &Path, parser: &mut KotlinParser) -> Option<ProjectFileIndex> {
+fn parse_project_file(
+    path: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Option<ProjectFileIndex> {
     let text = std::fs::read_to_string(path).ok()?;
-    let tree = parser.parse(&text);
-    let pkg = package_of(&tree, &text);
-    let symbols = extract_symbols(&tree, &text, &pkg);
-    let usages = extract_usages(&tree, &text);
+    let (symbols, usages) = match path.extension().and_then(|e| e.to_str()) {
+        Some("kt") | Some("kts") => {
+            let tree = kotlin.parse(&text);
+            let pkg = package_of(&tree, &text);
+            (extract_symbols(&tree, &text, &pkg), extract_usages(&tree, &text))
+        }
+        Some("java") => {
+            let tree = java.parse(&text);
+            (crate::java::extract_symbols(&tree, &text), Vec::new())
+        }
+        _ => return None,
+    };
     Some(ProjectFileIndex {
         key: path.to_string_lossy().to_string(),
         symbols,
@@ -1154,6 +1174,7 @@ fn git_source_files(root: &Path) -> Option<Vec<std::path::PathBuf>> {
             "--",
             "*.kt",
             "*.kts",
+            "*.java",
         ])
         .output()
         .ok()?;
@@ -1191,10 +1212,84 @@ fn walk_source_files(root: &Path) -> Vec<std::path::PathBuf> {
         let path = entry.path();
         if matches!(
             path.extension().and_then(|e| e.to_str()),
-            Some("kt") | Some("kts")
+            Some("kt") | Some("kts") | Some("java")
         ) {
             out.push(path.to_path_buf());
         }
     }
     out
+}
+
+fn generated_source_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let walker = WalkDir::new(root).into_iter().filter_entry(|entry| {
+        if !entry.file_type().is_dir() {
+            return true;
+        }
+        if path_has_build_dir(root, entry.path()) {
+            generated_source_walk_dir(root, entry.path())
+        } else {
+            !is_excluded(entry)
+        }
+    });
+    for entry in walker.filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if !is_generated_source_file(root, path) {
+            continue;
+        }
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("kt") | Some("kts") | Some("java")
+        ) {
+            out.push(path.to_path_buf());
+        }
+    }
+    out
+}
+
+fn path_has_build_dir(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    rel.components()
+        .any(|c| c.as_os_str().to_string_lossy() == "build")
+}
+
+fn generated_source_walk_dir(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    let parts: Vec<_> = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect();
+    let Some(build_pos) = parts.iter().rposition(|part| part == "build") else {
+        return false;
+    };
+    let inside_build = &parts[build_pos + 1..];
+    match inside_build {
+        [] => true,
+        [a] => a == "generated",
+        [a, b] => a == "generated" && b == "source",
+        [a, b, ..] => a == "generated" && b == "source",
+    }
+}
+
+fn generated_source_dir(root: &Path, path: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else {
+        return false;
+    };
+    rel.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .windows(3)
+        .any(|w| w[0] == "build" && w[1] == "generated" && w[2] == "source")
+}
+
+fn is_generated_source_file(root: &Path, path: &Path) -> bool {
+    path.parent()
+        .is_some_and(|parent| generated_source_dir(root, parent))
 }
