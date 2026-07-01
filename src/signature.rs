@@ -28,6 +28,9 @@ pub fn call_at<'tree>(
     loop {
         if node.kind() == "call_expression" {
             let callee = node.named_child(0)?;
+            if offset < callee.end_byte() {
+                return None;
+            }
             let name = callable_name(callee, text)?;
             let active = active_parameter(text, callee.end_byte(), offset);
             return Some((callee, name, active));
@@ -89,7 +92,12 @@ fn callable_name(node: Node<'_>, text: &str) -> Option<String> {
 fn active_parameter(text: &str, callee_end: usize, offset: usize) -> u32 {
     let mut depth = 0_i32;
     let mut active = 0_u32;
-    for ch in text[callee_end.min(text.len())..offset.min(text.len())].chars() {
+    let start = floor_char_boundary(text, callee_end);
+    let end = floor_char_boundary(text, offset);
+    if start >= end {
+        return active;
+    }
+    for ch in text[start..end].chars() {
         match ch {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth -= 1,
@@ -98,6 +106,14 @@ fn active_parameter(text: &str, callee_end: usize, offset: usize) -> u32 {
         }
     }
     active
+}
+
+fn floor_char_boundary(text: &str, mut offset: usize) -> usize {
+    offset = offset.min(text.len());
+    while offset > 0 && !text.is_char_boundary(offset) {
+        offset -= 1;
+    }
+    offset
 }
 
 fn type_ref_label(ty: &TypeRef) -> String {
