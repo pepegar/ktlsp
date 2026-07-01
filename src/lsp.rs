@@ -282,34 +282,34 @@ struct DepStats {
     jdk_symbols: usize,
 }
 
-/// Index every dependency declared in the project's version catalog into the shared index.
-/// Runs on a blocking thread; IO/parsing is lock-free and results are inserted per-coordinate
-/// under brief locks so `goto_definition` can interleave while indexing proceeds.
+/// Index version-catalog dependencies and locally discoverable transitive source dependencies into
+/// the shared index. Runs on a blocking thread; IO/parsing is lock-free and results are inserted
+/// per-coordinate under brief locks so `goto_definition` can interleave while indexing proceeds.
 fn index_dependencies(
     ws: &Arc<Mutex<Workspace>>,
     root: &std::path::Path,
     progress: Option<&tokio::sync::mpsc::UnboundedSender<(usize, usize, String)>>,
 ) -> DepStats {
+    use std::collections::{BTreeSet, VecDeque};
+
     use crate::artifacts::Repos;
     use crate::deps;
     use crate::index::Tier;
     use crate::java::JavaParser;
     use crate::parser::KotlinParser;
 
-    let coords = deps::coordinates_for_root(root);
+    let mut queue: VecDeque<_> = deps::coordinates_for_root(root).into();
+    let mut seen = BTreeSet::new();
     let repos = Repos::defaults();
     let extract_root = deps::extract_root();
     let mut kotlin = KotlinParser::new();
     let mut java = JavaParser::new();
 
-    let total = coords.len();
     let jdk_src = deps::jdk_src_zip();
     let has_jdk_src = jdk_src.is_some();
-    let progress_total = total + usize::from(has_jdk_src);
-    let mut stats = DepStats {
-        coordinates: coords.len(),
-        ..Default::default()
-    };
+    let mut progress_total = queue.len() + usize::from(has_jdk_src);
+    let mut stats = DepStats::default();
+    const MAX_DEPENDENCY_COORDINATES: usize = 1024;
     if let Some(src_zip) = jdk_src {
         if let Some(tx) = progress {
             let _ = tx.send((1, progress_total, "JDK sources".to_string()));
@@ -335,15 +335,20 @@ fn index_dependencies(
         }
     }
     let progress_offset = usize::from(has_jdk_src);
-    for (i, coord) in coords.iter().enumerate() {
+    while let Some(coord) = queue.pop_front() {
+        if !seen.insert(coord.clone()) {
+            continue;
+        }
+        stats.coordinates = seen.len();
+        progress_total = progress_offset + seen.len() + queue.len();
         // Report before resolving so the UI names the coordinate currently being worked on.
         if let Some(tx) = progress {
-            let _ = tx.send((i + 1 + progress_offset, progress_total, coord.label()));
+            let _ = tx.send((seen.len() + progress_offset, progress_total, coord.label()));
         }
         // Isolate each coordinate: a panic while parsing one library's sources must not abort
         // indexing of the rest.
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            deps::resolve_coordinate(coord, &repos, &extract_root, &mut kotlin, &mut java)
+            deps::resolve_coordinate(&coord, &repos, &extract_root, &mut kotlin, &mut java)
         }));
         let batches = match resolved {
             Ok(batches) => batches,
@@ -360,6 +365,18 @@ fn index_dependencies(
             stats.symbols += batch.symbols.len();
             guard.index.replace_file(&batch.file, batch.symbols, Tier::Durable);
             stats.files += 1;
+        }
+        let discovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::artifacts::dependency_coordinates(&repos, &coord)
+        }))
+        .unwrap_or_default();
+        for dep in discovered {
+            if seen.len() + queue.len() >= MAX_DEPENDENCY_COORDINATES {
+                break;
+            }
+            if !seen.contains(&dep) && !queue.iter().any(|queued| queued == &dep) {
+                queue.push_back(dep);
+            }
         }
     }
     stats

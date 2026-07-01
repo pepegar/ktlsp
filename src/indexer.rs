@@ -582,6 +582,46 @@ fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     None
 }
 
+fn recover_value_class_name<'t>(node: Node<'t>, src: &str) -> Option<Node<'t>> {
+    if node.kind() != "ERROR" {
+        return None;
+    }
+    let identifiers = descendant_identifiers(node);
+    let mut saw_value = false;
+    for id in identifiers {
+        match node_text(id, src) {
+            "value" => saw_value = true,
+            "class" if saw_value => return next_identifier_after(node, id.end_byte()),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn descendant_identifiers<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
+    collect_descendant_identifiers(node, &mut out);
+    out.sort_by_key(|n| n.start_byte());
+    out
+}
+
+fn collect_descendant_identifiers<'t>(node: Node<'t>, out: &mut Vec<Node<'t>>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "identifier" {
+            out.push(child);
+        }
+        collect_descendant_identifiers(child, out);
+    }
+}
+
+fn next_identifier_after<'t>(node: Node<'t>, byte: usize) -> Option<Node<'t>> {
+    descendant_identifiers(node)
+        .into_iter()
+        .filter(|id| id.start_byte() >= byte)
+        .min_by_key(|id| id.start_byte())
+}
+
 fn walk(
     node: Node,
     src: &str,
@@ -648,6 +688,21 @@ fn walk(
                 if let Some(id) = first_ident(child) {
                     push(out, id, src, SymbolKind::EnumEntry, package, container);
                 }
+            }
+            "ERROR" => {
+                if let Some(name) = recover_value_class_name(child, src) {
+                    push_type(
+                        out,
+                        name,
+                        src,
+                        SymbolKind::Class,
+                        package,
+                        container,
+                        Vec::new(),
+                        Vec::new(),
+                    );
+                }
+                walk(child, src, package, container, scope, out);
             }
             // Structural wrappers, `package_header`, `import`, and crucially `ERROR` nodes:
             // recurse to recover declarations nested inside. We never reach function bodies this
@@ -741,6 +796,27 @@ object Reg { fun add() {} }
         let syms = index(src);
         let got = names(&syms);
         assert!(got.contains(&"alpha"), "ERROR-descent should recover alpha, got {got:?}");
+    }
+
+    #[test]
+    fn recovers_value_class_name_from_stdlib_error_shape() {
+        // kotlin.time.Duration currently parses as one large ERROR because its value-class
+        // constructor is separated from the class name by annotations. Keep the class name indexed
+        // so explicit imports can navigate to it even when the body is malformed to tree-sitter.
+        let src = r#"
+package kotlin.time
+@SinceKotlin("1.6")
+@JvmInline
+public value class Duration
+@Deprecated("Don't call this constructor directly.", level = DeprecationLevel.ERROR)
+internal constructor(private val rawValue: Long) :
+    Comparable<Duration> {
+}
+"#;
+        let syms = index(src);
+        let duration = syms.iter().find(|s| s.name == "Duration").unwrap();
+        assert_eq!(duration.kind, SymbolKind::Class);
+        assert_eq!(duration.package, "kotlin.time");
     }
 
     #[test]

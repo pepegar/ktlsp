@@ -3,11 +3,12 @@
 //! source. The hermetic test builds a fake Gradle cache (no network); the `#[ignore]`d test
 //! exercises the real Maven Central download path.
 
+use std::collections::{BTreeSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use ktlsp::artifacts::Repos;
+use ktlsp::artifacts::{self, Repos};
 use ktlsp::coords::Coordinate;
 use ktlsp::deps;
 use ktlsp::java::JavaParser;
@@ -50,6 +51,33 @@ fn index_into_workspace(coord: &Coordinate, repos: &Repos, extract_root: &Path) 
     for batch in batches {
         ws.index
             .replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
+    }
+    ws
+}
+
+fn index_coordinate_closure_into_workspace(
+    coord: &Coordinate,
+    repos: &Repos,
+    extract_root: &Path,
+) -> Workspace {
+    let mut queue = VecDeque::from([coord.clone()]);
+    let mut seen = BTreeSet::new();
+    let mut kotlin = KotlinParser::new();
+    let mut java = JavaParser::new();
+    let mut ws = Workspace::new();
+    while let Some(next) = queue.pop_front() {
+        if !seen.insert(next.clone()) {
+            continue;
+        }
+        for batch in deps::resolve_coordinate(&next, repos, extract_root, &mut kotlin, &mut java) {
+            ws.index
+                .replace_file(&batch.file, batch.symbols, ktlsp::index::Tier::Durable);
+        }
+        for dep in artifacts::dependency_coordinates(repos, &next) {
+            if !seen.contains(&dep) && !queue.iter().any(|queued| queued == &dep) {
+                queue.push_back(dep);
+            }
+        }
     }
     ws
 }
@@ -188,6 +216,95 @@ fn goto_into_jvm_variant_sources_for_multiplatform_coordinate() {
     ws.open(key.clone(), src.to_string());
 
     assert_goto_into_library(&mut ws, &key, src, "Apache5", "Apache5.kt");
+
+    let _ = fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn goto_into_transitive_java_sources_discovered_from_metadata() {
+    let tmp = unique_tmp("libgoto_transitive_java");
+    let root_coord = Coordinate::parse("io.ktor:ktor-client-apache5:3.5.0").unwrap();
+    let jvm_coord = Coordinate::parse("io.ktor:ktor-client-apache5-jvm:3.5.0").unwrap();
+    let httpclient =
+        Coordinate::parse("org.apache.httpcomponents.client5:httpclient5:5.5.1").unwrap();
+    let httpcore = Coordinate::parse("org.apache.httpcomponents.core5:httpcore5:5.3.6").unwrap();
+
+    let gradle_cache = tmp.join("gradle/caches");
+    let module_dir = gradle_cache
+        .join("modules-2/files-2.1")
+        .join(&jvm_coord.group)
+        .join(&jvm_coord.artifact)
+        .join(&jvm_coord.version)
+        .join("module");
+    fs::create_dir_all(&module_dir).unwrap();
+    fs::write(
+        module_dir.join(format!("{}-{}.module", jvm_coord.artifact, jvm_coord.version)),
+        r#"{
+  "variants": [
+    { "name": "jvmApiElements", "dependencies": [
+      { "group": "org.apache.httpcomponents.client5", "module": "httpclient5", "version": { "requires": "5.5.1" } }
+    ] }
+  ]
+}"#,
+    )
+    .unwrap();
+
+    let client_jar = gradle_cache
+        .join("modules-2/files-2.1")
+        .join(&httpclient.group)
+        .join(&httpclient.artifact)
+        .join(&httpclient.version)
+        .join("client")
+        .join(httpclient.sources_jar_name());
+    write_sources_jar(
+        &client_jar,
+        &[
+            (
+                "org/apache/hc/client5/http/config/ConnectionConfig.java",
+                "package org.apache.hc.client5.http.config;\n\npublic class ConnectionConfig {}\n",
+            ),
+            (
+                "META-INF/maven/org.apache.httpcomponents.client5/httpclient5/pom.xml",
+                "<project><dependencies><dependency><groupId>org.apache.httpcomponents.core5</groupId><artifactId>httpcore5</artifactId></dependency></dependencies></project>",
+            ),
+        ],
+    );
+
+    let core_jar = gradle_cache
+        .join("modules-2/files-2.1")
+        .join(&httpcore.group)
+        .join(&httpcore.artifact)
+        .join(&httpcore.version)
+        .join("core")
+        .join(httpcore.sources_jar_name());
+    write_sources_jar(
+        &core_jar,
+        &[(
+            "org/apache/hc/core5/util/TimeValue.java",
+            "package org.apache.hc.core5.util;\n\npublic class TimeValue {}\n",
+        )],
+    );
+
+    let repos = Repos {
+        gradle_cache,
+        m2: tmp.join("m2"),
+        central_base: "http://127.0.0.1:0/unused".to_string(),
+        download_dir: tmp.join("dl"),
+        allow_download: false,
+    };
+    let extract_root = tmp.join("extracted");
+    let mut ws = index_coordinate_closure_into_workspace(&root_coord, &repos, &extract_root);
+
+    let key = tmp.join("app/Main.kt").to_string_lossy().into_owned();
+    let src = "package app\n\
+               import org.apache.hc.client5.http.config.ConnectionConfig\n\
+               import org.apache.hc.core5.util.TimeValue\n\
+               \n\
+               fun main(config: ConnectionConfig, ttl: TimeValue) {}\n";
+    ws.open(key.clone(), src.to_string());
+
+    assert_goto_into_library(&mut ws, &key, src, "ConnectionConfig", "ConnectionConfig.java");
+    assert_goto_into_library(&mut ws, &key, src, "TimeValue", "TimeValue.java");
 
     let _ = fs::remove_dir_all(&tmp);
 }
