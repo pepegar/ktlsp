@@ -36,6 +36,7 @@ struct ProjectFileIndex {
     key: String,
     symbols: Vec<IndexedSymbol>,
     usages: Vec<Usage>,
+    clean: bool,
 }
 
 pub struct Workspace {
@@ -43,6 +44,7 @@ pub struct Workspace {
     /// Open buffers, keyed by canonical identity. Take precedence over disk.
     open_docs: HashMap<String, DocState>,
     parser: KotlinParser,
+    completeness: resolve::CompletenessFacts,
 }
 
 impl Default for Workspace {
@@ -57,7 +59,25 @@ impl Workspace {
             index: Index::new(),
             open_docs: HashMap::new(),
             parser: KotlinParser::new(),
+            completeness: resolve::CompletenessFacts::default(),
         }
+    }
+
+    pub fn set_project_scan_complete(&mut self, complete: bool) {
+        self.completeness.project_scan_complete = complete;
+    }
+
+    pub fn set_library_index_complete(&mut self, complete: bool) {
+        self.completeness.library_index_complete = complete;
+    }
+
+    pub fn set_jdk_index_complete(&mut self, complete: bool) {
+        self.completeness.jdk_index_complete = complete;
+    }
+
+    /// Test helper for fixtures that intentionally model a closed source world.
+    pub fn assume_index_complete_for_tests(&mut self) {
+        self.completeness = resolve::CompletenessFacts::complete();
     }
 
     /// Current text for a key: the open buffer if present, else the file on disk.
@@ -131,11 +151,13 @@ impl Workspace {
         }
         let batches = parse_project_files(paths);
         let n = batches.len();
+        let clean = batches.iter().all(|batch| batch.clean);
         for batch in batches {
             self.index
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
         }
+        self.set_project_scan_complete(clean);
         n
     }
 
@@ -152,6 +174,65 @@ impl Workspace {
         };
         let tree = self.parser.parse(&text);
         resolve::goto(&self.index, key, &text, &tree, offset)
+    }
+
+    pub fn explain_resolution(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<crate::commands::ResolutionExplanation> {
+        let text = self.doc_text(key)?;
+        let parsed;
+        let (doc_text, tree): (&str, &Tree) = match self.open_docs.get(key) {
+            Some(doc) => (&doc.text, &doc.tree),
+            None => {
+                parsed = (self.parser.parse(&text), text);
+                (&parsed.1, &parsed.0)
+            }
+        };
+        let ident = identifier_at(tree, offset)?;
+        let symbol = Some(node_text(ident, doc_text).to_string()).filter(|s| !s.is_empty());
+        let targets = resolve::goto(&self.index, key, doc_text, tree, offset)
+            .into_iter()
+            .map(|d| format!("{}:{}..{}", d.file, d.start_byte, d.end_byte))
+            .collect::<Vec<_>>();
+        let kind = match resolve::use_kind(ident) {
+            resolve::UseKind::Type => "type",
+            resolve::UseKind::Call => "call",
+            resolve::UseKind::MemberSelector => "member",
+            resolve::UseKind::Value => "value",
+        };
+        if !targets.is_empty() {
+            return Some(crate::commands::ResolutionExplanation {
+                status: "ok",
+                kind,
+                symbol,
+                targets,
+                reasons: Vec::new(),
+            });
+        }
+
+        let status = resolve::reference_status(
+            &self.index,
+            tree,
+            doc_text,
+            ident,
+            self.effective_completeness(),
+        );
+        let (status, reasons) = match status {
+            resolve::ResolutionStatus::Found(()) => ("ok", Vec::new()),
+            resolve::ResolutionStatus::DefinitelyAbsent => ("definitely-absent", Vec::new()),
+            resolve::ResolutionStatus::Unknown(reasons) => {
+                ("unknown", reasons.into_iter().map(|reason| reason.label()).collect())
+            }
+        };
+        Some(crate::commands::ResolutionExplanation {
+            status,
+            kind,
+            symbol,
+            targets,
+            reasons,
+        })
     }
 
     /// `textDocument/completion`. Returns visible completion candidates at the cursor, or `None`
@@ -687,14 +768,43 @@ impl Workspace {
     /// LSP layer converts to positions and severities.
     pub fn diagnostics(&mut self, key: &str) -> Vec<crate::diagnostics::Diagnostic> {
         if let Some(doc) = self.open_docs.get(key) {
-            return crate::diagnostics::compute(&doc.text, &doc.tree);
+            return self.diagnostics_for_tree(&doc.text, &doc.tree);
         }
         let text = match self.doc_text(key) {
             Some(t) => t,
             None => return Vec::new(),
         };
         let tree = self.parser.parse(&text);
-        crate::diagnostics::compute(&text, &tree)
+        self.diagnostics_for_tree(&text, &tree)
+    }
+
+    fn diagnostics_for_tree(&self, text: &str, tree: &Tree) -> Vec<crate::diagnostics::Diagnostic> {
+        let mut out = crate::diagnostics::compute(text, tree);
+        if out
+            .iter()
+            .any(|d| d.code == Some(crate::diagnostics::DiagnosticCode::SyntaxError))
+        {
+            return out;
+        }
+        out.extend(crate::indexed_diagnostics::compute(
+            &self.index,
+            text,
+            tree,
+            self.effective_completeness(),
+        ));
+        out
+    }
+
+    fn effective_completeness(&self) -> resolve::CompletenessFacts {
+        let mut facts = self.completeness;
+        if self
+            .open_docs
+            .values()
+            .any(|doc| doc.tree.root_node().has_error())
+        {
+            facts.project_scan_complete = false;
+        }
+        facts
     }
 
     /// `textDocument/codeAction`: conservative import actions over the current document.
@@ -1116,15 +1226,17 @@ fn parse_project_file(
     java: &mut JavaParser,
 ) -> Option<ProjectFileIndex> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (symbols, usages) = match path.extension().and_then(|e| e.to_str()) {
+    let (symbols, usages, clean) = match path.extension().and_then(|e| e.to_str()) {
         Some("kt") | Some("kts") => {
             let tree = kotlin.parse(&text);
+            let clean = !tree.root_node().has_error();
             let pkg = package_of(&tree, &text);
-            (extract_symbols(&tree, &text, &pkg), extract_usages(&tree, &text))
+            (extract_symbols(&tree, &text, &pkg), extract_usages(&tree, &text), clean)
         }
         Some("java") => {
             let tree = java.parse(&text);
-            (crate::java::extract_symbols(&tree, &text), Vec::new())
+            let clean = !tree.root_node().has_error();
+            (crate::java::extract_symbols(&tree, &text), Vec::new(), clean)
         }
         _ => return None,
     };
@@ -1132,6 +1244,7 @@ fn parse_project_file(
         key: path.to_string_lossy().to_string(),
         symbols,
         usages,
+        clean,
     })
 }
 

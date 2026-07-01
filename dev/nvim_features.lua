@@ -267,6 +267,52 @@ do
   end, 100)
 end
 
+-- ---- Indexed diagnostics: missing simple type is published only after complete indexing ----
+do
+  local start_line = vim.api.nvim_buf_line_count(bufnr)
+  vim.api.nvim_buf_set_lines(bufnr, start_line, start_line, false, {
+    "",
+    "fun unresolvedTypeProbe(x: MissingHarnessType) {}",
+  })
+
+  local unresolved_diag = nil
+  vim.wait(8000, function()
+    for _, d in ipairs(vim.diagnostic.get(bufnr)) do
+      local is_missing_type = d.source == "ktlsp"
+        and d.severity == vim.diagnostic.severity.ERROR
+        and d.message == "Unresolved reference: MissingHarnessType"
+      if is_missing_type then
+        unresolved_diag = d
+        return true
+      end
+    end
+    return false
+  end, 100)
+  check(
+    "publishDiagnostics reports complete-index missing type",
+    unresolved_diag ~= nil,
+    vim.inspect(vim.diagnostic.get(bufnr))
+  )
+
+  local command_result = request("workspace/executeCommand", {
+    command = "ktlsp.explainResolution",
+    arguments = {
+      {
+        uri = uri,
+        position = { line = start_line + 1, character = #"fun unresolvedTypeProbe(x: " },
+      },
+    },
+  })
+  check(
+    "executeCommand explainResolution reports definitely-absent for closed missing type",
+    command_result ~= nil
+      and command_result.status == "definitely-absent"
+      and command_result.kind == "type"
+      and vim.tbl_isempty(command_result.reasons or {}),
+    vim.inspect(command_result)
+  )
+end
+
 -- ---- Visual editor features: folding, selection ranges, semantic tokens, inlay hints ----
 do
   local folds = request("textDocument/foldingRange", { textDocument = { uri = uri } })

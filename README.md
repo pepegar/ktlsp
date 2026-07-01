@@ -155,16 +155,22 @@ vim.lsp.start({
 
 ## Fast diagnostics
 
-ktlsp publishes conservative compiler-free diagnostics from the live tree-sitter parse. Today that
-means tree-sitter syntax errors, unused imports, plus duplicate simple declarations in local scopes:
-classifiers, properties, enum entries, value parameters, primary-constructor parameters, and type
-parameters. These checks run without Gradle or the Kotlin compiler. Syntax errors come directly from
-tree-sitter recovery nodes; semantic checks are still gated on a clean parse so ktlsp does not guess
-from a partial tree.
+ktlsp publishes conservative compiler-free diagnostics from the live tree-sitter parse and the
+symbol index. Today that means tree-sitter syntax errors, unused imports, duplicate simple
+declarations in local scopes (classifiers, properties, enum entries, value parameters,
+primary-constructor parameters, and type parameters), plus unresolved simple type, value, call, and
+member references when ktlsp can prove the relevant visible scope is complete. These checks run
+without Gradle or the Kotlin compiler. Syntax errors come directly from tree-sitter recovery nodes;
+semantic checks are still gated on a clean parse so ktlsp does not guess from a partial tree.
 
-The fast diagnostics deliberately do not report type mismatches, unresolved references, exhaustiveness
-errors, or full overload-resolution failures. Those require Kotlin compiler semantics; use the opt-in
-compile diagnostics backend below when you want the compiler as the oracle.
+The unresolved-reference diagnostics are intentionally conservative: ktlsp only fires when the
+query-local visibility world is closed enough to prove absence. `ktlsp.explainResolution` exposes
+the same model directly, returning `ok`, `definitely-absent`, or `unknown` together with explicit
+incompleteness reasons such as `project-package-incomplete:app` or
+`library-package-incomplete:kotlin.collections`. Fast diagnostics still deliberately do not report
+type mismatches, exhaustiveness errors, or full overload-resolution failures. Those require Kotlin
+compiler semantics; use the opt-in compile diagnostics backend below when you want the compiler as
+the oracle.
 
 ## Compile diagnostics (opt-in, off by default)
 
@@ -244,6 +250,7 @@ the logic honest:
 | `indexer` | extract declarations + identifier usages from a parse tree (descends into ERROR nodes) |
 | `index` | two-tier (volatile/durable) by-name symbol index + reverse usage index |
 | `resolve` | the goto-definition algorithm (local scope walk + kind-aware cross-file) |
+| `indexed_diagnostics` | index-backed diagnostics that require explicit completeness facts |
 | `coords` / `catalog` | Maven coordinates + Gradle version-catalog (`libs.versions.toml`) parsing |
 | `artifacts` / `jar` | locate/download `-sources.jar` (cache → Maven Central); zip-slip-safe extraction |
 | `deps` | catalog → coordinate → jar → extracted sources → indexed symbols, with a persistent symbol cache |
@@ -309,9 +316,10 @@ Useful scenarios:
 
 - `basic` creates a disposable two-file Kotlin project and checks local + cross-file goto.
 - `features` runs the richer `dev/sample` smoke: references, completion, auto-import, hover
-  signatures plus KDoc, document/workspace symbols, highlights, syntax diagnostics, code actions,
-  folding/selection ranges, semantic tokens, inlay hints, member goto, rename, signature help,
-  implementation/type-definition, call/type hierarchy, workspace commands, and did-change reparse.
+  signatures plus KDoc, document/workspace symbols, highlights, syntax diagnostics, complete-index
+  missing-type diagnostics, code actions, folding/selection ranges, semantic tokens, inlay hints,
+  member goto, rename, signature help, implementation/type-definition, call/type hierarchy,
+  workspace commands, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
   `kotlin-stdlib` and JDK sources.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.

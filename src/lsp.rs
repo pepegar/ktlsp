@@ -278,6 +278,7 @@ struct DepStats {
     files: usize,
     symbols: usize,
     failed: usize,
+    missing_sources: usize,
     shadowed: usize,
     skipped: usize,
     jdk_files: usize,
@@ -297,6 +298,7 @@ struct DependencyResult {
     discovered: Vec<crate::coords::Coordinate>,
     failed: bool,
     skipped: bool,
+    missing_source: bool,
     jdk: bool,
 }
 
@@ -336,6 +338,7 @@ fn spawn_jdk_index_worker(
                 discovered: Vec::new(),
                 failed: false,
                 skipped: false,
+                missing_source: false,
                 jdk: true,
             },
             Err(_) => DependencyResult {
@@ -345,6 +348,7 @@ fn spawn_jdk_index_worker(
                 discovered: Vec::new(),
                 failed: true,
                 skipped: false,
+                missing_source: false,
                 jdk: true,
             },
         };
@@ -368,6 +372,7 @@ fn spawn_coordinate_index_worker(
         let label = coord.label();
         let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let source = deps::coordinate_source(&coord, &repos, &extract_root);
+            let missing_source = source.is_none();
             let skipped = source
                 .as_ref()
                 .map(|source| {
@@ -385,16 +390,17 @@ fn spawn_coordinate_index_worker(
                 Vec::new()
             };
             let discovered = artifacts::dependency_coordinates(&repos, &coord);
-            (batches, discovered, skipped)
+            (batches, discovered, skipped, missing_source)
         }));
         let result = match resolved {
-            Ok((batches, discovered, skipped)) => DependencyResult {
+            Ok((batches, discovered, skipped, missing_source)) => DependencyResult {
                 coord: Some(coord),
                 label,
                 batches,
                 discovered,
                 failed: false,
                 skipped,
+                missing_source,
                 jdk: false,
             },
             Err(_) => DependencyResult {
@@ -404,6 +410,7 @@ fn spawn_coordinate_index_worker(
                 discovered: Vec::new(),
                 failed: true,
                 skipped: false,
+                missing_source: false,
                 jdk: false,
             },
         };
@@ -519,6 +526,9 @@ fn index_dependencies(
         if result.skipped {
             stats.skipped += 1;
         }
+        if result.missing_source {
+            stats.missing_sources += 1;
+        }
         if result
             .coord
             .as_ref()
@@ -617,15 +627,21 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         String::new()
     };
     let summary = format!(
-        "ktlsp indexed {} library files ({} symbols) from {} dependencies{} ({} failed, {} shadowed, {} duplicate skipped)",
+        "ktlsp indexed {} library files ({} symbols) from {} dependencies{} ({} failed, {} missing sources, {} shadowed, {} duplicate skipped)",
         stats.files,
         stats.symbols,
         stats.coordinates,
         jdk_summary,
         stats.failed,
+        stats.missing_sources,
         stats.shadowed,
         stats.skipped
     );
+    {
+        let mut guard = ws.lock().unwrap();
+        guard.set_library_index_complete(stats.failed == 0 && stats.missing_sources == 0);
+        guard.set_jdk_index_complete(stats.jdk_files > 0);
+    }
     client.log_message(MessageType::INFO, summary.clone()).await;
     if let Some(p) = ongoing {
         p.finish_with_message(format!(
@@ -1310,19 +1326,17 @@ impl LanguageServer for Backend {
                         None => return Ok(Some(serde_json::json!({ "status": "missing-document" }))),
                     };
                     let offset = LineIndex::new(&text).offset(&text, position.line, position.character);
-                    let symbol = crate::trace::ident_at(&text, offset);
-                    let targets = ws
-                        .goto_definition(&key, offset)
-                        .into_iter()
-                        .map(|d| format!("{}:{}..{}", d.file, d.start_byte, d.end_byte))
-                        .collect::<Vec<_>>();
-                    let status = if targets.is_empty() { "empty" } else { "ok" };
-                    serde_json::to_value(crate::commands::ResolutionExplanation {
-                        status,
-                        symbol,
-                        targets,
-                    })
-                    .unwrap_or_else(|_| serde_json::json!({ "status": "error" }))
+                    let explanation = ws.explain_resolution(&key, offset).unwrap_or(
+                        crate::commands::ResolutionExplanation {
+                            status: "no-identifier",
+                            kind: "unknown",
+                            symbol: crate::trace::ident_at(&text, offset),
+                            targets: Vec::new(),
+                            reasons: Vec::new(),
+                        },
+                    );
+                    serde_json::to_value(explanation)
+                        .unwrap_or_else(|_| serde_json::json!({ "status": "error" }))
                 };
                 Ok(Some(result))
             }

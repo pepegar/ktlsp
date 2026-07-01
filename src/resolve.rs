@@ -24,6 +24,74 @@ use crate::parser::{
 };
 use crate::symbol::{Def, SymbolKind};
 
+/// Coarse index/source completeness facts used only for negative diagnostics. These are deliberately
+/// separate from the symbol index: an empty lookup proves absence only when the caller knows the
+/// relevant source worlds have been indexed cleanly.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompletenessFacts {
+    pub project_scan_complete: bool,
+    pub library_index_complete: bool,
+    pub jdk_index_complete: bool,
+}
+
+impl CompletenessFacts {
+    pub fn complete() -> Self {
+        Self {
+            project_scan_complete: true,
+            library_index_complete: true,
+            jdk_index_complete: true,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum IncompletenessReason {
+    ProjectPackageIncomplete(String),
+    LibraryPackageIncomplete(String),
+    JdkPackageIncomplete(String),
+    NotSimpleTypeName,
+    NotSimpleName,
+    NotTypePosition,
+    NotReferencePosition,
+    UnknownReceiverType,
+    AmbiguousReceiverTypePackage(String),
+    ReceiverTypeNotIndexed(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolutionStatus<T> {
+    Found(T),
+    DefinitelyAbsent,
+    Unknown(Vec<IncompletenessReason>),
+}
+
+impl IncompletenessReason {
+    pub fn label(&self) -> String {
+        match self {
+            IncompletenessReason::ProjectPackageIncomplete(pkg) => {
+                format!("project-package-incomplete:{pkg}")
+            }
+            IncompletenessReason::LibraryPackageIncomplete(pkg) => {
+                format!("library-package-incomplete:{pkg}")
+            }
+            IncompletenessReason::JdkPackageIncomplete(pkg) => {
+                format!("jdk-package-incomplete:{pkg}")
+            }
+            IncompletenessReason::NotSimpleTypeName => "not-simple-type-name".to_string(),
+            IncompletenessReason::NotSimpleName => "not-simple-name".to_string(),
+            IncompletenessReason::NotTypePosition => "not-type-position".to_string(),
+            IncompletenessReason::NotReferencePosition => "not-reference-position".to_string(),
+            IncompletenessReason::UnknownReceiverType => "unknown-receiver-type".to_string(),
+            IncompletenessReason::AmbiguousReceiverTypePackage(name) => {
+                format!("ambiguous-receiver-type-package:{name}")
+            }
+            IncompletenessReason::ReceiverTypeNotIndexed(name) => {
+                format!("receiver-type-not-indexed:{name}")
+            }
+        }
+    }
+}
+
 /// Where an identifier sits syntactically — determines which symbol kinds may resolve it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UseKind {
@@ -58,6 +126,280 @@ pub(crate) fn use_kind(usage: Node) -> UseKind {
         }
     }
     UseKind::Value
+}
+
+pub fn reference_status(
+    index: &Index,
+    tree: &Tree,
+    src: &str,
+    usage: Node,
+    facts: CompletenessFacts,
+) -> ResolutionStatus<()> {
+    if usage.kind() != "identifier" {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleName]);
+    }
+    if is_declaration_identifier(usage) || has_ancestor_kind(usage, &["import", "package_header"]) {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
+    }
+    match use_kind(usage) {
+        UseKind::Type => simple_type_name_status(index, tree, src, usage, facts),
+        UseKind::Call | UseKind::Value => {
+            if is_navigation_receiver(usage) {
+                return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
+            }
+            if !is_simple_identifier(usage) {
+                return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleName]);
+            }
+            simple_name_status(index, tree, src, usage, use_kind(usage), facts)
+        }
+        UseKind::MemberSelector => member_name_status(index, tree, src, usage, facts),
+    }
+}
+
+/// Certify whether a simple type-name usage is definitely absent from the current file's visible
+/// type scope. This is intentionally narrower than goto-definition:
+/// - only simple `user_type` names are considered;
+/// - absence is proved against an explicit visibility/completeness model rather than a best-effort
+///   empty goto result;
+/// - every visible package world involved in the lookup must be marked complete before absence is
+///   reported.
+///
+/// Callers should use this for diagnostics, not navigation. Navigation can return "no result" when
+/// unsure; diagnostics need a proof boundary for the negative case.
+pub fn simple_type_name_status(
+    index: &Index,
+    tree: &Tree,
+    src: &str,
+    usage: Node,
+    facts: CompletenessFacts,
+) -> ResolutionStatus<()> {
+    if use_kind(usage) != UseKind::Type {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::NotTypePosition]);
+    }
+    if !is_simple_user_type_identifier(usage, src) {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleTypeName]);
+    }
+    simple_name_status(index, tree, src, usage, UseKind::Type, facts)
+}
+
+fn is_simple_user_type_identifier(usage: Node, src: &str) -> bool {
+    let Some(parent) = usage.parent() else {
+        return false;
+    };
+    if parent.kind() != "user_type" {
+        return false;
+    }
+    let parts = direct_identifier_parts(parent, src);
+    parts.len() == 1 && parts[0].0 == usage
+}
+
+fn is_simple_identifier(usage: Node) -> bool {
+    usage.kind() == "identifier"
+}
+
+fn is_navigation_receiver(usage: Node) -> bool {
+    usage.parent().is_some_and(|parent| {
+        parent.kind() == "navigation_expression" && parent.named_child(0) == Some(usage)
+    })
+}
+
+fn is_declaration_identifier(node: Node<'_>) -> bool {
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    match parent.kind() {
+        "variable_declaration" | "parameter" | "class_parameter" | "type_parameter"
+        | "enum_entry" => true,
+        "class_declaration" | "object_declaration" | "function_declaration" => parent
+            .child_by_field_name("name")
+            .is_some_and(|name| {
+                name.start_byte() == node.start_byte() && name.end_byte() == node.end_byte()
+            }),
+        _ => false,
+    }
+}
+
+fn has_ancestor_kind(node: Node<'_>, kinds: &[&str]) -> bool {
+    let mut current = node.parent();
+    while let Some(parent) = current {
+        if kinds.contains(&parent.kind()) {
+            return true;
+        }
+        current = parent.parent();
+    }
+    false
+}
+
+fn simple_name_status(
+    index: &Index,
+    tree: &Tree,
+    src: &str,
+    usage: Node,
+    uk: UseKind,
+    facts: CompletenessFacts,
+) -> ResolutionStatus<()> {
+    let name = node_text(usage, src);
+    if local_decl(usage, name, uk, src).is_some() {
+        return ResolutionStatus::Found(());
+    }
+    if !resolve_cross_file(index, tree, src, name, uk).is_empty() {
+        return ResolutionStatus::Found(());
+    }
+
+    let reasons = visible_package_reasons(tree, src, name, facts);
+    if reasons.is_empty() {
+        ResolutionStatus::DefinitelyAbsent
+    } else {
+        ResolutionStatus::Unknown(reasons)
+    }
+}
+
+fn member_name_status(
+    index: &Index,
+    tree: &Tree,
+    src: &str,
+    usage: Node,
+    facts: CompletenessFacts,
+) -> ResolutionStatus<()> {
+    let name = node_text(usage, src);
+    if !resolve_member(index, usage, name, src, tree).is_empty() {
+        return ResolutionStatus::Found(());
+    }
+
+    let Some(nav) = usage.parent() else {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+    };
+    let Some(recv) = nav.named_child(0) else {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+    };
+    let ctx = infer::FileCtx::from_tree(tree, src);
+    let recv_ty = infer::infer(index, recv, src, &ctx);
+    let Some(root) = recv_ty.name() else {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
+    };
+    let Some(root_pkg) = recv_ty.package() else {
+        return ResolutionStatus::Unknown(vec![IncompletenessReason::AmbiguousReceiverTypePackage(
+            root.to_string(),
+        )]);
+    };
+
+    let mut reasons = hierarchy_package_reasons(index, root, root_pkg, facts);
+    reasons.extend(visible_package_reasons(tree, src, name, facts));
+    dedup_reasons(&mut reasons);
+    if reasons.is_empty() {
+        ResolutionStatus::DefinitelyAbsent
+    } else {
+        ResolutionStatus::Unknown(reasons)
+    }
+}
+
+fn hierarchy_package_reasons(
+    index: &Index,
+    root: &str,
+    root_pkg: &str,
+    facts: CompletenessFacts,
+) -> Vec<IncompletenessReason> {
+    let mut reasons = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut frontier = vec![(root.to_string(), root_pkg.to_string())];
+    while let Some((name, pkg)) = frontier.pop() {
+        if !visited.insert(format!("{pkg}:{name}")) {
+            continue;
+        }
+        let entries: Vec<&Entry> = index
+            .lookup_type(&name)
+            .into_iter()
+            .filter(|e| e.sym.package == pkg)
+            .collect();
+        if entries.is_empty() {
+            reasons.push(IncompletenessReason::ReceiverTypeNotIndexed(format!("{pkg}.{name}")));
+            continue;
+        }
+        for entry in &entries {
+            package_world_reasons(&pkg, Some(*entry), root_pkg, facts, &mut reasons);
+        }
+        for sup in index.supertypes_of_in(&name, Some(&pkg)) {
+            let sup_pkg = if index.lookup_type(&sup).iter().any(|e| e.sym.package == pkg) {
+                pkg.clone()
+            } else {
+                pkg.clone()
+            };
+            frontier.push((sup, sup_pkg));
+        }
+    }
+    dedup_reasons(&mut reasons);
+    reasons
+}
+
+fn visible_package_reasons(
+    tree: &Tree,
+    src: &str,
+    local_name: &str,
+    facts: CompletenessFacts,
+) -> Vec<IncompletenessReason> {
+    let imports = imports_of(tree, src);
+    let current_pkg = package_of(tree, src);
+    let mut reasons = Vec::new();
+    let mut visible_pkgs = Vec::new();
+    push_visible_package(&mut visible_pkgs, current_pkg.clone());
+    for imp in &imports {
+        if !imp.wildcard && imp.local_name() == Some(local_name) {
+            push_visible_package(&mut visible_pkgs, imp.package());
+        }
+    }
+    for imp in &imports {
+        if imp.wildcard {
+            push_visible_package(&mut visible_pkgs, imp.package());
+        }
+    }
+    for pkg in DEFAULT_IMPORT_PACKAGES {
+        push_visible_package(&mut visible_pkgs, (*pkg).to_string());
+    }
+    for pkg in visible_pkgs {
+        package_world_reasons(&pkg, None, &current_pkg, facts, &mut reasons);
+    }
+    dedup_reasons(&mut reasons);
+    reasons
+}
+
+fn push_visible_package(out: &mut Vec<String>, package: String) {
+    if !out.iter().any(|p| p == &package) {
+        out.push(package);
+    }
+}
+
+fn package_world_reasons(
+    package: &str,
+    entry: Option<&Entry>,
+    current_file_pkg: &str,
+    facts: CompletenessFacts,
+    out: &mut Vec<IncompletenessReason>,
+) {
+    let from_project = entry
+        .map(|e| e.tier == crate::index::Tier::Volatile)
+        .unwrap_or(package == current_file_pkg);
+    let from_jdk = package == "java.lang"
+        || package.starts_with("java.")
+        || package.starts_with("javax.")
+        || package.starts_with("jdk.");
+    let from_library = entry
+        .map(|e| e.tier == crate::index::Tier::Durable && !from_jdk)
+        .unwrap_or(!from_project && !from_jdk);
+
+    if from_project && !facts.project_scan_complete {
+        out.push(IncompletenessReason::ProjectPackageIncomplete(package.to_string()));
+    }
+    if from_library && !facts.library_index_complete {
+        out.push(IncompletenessReason::LibraryPackageIncomplete(package.to_string()));
+    }
+    if from_jdk && !facts.jdk_index_complete {
+        out.push(IncompletenessReason::JdkPackageIncomplete(package.to_string()));
+    }
+}
+
+fn dedup_reasons(reasons: &mut Vec<IncompletenessReason>) {
+    let mut seen = std::collections::HashSet::new();
+    reasons.retain(|reason| seen.insert(reason.label()));
 }
 
 fn kind_ok(uk: UseKind, kind: SymbolKind) -> bool {

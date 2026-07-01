@@ -21,6 +21,7 @@ pub mod hierarchy;
 pub mod hints;
 pub mod index;
 pub mod indexer;
+pub mod indexed_diagnostics;
 pub mod infer;
 pub mod imports;
 pub mod jar;

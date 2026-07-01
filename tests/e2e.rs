@@ -618,6 +618,7 @@ async fn expanded_editor_surface_requests_round_trip() {
                 class ConsoleGreeter : Greeter\n\
                 fun add(a: Int, b: Int): Int = a + b\n\
                 fun caller(): Int = add(1, 2)\n\
+                fun unresolvedTypeProbe(x: MissingHarnessType) {}\n\
                 fun main() {\n\
                 \x20\x20\x20\x20val g = ConsoleGreeter()\n\
                 \x20\x20\x20\x20println(g)\n\
@@ -780,6 +781,40 @@ async fn expanded_editor_surface_requests_round_trip() {
         .unwrap()
         .expect("command should return a value");
     assert_eq!(command.get("status").and_then(|v| v.as_str()), Some("ok"));
+    assert_eq!(command.get("kind").and_then(|v| v.as_str()), Some("call"));
+
+    let missing_line =
+        text.lines().position(|line| line.contains("MissingHarnessType")).unwrap() as u32;
+    let missing_col = text
+        .lines()
+        .nth(missing_line as usize)
+        .unwrap()
+        .find("MissingHarnessType")
+        .unwrap() as u32;
+    let missing = backend
+        .execute_command(ExecuteCommandParams {
+            command: "ktlsp.explainResolution".into(),
+            arguments: vec![serde_json::json!({
+                "uri": uri.as_str(),
+                "position": { "line": missing_line, "character": missing_col }
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("missing-resolution command should return a value");
+    assert_eq!(
+        missing.get("status").and_then(|v| v.as_str()),
+        Some("unknown")
+    );
+    assert_eq!(missing.get("kind").and_then(|v| v.as_str()), Some("type"));
+    assert!(
+        missing
+            .get("reasons")
+            .and_then(|v| v.as_array())
+            .is_some_and(|reasons| !reasons.is_empty()),
+        "{missing:?}"
+    );
 
     let formatting = backend
         .formatting(DocumentFormattingParams {

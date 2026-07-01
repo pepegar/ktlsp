@@ -28,6 +28,7 @@ pub enum Severity {
 pub enum DiagnosticCode {
     SyntaxError,
     UnusedImport,
+    UnresolvedReference,
 }
 
 impl DiagnosticCode {
@@ -35,6 +36,7 @@ impl DiagnosticCode {
         match self {
             DiagnosticCode::SyntaxError => "syntax_error",
             DiagnosticCode::UnusedImport => "unused_import",
+            DiagnosticCode::UnresolvedReference => "unresolved_reference",
         }
     }
 }

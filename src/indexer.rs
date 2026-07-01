@@ -591,6 +591,158 @@ fn push_ctor_properties(
     }
 }
 
+fn push_synthetic_member(
+    out: &mut Vec<IndexedSymbol>,
+    anchor: Node,
+    name: &str,
+    kind: SymbolKind,
+    package: &str,
+    container: &str,
+    arity: Option<u8>,
+    return_type: Option<TypeRef>,
+    value_type: Option<TypeRef>,
+    params: Vec<TypeRef>,
+    type_params: Vec<String>,
+) {
+    if out.iter().any(|sym| {
+        sym.name == name && sym.kind == kind && sym.package == package
+            && sym.container.as_deref() == Some(container)
+    }) {
+        return;
+    }
+    out.push(IndexedSymbol {
+        name: name.to_string(),
+        kind,
+        package: package.to_string(),
+        container: Some(container.to_string()),
+        start_byte: anchor.start_byte(),
+        end_byte: anchor.end_byte(),
+        documentation: None,
+        supertypes: Vec::new(),
+        ext_receiver: None,
+        arity,
+        return_type,
+        value_type,
+        params,
+        type_params,
+    });
+}
+
+fn push_data_class_synthetics(
+    out: &mut Vec<IndexedSymbol>,
+    class_decl: Node,
+    name_node: Node,
+    src: &str,
+    package: &str,
+    container: &str,
+    scope: &TypeScope,
+) {
+    if !is_data_class(class_decl, name_node, src) {
+        return;
+    }
+    let Some(pc) = child_of_kind(class_decl, "primary_constructor") else {
+        return;
+    };
+    let Some(cps) = child_of_kind(pc, "class_parameters") else {
+        return;
+    };
+    let mut props = Vec::new();
+    let mut cursor = cps.walk();
+    for cp in cps.named_children(&mut cursor) {
+        if cp.kind() != "class_parameter" || (!has_child_token(cp, "val") && !has_child_token(cp, "var")) {
+            continue;
+        }
+        props.push(value_type_of_scoped(cp, src, Some(scope)).unwrap_or_default());
+    }
+
+    let self_type = TypeRef {
+        name: container.to_string(),
+        nullable: false,
+        args: Vec::new(),
+        package_candidates: vec![package.to_string()],
+    };
+    push_synthetic_member(
+        out,
+        name_node,
+        "copy",
+        SymbolKind::Function,
+        package,
+        container,
+        Some(props.len().min(u8::MAX as usize) as u8),
+        Some(self_type),
+        None,
+        props.clone(),
+        type_params_of(class_decl, src),
+    );
+    for (idx, prop) in props.into_iter().enumerate() {
+        push_synthetic_member(
+            out,
+            name_node,
+            &format!("component{}", idx + 1),
+            SymbolKind::Function,
+            package,
+            container,
+            Some(0),
+            Some(prop),
+            None,
+            Vec::new(),
+            Vec::new(),
+        );
+    }
+}
+
+fn is_data_class(class_decl: Node, name_node: Node, src: &str) -> bool {
+    src.get(class_decl.start_byte()..name_node.start_byte())
+        .is_some_and(|prefix| prefix.split_whitespace().any(|part| part == "data"))
+}
+
+fn push_enum_class_synthetics(
+    out: &mut Vec<IndexedSymbol>,
+    name_node: Node,
+    package: &str,
+    container: &str,
+) {
+    push_synthetic_member(
+        out,
+        name_node,
+        "entries",
+        SymbolKind::Property,
+        package,
+        container,
+        None,
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+    );
+    push_synthetic_member(
+        out,
+        name_node,
+        "values",
+        SymbolKind::Function,
+        package,
+        container,
+        Some(0),
+        None,
+        None,
+        Vec::new(),
+        Vec::new(),
+    );
+    push_synthetic_member(
+        out,
+        name_node,
+        "valueOf",
+        SymbolKind::Function,
+        package,
+        container,
+        Some(1),
+        None,
+        None,
+        vec![TypeRef::simple("String")],
+        Vec::new(),
+    );
+}
+
 /// First descendant of `node` (depth-first) with the given kind.
 fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
     let mut cursor = node.walk();
@@ -683,6 +835,10 @@ fn walk(
                     // every data-class property). Index them as members; plain params (no val/var) are
                     // not members and stay unindexed.
                     push_ctor_properties(out, child, src, package, &cname, scope);
+                    push_data_class_synthetics(out, child, name, src, package, &cname, scope);
+                    if kind == SymbolKind::EnumClass {
+                        push_enum_class_synthetics(out, name, package, &cname);
+                    }
                     let mut c2 = child.walk();
                     for body in child.named_children(&mut c2) {
                         if matches!(body.kind(), "class_body" | "enum_class_body") {
@@ -890,6 +1046,29 @@ object Reg { fun add() {} }
         assert_eq!(pid.kind, SymbolKind::Property);
         assert_eq!(pid.container.as_deref(), Some("P"));
         assert_eq!(pid.value_type.as_ref().map(|t| t.name.as_str()), Some("Long"));
+    }
+
+    #[test]
+    fn data_class_synthetic_members_are_indexed() {
+        let syms = index("data class User(val name: String, val age: Int)\n");
+        let copy = syms.iter().find(|s| s.name == "copy").unwrap();
+        assert_eq!(copy.kind, SymbolKind::Function);
+        assert_eq!(copy.container.as_deref(), Some("User"));
+        assert_eq!(copy.arity, Some(2));
+        assert_eq!(copy.return_type.as_ref().map(|t| t.name.as_str()), Some("User"));
+        assert_eq!(copy.params.len(), 2);
+
+        let component1 = syms.iter().find(|s| s.name == "component1").unwrap();
+        assert_eq!(component1.kind, SymbolKind::Function);
+        assert_eq!(component1.return_type.as_ref().map(|t| t.name.as_str()), Some("String"));
+    }
+
+    #[test]
+    fn enum_class_synthetic_members_are_indexed() {
+        let syms = index("enum class Role { ADMIN }\n");
+        assert!(syms.iter().any(|s| s.name == "entries" && s.container.as_deref() == Some("Role")));
+        assert!(syms.iter().any(|s| s.name == "values" && s.container.as_deref() == Some("Role")));
+        assert!(syms.iter().any(|s| s.name == "valueOf" && s.container.as_deref() == Some("Role")));
     }
 
     #[test]

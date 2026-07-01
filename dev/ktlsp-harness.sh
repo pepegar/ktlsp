@@ -181,6 +181,20 @@ KOTLIN
   printf '%s\n' "$project"
 }
 
+write_fake_jdk_src_zip() {
+  local src_root="$run_dir/fake-jdk-src"
+  local src_zip="$run_dir/fake-jdk-src.zip"
+  mkdir -p "$src_root/java/lang"
+  cat > "$src_root/java/lang/Object.java" <<'JAVA'
+package java.lang;
+
+public class Object {
+}
+JAVA
+  (cd "$src_root" && zip -qr "$src_zip" .)
+  printf '%s\n' "$src_zip"
+}
+
 run_and_capture() {
   local name="$1"
   shift
@@ -226,6 +240,9 @@ case "$scenario" in
     ;;
   features)
     project="${root_arg:-$repo/dev/sample}"
+    if [ -z "${KTLSP_JDK_SRC:-}" ]; then
+      export KTLSP_JDK_SRC="$(write_fake_jdk_src_zip)"
+    fi
     run_and_capture features nvim -l "$repo/dev/nvim_features.lua" "$project" || run_status=$?
     ;;
   library)

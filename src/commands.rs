@@ -19,6 +19,8 @@ pub fn all() -> Vec<String> {
 #[derive(Debug, Serialize)]
 pub struct ResolutionExplanation {
     pub status: &'static str,
+    pub kind: &'static str,
     pub symbol: Option<String>,
     pub targets: Vec<String>,
+    pub reasons: Vec<String>,
 }
