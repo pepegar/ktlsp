@@ -141,6 +141,18 @@ fn goto_into_jvm_variant_sources_for_multiplatform_coordinate() {
     let jvm_coord = Coordinate::parse("io.ktor:ktor-client-apache5-jvm:3.5.0").unwrap();
 
     let gradle_cache = tmp.join("gradle/caches");
+    let empty_root_jar = gradle_cache
+        .join("modules-2/files-2.1")
+        .join(&coord.group)
+        .join(&coord.artifact)
+        .join(&coord.version)
+        .join("feedface")
+        .join(coord.sources_jar_name());
+    write_sources_jar(
+        &empty_root_jar,
+        &[("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")],
+    );
+
     let jar = gradle_cache
         .join("modules-2/files-2.1")
         .join(&jvm_coord.group)

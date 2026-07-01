@@ -49,16 +49,22 @@ pub fn sources_jar(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<PathB
     let candidates = source_candidates(c);
     for candidate in &candidates {
         if let Some(p) = find_in_gradle_cache(&repos.gradle_cache, candidate) {
-            return Ok(Some(p));
+            if has_indexable_sources(&p) {
+                return Ok(Some(p));
+            }
         }
         if let Some(p) = find_in_m2(&repos.m2, candidate) {
-            return Ok(Some(p));
+            if has_indexable_sources(&p) {
+                return Ok(Some(p));
+            }
         }
     }
     if repos.allow_download {
         for candidate in &candidates {
             if let Some(p) = download_sources(repos, candidate)? {
-                return Ok(Some(p));
+                if has_indexable_sources(&p) {
+                    return Ok(Some(p));
+                }
             }
         }
     }
@@ -74,6 +80,26 @@ fn source_candidates(c: &Coordinate) -> Vec<Coordinate> {
         });
     }
     candidates
+}
+
+fn has_indexable_sources(path: &Path) -> bool {
+    let Ok(file) = fs::File::open(path) else {
+        // Preserve the old path so extraction can report the real failure.
+        return true;
+    };
+    let Ok(mut archive) = zip::ZipArchive::new(file) else {
+        return true;
+    };
+    for i in 0..archive.len() {
+        let Ok(entry) = archive.by_index(i) else {
+            continue;
+        };
+        let name = entry.name();
+        if name.ends_with(".kt") || name.ends_with(".java") {
+            return true;
+        }
+    }
+    false
 }
 
 /// `~/.gradle/caches/modules-2/files-2.1/{group}/{artifact}/{version}/{sha1}/{name}` — the group
@@ -198,6 +224,21 @@ mod tests {
         let _ = fs::remove_dir_all(&tmp);
         let c = Coordinate::parse("io.ktor:ktor-client-apache5:3.5.0").unwrap();
         let jvm = Coordinate::parse("io.ktor:ktor-client-apache5-jvm:3.5.0").unwrap();
+
+        let root_dir = tmp
+            .join(".gradle/caches/modules-2/files-2.1")
+            .join(&c.group)
+            .join(&c.artifact)
+            .join(&c.version)
+            .join("feedface");
+        fs::create_dir_all(&root_dir).unwrap();
+        let empty_root_jar = root_dir.join(c.sources_jar_name());
+        let f = fs::File::create(&empty_root_jar).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        zip.start_file("META-INF/MANIFEST.MF", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"Manifest-Version: 1.0\n").unwrap();
+        zip.finish().unwrap();
 
         let dir = tmp
             .join(".gradle/caches/modules-2/files-2.1")
