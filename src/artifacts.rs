@@ -8,6 +8,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use serde_json::Value;
@@ -15,6 +16,7 @@ use serde_json::Value;
 use crate::coords::{compare_versions, Coordinate};
 
 /// Where to look for / store artifacts.
+#[derive(Clone, Debug)]
 pub struct Repos {
     /// `~/.gradle/caches` (Gradle stores `modules-2/files-2.1/{group}/{artifact}/{version}/{sha1}/`).
     pub gradle_cache: PathBuf,
@@ -35,11 +37,15 @@ impl Repos {
         let home = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(std::env::temp_dir);
+        let ktlsp_cache = std::env::var_os("KTLSP_CACHE_DIR")
+            .filter(|path| !path.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(".cache/ktlsp"));
         Repos {
             gradle_cache: home.join(".gradle/caches"),
             m2: home.join(".m2/repository"),
             central_base: "https://repo1.maven.org/maven2".to_string(),
-            download_dir: home.join(".cache/ktlsp/jars"),
+            download_dir: ktlsp_cache.join("jars"),
             allow_download: true,
         }
     }
@@ -211,20 +217,46 @@ fn download_sources(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<Path
     if dest.is_file() {
         return Ok(Some(dest)); // previously downloaded
     }
+    let marker = no_sources_marker(&repos.download_dir, c);
+    if marker.is_file() {
+        return Ok(None); // previously confirmed absent from the remote repository
+    }
     let url = c.sources_url(&repos.central_base);
     match http_download(&url, &dest) {
         Ok(()) => Ok(Some(dest)),
         Err(e) => {
             // 404 / network error: no sources available — skip gracefully, don't fail indexing.
             tracing::debug!("no sources jar for {}: {e}", c.label());
+            remember_no_sources(&marker);
             Ok(None)
         }
     }
 }
 
+fn no_sources_marker(download_dir: &Path, c: &Coordinate) -> PathBuf {
+    download_dir
+        .join(c.group_path())
+        .join(&c.artifact)
+        .join(&c.version)
+        .join(format!("{}.no-sources", c.sources_jar_name()))
+}
+
+fn remember_no_sources(marker: &Path) {
+    if let Some(parent) = marker.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(marker, b"missing\n");
+}
+
 /// Blocking HTTPS GET to a file (ureq + rustls). Follows redirects; errors on non-2xx.
 fn http_download(url: &str, dest: &Path) -> anyhow::Result<()> {
-    let mut resp = ureq::get(url)
+    let agent = ureq::Agent::new_with_config(
+        ureq::Agent::config_builder()
+            .timeout_global(Some(source_download_timeout()))
+            .build(),
+    );
+    let mut resp = agent
+        .get(url)
         .call()
         .with_context(|| format!("GET {url}"))?;
     anyhow::ensure!(
@@ -242,6 +274,16 @@ fn http_download(url: &str, dest: &Path) -> anyhow::Result<()> {
     drop(out);
     fs::rename(&tmp, dest)?;
     Ok(())
+}
+
+fn source_download_timeout() -> Duration {
+    const DEFAULT_MS: u64 = 3_000;
+    let ms = std::env::var("KTLSP_SOURCE_DOWNLOAD_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MS);
+    Duration::from_millis(ms)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -669,6 +711,43 @@ mod tests {
         };
         let found = sources_jar(&repos, &c).unwrap();
         assert_eq!(found.as_deref(), Some(jar.as_path()));
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn no_sources_marker_is_respected_but_local_cache_still_wins() {
+        let tmp = std::env::temp_dir().join(format!("ktlsp_art_no_sources_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let c = Coordinate::parse("com.example:absent:1.0").unwrap();
+        let repos = Repos {
+            gradle_cache: tmp.join(".gradle/caches"),
+            m2: tmp.join(".m2/repository"),
+            central_base: "http://127.0.0.1:0/unused".to_string(),
+            download_dir: tmp.join("dl"),
+            allow_download: true,
+        };
+
+        let marker = no_sources_marker(&repos.download_dir, &c);
+        remember_no_sources(&marker);
+        assert_eq!(sources_jar(&repos, &c).unwrap(), None);
+
+        let dir = tmp
+            .join(".gradle/caches/modules-2/files-2.1")
+            .join(&c.group)
+            .join(&c.artifact)
+            .join(&c.version)
+            .join("deadbeef");
+        fs::create_dir_all(&dir).unwrap();
+        let jar = dir.join(c.sources_jar_name());
+        let f = fs::File::create(&jar).unwrap();
+        let mut zip = zip::ZipWriter::new(f);
+        zip.start_file("demo/Lib.kt", SimpleFileOptions::default())
+            .unwrap();
+        zip.write_all(b"package demo\nfun x() {}\n").unwrap();
+        zip.finish().unwrap();
+
+        assert_eq!(sources_jar(&repos, &c).unwrap().as_deref(), Some(jar.as_path()));
 
         let _ = fs::remove_dir_all(&tmp);
     }

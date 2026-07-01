@@ -2,8 +2,10 @@
 //! the LSP layer drives. All keys are the caller's canonical identity string (a path or URI
 //! string); we never re-derive identity from the filesystem at query time.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
+use std::process::Command;
+use std::sync::{mpsc, Arc, Mutex};
 
 use tree_sitter::{Node, Tree};
 use walkdir::{DirEntry, WalkDir};
@@ -11,7 +13,7 @@ use walkdir::{DirEntry, WalkDir};
 use crate::actions::{self, Action};
 use crate::complete::{self, ScopeCompletion, ShapedCompletions};
 use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
-use crate::index::{Entry, Index, RefEntry, Tier};
+use crate::index::{Entry, Index, RefEntry, Tier, Usage};
 use crate::indexer::{extract_symbols, extract_usages};
 use crate::infer;
 use crate::imports::{self, ImportLayout};
@@ -19,7 +21,7 @@ use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_
 use crate::ranges::{self, FoldRange, SelectionRange};
 use crate::resolve;
 use crate::semantic;
-use crate::symbol::{Def, SymbolKind};
+use crate::symbol::{Def, IndexedSymbol, SymbolKind};
 use crate::symbols::SymbolSummary;
 
 /// An open buffer: its current text plus the parsed tree, kept in sync so goto-definition reads an
@@ -27,6 +29,12 @@ use crate::symbols::SymbolSummary;
 struct DocState {
     text: String,
     tree: Tree,
+}
+
+struct ProjectFileIndex {
+    key: String,
+    symbols: Vec<IndexedSymbol>,
+    usages: Vec<Usage>,
 }
 
 pub struct Workspace {
@@ -111,30 +119,20 @@ impl Workspace {
     /// Index every `.kt`/`.kts` under `root`, skipping build output and dot directories and any
     /// files currently open (their dirty buffers are authoritative). Returns the count indexed.
     pub fn scan(&mut self, root: &Path) -> usize {
-        let mut n = 0;
-        let walker = WalkDir::new(root)
-            .into_iter()
-            .filter_entry(|e| !is_excluded(e));
-        for entry in walker.filter_map(Result::ok) {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let path = entry.path();
-            let is_kt = matches!(
-                path.extension().and_then(|e| e.to_str()),
-                Some("kt") | Some("kts")
-            );
-            if !is_kt {
-                continue;
-            }
+        let mut paths = Vec::new();
+        for path in project_source_files(root) {
             let key = path.to_string_lossy().to_string();
             if self.open_docs.contains_key(&key) {
                 continue;
             }
-            if let Ok(text) = std::fs::read_to_string(path) {
-                self.reindex(&key, &text);
-                n += 1;
-            }
+            paths.push(path);
+        }
+        let batches = parse_project_files(paths);
+        let n = batches.len();
+        for batch in batches {
+            self.index
+                .replace_file(&batch.key, batch.symbols, Tier::Volatile);
+            self.index.replace_file_refs(&batch.key, batch.usages);
         }
         n
     }
@@ -1040,10 +1038,163 @@ fn is_excluded(entry: &DirEntry) -> bool {
         return false;
     }
     match entry.file_name().to_str() {
-        Some(name) => {
-            matches!(name, "build" | "out" | "target" | "node_modules" | ".gradle")
-                || (name.starts_with('.') && name.len() > 1)
-        }
+        Some(name) => is_excluded_dir_name(name),
         None => false,
     }
+}
+
+fn is_excluded_dir_name(name: &str) -> bool {
+    matches!(name, "build" | "out" | "target" | "node_modules" | ".gradle")
+        || (name.starts_with('.') && name.len() > 1)
+}
+
+fn relative_path_has_excluded_dir(path: &str) -> bool {
+    path.split('/').any(is_excluded_dir_name)
+}
+
+fn project_source_files(root: &Path) -> Vec<std::path::PathBuf> {
+    git_source_files(root).unwrap_or_else(|| walk_source_files(root))
+}
+
+fn parse_project_files(paths: Vec<std::path::PathBuf>) -> Vec<ProjectFileIndex> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let workers = project_index_threads().min(paths.len());
+    if workers <= 1 {
+        let mut parser = KotlinParser::new();
+        let mut out: Vec<_> = paths
+            .into_iter()
+            .filter_map(|path| parse_project_file(&path, &mut parser))
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        return out;
+    }
+
+    let queue = Arc::new(Mutex::new(VecDeque::from(paths)));
+    let (tx, rx) = mpsc::channel();
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let queue = queue.clone();
+        let tx = tx.clone();
+        handles.push(std::thread::spawn(move || {
+            let mut parser = KotlinParser::new();
+            loop {
+                let path = {
+                    let mut guard = queue.lock().unwrap();
+                    guard.pop_front()
+                };
+                let Some(path) = path else {
+                    break;
+                };
+                if let Some(batch) = parse_project_file(&path, &mut parser) {
+                    let _ = tx.send(batch);
+                }
+            }
+        }));
+    }
+    drop(tx);
+    let mut out: Vec<_> = rx.into_iter().collect();
+    for handle in handles {
+        let _ = handle.join();
+    }
+    out.sort_by(|a, b| a.key.cmp(&b.key));
+    out
+}
+
+fn parse_project_file(path: &Path, parser: &mut KotlinParser) -> Option<ProjectFileIndex> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let tree = parser.parse(&text);
+    let pkg = package_of(&tree, &text);
+    let symbols = extract_symbols(&tree, &text, &pkg);
+    let usages = extract_usages(&tree, &text);
+    Some(ProjectFileIndex {
+        key: path.to_string_lossy().to_string(),
+        symbols,
+        usages,
+    })
+}
+
+fn project_index_threads() -> usize {
+    std::env::var("KTLSP_PROJECT_INDEX_THREADS")
+        .ok()
+        .or_else(|| std::env::var("KTLSP_INDEX_THREADS").ok())
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|threads| threads.get())
+                .unwrap_or(1)
+                .min(8)
+        })
+}
+
+fn git_source_files(root: &Path) -> Option<Vec<std::path::PathBuf>> {
+    let top = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+        .ok()?;
+    if !top.status.success() {
+        return None;
+    }
+    let top = String::from_utf8(top.stdout).ok()?;
+    let top = std::path::PathBuf::from(top.trim());
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args([
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--full-name",
+            "--",
+            "*.kt",
+            "*.kts",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let mut out = Vec::new();
+    for rel in output.stdout.split(|byte| *byte == 0) {
+        if rel.is_empty() {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(rel);
+        if relative_path_has_excluded_dir(&rel) {
+            continue;
+        }
+        let path = top.join(rel.as_ref());
+        if path.starts_with(&root) {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Some(out)
+}
+
+fn walk_source_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let walker = WalkDir::new(root)
+        .into_iter()
+        .filter_entry(|e| !is_excluded(e));
+    let mut out = Vec::new();
+    for entry in walker.filter_map(Result::ok) {
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let path = entry.path();
+        if matches!(
+            path.extension().and_then(|e| e.to_str()),
+            Some("kt") | Some("kts")
+        ) {
+            out.push(path.to_path_buf());
+        }
+    }
+    out
 }

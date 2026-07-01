@@ -37,6 +37,28 @@ pub struct FileSymbols {
     pub symbols: Vec<IndexedSymbol>,
 }
 
+/// A resolved source location for a dependency coordinate. The `identity` is stable for the actual
+/// source artifact, not just the requested coordinate, so `foo` and its `foo-jvm` fallback can be
+/// recognized as the same library before parsing.
+#[derive(Clone, Debug)]
+pub struct LibrarySource {
+    dest: PathBuf,
+    jar: Option<PathBuf>,
+    fingerprint: Option<String>,
+}
+
+impl LibrarySource {
+    pub fn identity(&self) -> String {
+        if let Some(fingerprint) = &self.fingerprint {
+            format!("jar:{fingerprint}")
+        } else if let Some(jar) = &self.jar {
+            format!("jar:{}", jar.to_string_lossy())
+        } else {
+            format!("extracted:{}", self.dest.to_string_lossy())
+        }
+    }
+}
+
 /// Read coordinates from every version catalog under `root` (`gradle/libs.versions.toml`, a
 /// top-level `libs.versions.toml`, and nested Gradle builds' catalogs), then ensure kotlin-stdlib is
 /// among them (the Kotlin Gradle plugin adds it implicitly, so most projects never list it).
@@ -400,16 +422,13 @@ fn parse_dir(dest: &Path, kotlin: &mut KotlinParser, java: &mut JavaParser) -> V
     out
 }
 
-/// Resolve one coordinate to indexed symbols: locate/download its sources jar, ensure it's
-/// extracted, then load parsed symbols from the symcache (skipping parse) or parse + cache them.
-/// Lock-free; returns nothing if the coordinate has no sources jar and no prior extraction.
-pub fn resolve_coordinate(
+/// Resolve one coordinate to its source artifact/extraction location without parsing it. Returns
+/// nothing if the coordinate has no sources jar and no prior extraction.
+pub fn coordinate_source(
     coord: &Coordinate,
     repos: &Repos,
     extract_root: &Path,
-    kotlin: &mut KotlinParser,
-    java: &mut JavaParser,
-) -> Vec<FileSymbols> {
+) -> Option<LibrarySource> {
     let dest = extract_root
         .join(&coord.group)
         .join(&coord.artifact)
@@ -426,31 +445,65 @@ pub fn resolve_coordinate(
 
     let Some(jar) = jar else {
         // No sources jar available now — use a prior extraction if one exists, else give up.
-        return if dest.is_dir() {
-            parse_dir(&dest, kotlin, java)
-        } else {
-            Vec::new()
-        };
+        return dest.is_dir().then_some(LibrarySource {
+            dest,
+            jar: None,
+            fingerprint: None,
+        });
     };
 
-    if !dest.is_dir() {
-        if let Err(e) = jar::extract_sources(&jar, &dest) {
-            tracing::warn!("extract {} failed: {e}", coord.label());
+    let fingerprint = jar_fingerprint(&jar);
+    Some(LibrarySource {
+        dest,
+        jar: Some(jar),
+        fingerprint,
+    })
+}
+
+/// Index an already-resolved library source: ensure it's extracted, then load parsed symbols from
+/// the symcache (skipping parse) or parse + cache them.
+pub fn resolve_library_source(
+    source: &LibrarySource,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Vec<FileSymbols> {
+    let Some(jar) = &source.jar else {
+        return parse_dir(&source.dest, kotlin, java);
+    };
+
+    if !source.dest.is_dir() {
+        if let Err(e) = jar::extract_sources(jar, &source.dest) {
+            tracing::warn!("extract {} failed: {e}", jar.display());
             return Vec::new();
         }
     }
 
     // Symbol cache: a hit skips the (dominant) parse cost entirely.
-    if let Some(fingerprint) = jar_fingerprint(&jar) {
+    if let Some(fingerprint) = &source.fingerprint {
         if let Some(cached) = symcache_load(&fingerprint) {
             return cached;
         }
-        let symbols = parse_dir(&dest, kotlin, java);
-        symcache_store(&fingerprint, &symbols);
+        let symbols = parse_dir(&source.dest, kotlin, java);
+        symcache_store(fingerprint, &symbols);
         return symbols;
     }
 
-    parse_dir(&dest, kotlin, java)
+    parse_dir(&source.dest, kotlin, java)
+}
+
+/// Resolve one coordinate to indexed symbols: locate/download its sources jar, ensure it's
+/// extracted, then load parsed symbols from the symcache (skipping parse) or parse + cache them.
+/// Lock-free; returns nothing if the coordinate has no sources jar and no prior extraction.
+pub fn resolve_coordinate(
+    coord: &Coordinate,
+    repos: &Repos,
+    extract_root: &Path,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Vec<FileSymbols> {
+    coordinate_source(coord, repos, extract_root)
+        .map(|source| resolve_library_source(&source, kotlin, java))
+        .unwrap_or_default()
 }
 
 /// Resolve the local JDK `src.zip` into indexed Java symbols. JDK sources are not Maven
@@ -487,9 +540,25 @@ pub fn resolve_jdk_sources(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    use zip::write::SimpleFileOptions;
 
     fn coord(s: &str) -> Coordinate {
         Coordinate::parse(s).unwrap()
+    }
+
+    fn write_sources_jar(path: &Path, entries: &[(&str, &str)]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (name, body) in entries {
+            zip.start_file(*name, SimpleFileOptions::default()).unwrap();
+            zip.write_all(body.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
     }
 
     #[test]
@@ -618,5 +687,54 @@ worktree = "com.example:worktree:9.9"
         assert!(!labels.iter().any(|l| l.contains("worktree")));
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn coordinate_source_identity_matches_jvm_variant_fallback() {
+        let tmp = std::env::temp_dir().join(format!("ktlsp_source_identity_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let root_coord = coord("io.ktor:ktor-client-apache5:3.5.0");
+        let jvm_coord = coord("io.ktor:ktor-client-apache5-jvm:3.5.0");
+        let gradle_cache = tmp.join("gradle/caches");
+
+        write_sources_jar(
+            &gradle_cache
+                .join("modules-2/files-2.1")
+                .join(&root_coord.group)
+                .join(&root_coord.artifact)
+                .join(&root_coord.version)
+                .join("feedface")
+                .join(root_coord.sources_jar_name()),
+            &[("META-INF/MANIFEST.MF", "Manifest-Version: 1.0\n")],
+        );
+        let jvm_jar = gradle_cache
+            .join("modules-2/files-2.1")
+            .join(&jvm_coord.group)
+            .join(&jvm_coord.artifact)
+            .join(&jvm_coord.version)
+            .join("deadbeef")
+            .join(jvm_coord.sources_jar_name());
+        write_sources_jar(
+            &jvm_jar,
+            &[(
+                "io/ktor/client/engine/apache5/Apache5.kt",
+                "package io.ktor.client.engine.apache5\nobject Apache5\n",
+            )],
+        );
+        let repos = Repos {
+            gradle_cache,
+            m2: tmp.join("m2"),
+            central_base: "http://127.0.0.1:0/unused".to_string(),
+            download_dir: tmp.join("dl"),
+            allow_download: false,
+        };
+        let extract_root = tmp.join("extracted");
+
+        let root_source = coordinate_source(&root_coord, &repos, &extract_root).unwrap();
+        let jvm_source = coordinate_source(&jvm_coord, &repos, &extract_root).unwrap();
+
+        assert_eq!(root_source.identity(), jvm_source.identity());
+
+        let _ = fs::remove_dir_all(&tmp);
     }
 }

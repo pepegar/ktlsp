@@ -279,6 +279,7 @@ struct DepStats {
     symbols: usize,
     failed: usize,
     shadowed: usize,
+    skipped: usize,
     jdk_files: usize,
     jdk_symbols: usize,
 }
@@ -287,6 +288,127 @@ struct DepStats {
 struct IndexedDependencyFile {
     path: String,
     symbols: usize,
+}
+
+struct DependencyResult {
+    coord: Option<crate::coords::Coordinate>,
+    label: String,
+    batches: Vec<crate::deps::FileSymbols>,
+    discovered: Vec<crate::coords::Coordinate>,
+    failed: bool,
+    skipped: bool,
+    jdk: bool,
+}
+
+fn dependency_index_threads() -> usize {
+    std::env::var("KTLSP_INDEX_THREADS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism()
+                .map(|threads| threads.get())
+                .unwrap_or(1)
+                .min(8)
+        })
+}
+
+fn spawn_jdk_index_worker(
+    src_zip: std::path::PathBuf,
+    extract_root: std::path::PathBuf,
+    tx: std::sync::mpsc::Sender<DependencyResult>,
+) {
+    std::thread::spawn(move || {
+        use crate::deps;
+        use crate::java::JavaParser;
+        use crate::parser::KotlinParser;
+
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut kotlin = KotlinParser::new();
+            let mut java = JavaParser::new();
+            deps::resolve_jdk_sources(&src_zip, &extract_root, &mut kotlin, &mut java)
+        }));
+        let result = match resolved {
+            Ok(batches) => DependencyResult {
+                coord: None,
+                label: "JDK sources".to_string(),
+                batches,
+                discovered: Vec::new(),
+                failed: false,
+                skipped: false,
+                jdk: true,
+            },
+            Err(_) => DependencyResult {
+                coord: None,
+                label: "JDK sources".to_string(),
+                batches: Vec::new(),
+                discovered: Vec::new(),
+                failed: true,
+                skipped: false,
+                jdk: true,
+            },
+        };
+        let _ = tx.send(result);
+    });
+}
+
+fn spawn_coordinate_index_worker(
+    coord: crate::coords::Coordinate,
+    repos: crate::artifacts::Repos,
+    extract_root: std::path::PathBuf,
+    indexed_sources: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    tx: std::sync::mpsc::Sender<DependencyResult>,
+) {
+    std::thread::spawn(move || {
+        use crate::artifacts;
+        use crate::deps;
+        use crate::java::JavaParser;
+        use crate::parser::KotlinParser;
+
+        let label = coord.label();
+        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let source = deps::coordinate_source(&coord, &repos, &extract_root);
+            let skipped = source
+                .as_ref()
+                .map(|source| {
+                    let mut guard = indexed_sources.lock().unwrap();
+                    !guard.insert(source.identity())
+                })
+                .unwrap_or(false);
+            let batches = if skipped {
+                Vec::new()
+            } else if let Some(source) = source {
+                let mut kotlin = KotlinParser::new();
+                let mut java = JavaParser::new();
+                deps::resolve_library_source(&source, &mut kotlin, &mut java)
+            } else {
+                Vec::new()
+            };
+            let discovered = artifacts::dependency_coordinates(&repos, &coord);
+            (batches, discovered, skipped)
+        }));
+        let result = match resolved {
+            Ok((batches, discovered, skipped)) => DependencyResult {
+                coord: Some(coord),
+                label,
+                batches,
+                discovered,
+                failed: false,
+                skipped,
+                jdk: false,
+            },
+            Err(_) => DependencyResult {
+                coord: Some(coord),
+                label,
+                batches: Vec::new(),
+                discovered: Vec::new(),
+                failed: true,
+                skipped: false,
+                jdk: false,
+            },
+        };
+        let _ = tx.send(result);
+    });
 }
 
 /// Index version-catalog dependencies and locally discoverable transitive source dependencies into
@@ -303,8 +425,6 @@ fn index_dependencies(
     use crate::coords::Coordinate;
     use crate::deps::{self, CoordinateDecision, CoordinateSelector};
     use crate::index::Tier;
-    use crate::java::JavaParser;
-    use crate::parser::KotlinParser;
 
     let mut queue: VecDeque<_> = deps::coordinates_for_root(root).into();
     let mut seen = BTreeSet::new();
@@ -312,101 +432,122 @@ fn index_dependencies(
     let mut indexed_files: BTreeMap<Coordinate, Vec<IndexedDependencyFile>> = BTreeMap::new();
     let repos = Repos::defaults();
     let extract_root = deps::extract_root();
-    let mut kotlin = KotlinParser::new();
-    let mut java = JavaParser::new();
-
     let jdk_src = deps::jdk_src_zip();
-    let has_jdk_src = jdk_src.is_some();
-    let mut progress_total = queue.len() + usize::from(has_jdk_src);
     let mut stats = DepStats::default();
     const MAX_DEPENDENCY_COORDINATES: usize = 1024;
+    let max_workers = dependency_index_threads();
+    let indexed_sources = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let (tx, rx) = std::sync::mpsc::channel::<DependencyResult>();
+    let mut active = 0usize;
+    let mut completed = 0usize;
+    let mut suppressed = BTreeSet::new();
+
     if let Some(src_zip) = jdk_src {
         if let Some(tx) = progress {
-            let _ = tx.send((1, progress_total, "JDK sources".to_string()));
+            let total = 1 + queue.len();
+            let _ = tx.send((1, total, "JDK sources".to_string()));
         }
-        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            deps::resolve_jdk_sources(&src_zip, &extract_root, &mut kotlin, &mut java)
-        }));
-        match resolved {
-            Ok(batches) => {
-                for batch in batches {
-                    let mut guard = ws.lock().unwrap();
-                    stats.symbols += batch.symbols.len();
-                    stats.files += 1;
-                    stats.jdk_symbols += batch.symbols.len();
-                    stats.jdk_files += 1;
-                    guard.index.replace_file(&batch.file, batch.symbols, Tier::Durable);
-                }
-            }
-            Err(_) => {
-                tracing::warn!("indexing JDK sources panicked; skipping");
-                stats.failed += 1;
-            }
-        }
+        spawn_jdk_index_worker(src_zip, extract_root.clone(), tx.clone());
+        active += 1;
     }
-    let progress_offset = usize::from(has_jdk_src);
-    while let Some(coord) = queue.pop_front() {
-        if !seen.insert(coord.clone()) {
-            continue;
-        }
-        match selected.consider(coord.clone()) {
-            CoordinateDecision::Selected => {}
-            CoordinateDecision::Replaces(previous) => {
-                stats.shadowed += 1;
-                if let Some(files) = indexed_files.remove(&previous) {
-                    let mut guard = ws.lock().unwrap();
-                    for file in files {
-                        guard.index.remove_file(&file.path);
-                        stats.files = stats.files.saturating_sub(1);
-                        stats.symbols = stats.symbols.saturating_sub(file.symbols);
+
+    while active > 0 || !queue.is_empty() {
+        while active < max_workers {
+            let Some(coord) = queue.pop_front() else {
+                break;
+            };
+            if !seen.insert(coord.clone()) {
+                continue;
+            }
+            match selected.consider(coord.clone()) {
+                CoordinateDecision::Selected => {}
+                CoordinateDecision::Replaces(previous) => {
+                    stats.shadowed += 1;
+                    suppressed.insert(previous.clone());
+                    if let Some(files) = indexed_files.remove(&previous) {
+                        let mut guard = ws.lock().unwrap();
+                        for file in files {
+                            guard.index.remove_file(&file.path);
+                            stats.files = stats.files.saturating_sub(1);
+                            stats.symbols = stats.symbols.saturating_sub(file.symbols);
+                        }
                     }
                 }
+                CoordinateDecision::ShadowedBy(_) => {
+                    stats.shadowed += 1;
+                    continue;
+                }
             }
-            CoordinateDecision::ShadowedBy(_) => {
-                stats.shadowed += 1;
-                continue;
+            stats.coordinates = seen.len();
+            let progress_total = (seen.len() + queue.len()).max(completed + active + 1);
+            if let Some(tx) = progress {
+                let _ = tx.send((
+                    completed + active + 1,
+                    progress_total,
+                    coord.label(),
+                ));
             }
+            spawn_coordinate_index_worker(
+                coord,
+                repos.clone(),
+                extract_root.clone(),
+                indexed_sources.clone(),
+                tx.clone(),
+            );
+            active += 1;
         }
-        stats.coordinates = seen.len();
-        progress_total = progress_offset + seen.len() + queue.len();
-        // Report before resolving so the UI names the coordinate currently being worked on.
-        if let Some(tx) = progress {
-            let _ = tx.send((seen.len() + progress_offset, progress_total, coord.label()));
+
+        if active == 0 {
+            continue;
         }
-        // Isolate each coordinate: a panic while parsing one library's sources must not abort
-        // indexing of the rest.
-        let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            deps::resolve_coordinate(&coord, &repos, &extract_root, &mut kotlin, &mut java)
-        }));
-        let batches = match resolved {
-            Ok(batches) => batches,
-            Err(_) => {
-                tracing::warn!("indexing panicked for {}; skipping", coord.label());
-                stats.failed += 1;
-                continue;
-            }
+
+        let Ok(result) = rx.recv() else {
+            break;
         };
-        // Insert each file under its own brief lock so goto_definition can interleave (a single
-        // coordinate like kotlin-stdlib can contribute hundreds of files).
+        active = active.saturating_sub(1);
+        completed += 1;
+
+        if result.failed {
+            if result.jdk {
+                tracing::warn!("indexing JDK sources panicked; skipping");
+            } else {
+                tracing::warn!("indexing panicked for {}; skipping", result.label);
+            }
+            stats.failed += 1;
+            continue;
+        }
+        if result.skipped {
+            stats.skipped += 1;
+        }
+        if result
+            .coord
+            .as_ref()
+            .is_some_and(|coord| suppressed.contains(coord))
+        {
+            continue;
+        }
         let mut files_for_coord = Vec::new();
-        for batch in batches {
+        for batch in result.batches {
             let mut guard = ws.lock().unwrap();
             let symbol_count = batch.symbols.len();
             stats.symbols += symbol_count;
-            files_for_coord.push(IndexedDependencyFile {
-                path: batch.file.clone(),
-                symbols: symbol_count,
-            });
+            if result.jdk {
+                stats.jdk_symbols += symbol_count;
+                stats.jdk_files += 1;
+            } else {
+                files_for_coord.push(IndexedDependencyFile {
+                    path: batch.file.clone(),
+                    symbols: symbol_count,
+                });
+            }
             guard.index.replace_file(&batch.file, batch.symbols, Tier::Durable);
             stats.files += 1;
         }
-        indexed_files.insert(coord.clone(), files_for_coord);
-        let discovered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::artifacts::dependency_coordinates(&repos, &coord)
-        }))
-        .unwrap_or_default();
-        for dep in discovered {
-            if seen.len() + queue.len() >= MAX_DEPENDENCY_COORDINATES {
+        if let Some(coord) = result.coord.clone() {
+            indexed_files.insert(coord, files_for_coord);
+        }
+        for dep in result.discovered {
+            if seen.len() + queue.len() + active >= MAX_DEPENDENCY_COORDINATES {
                 break;
             }
             if !seen.contains(&dep) && !queue.iter().any(|queued| queued == &dep) {
@@ -476,8 +617,14 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         String::new()
     };
     let summary = format!(
-        "ktlsp indexed {} library files ({} symbols) from {} dependencies{} ({} failed, {} shadowed)",
-        stats.files, stats.symbols, stats.coordinates, jdk_summary, stats.failed, stats.shadowed
+        "ktlsp indexed {} library files ({} symbols) from {} dependencies{} ({} failed, {} shadowed, {} duplicate skipped)",
+        stats.files,
+        stats.symbols,
+        stats.coordinates,
+        jdk_summary,
+        stats.failed,
+        stats.shadowed,
+        stats.skipped
     );
     client.log_message(MessageType::INFO, summary.clone()).await;
     if let Some(p) = ongoing {
