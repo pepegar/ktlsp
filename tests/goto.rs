@@ -378,6 +378,96 @@ fn ambiguous_same_package_returns_all() {
     );
 }
 
+#[test]
+fn kmp_main_and_jvm_main_prefers_jvm_main() {
+    check(
+        "//- src/main/kotlin/app/Thing.kt\npackage app\nclass Thing\nfun makeThing(): Thing = Thing()\nfun duplicate() {}\n\
+         //- src/jvmMain/kotlin/app/Thing.kt\npackage app\nclass /*def*/Thing\nfun makeThing(): Thing = Thing()\nfun duplicate() {}\n\
+         //- Main.kt\npackage app\nfun main() { val x: /*^*/Thing = makeThing() }\n",
+    );
+}
+
+#[test]
+fn kmp_common_main_and_jvm_main_prefers_jvm_main() {
+    check(
+        "//- src/commonMain/kotlin/app/Thing.kt\npackage app\nclass Thing\n\
+         //- src/jvmMain/kotlin/app/Thing.kt\npackage app\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nfun main() { val x: /*^*/Thing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_only_common_main_still_resolves_common_main() {
+    check(
+        "//- src/commonMain/kotlin/app/Thing.kt\npackage app\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nfun main() { val x: /*^*/Thing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_multiple_specific_source_sets_return_specific_choices() {
+    check(
+        "//- src/commonMain/kotlin/app/Thing.kt\npackage app\nclass Thing\n\
+         //- src/iosMain/kotlin/app/Thing.kt\npackage app\nclass /*def*/Thing\n\
+         //- src/jvmMain/kotlin/app/Thing.kt\npackage app\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nfun main() { val x: /*^*/Thing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_unknown_candidate_keeps_original_ambiguity() {
+    check(
+        "//- vendor/app/Thing.kt\npackage app\nclass /*def*/Thing\n\
+         //- src/jvmMain/kotlin/app/Thing.kt\npackage app\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nfun main() { val x: /*^*/Thing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_explicit_import_prefers_specific_source_set() {
+    check(
+        "//- src/commonMain/kotlin/lib/Thing.kt\npackage lib\nclass Thing\n\
+         //- src/jvmMain/kotlin/lib/Thing.kt\npackage lib\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nimport lib.Thing\nfun main() { val x: /*^*/Thing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_import_alias_prefers_specific_source_set() {
+    check(
+        "//- src/commonMain/kotlin/lib/Thing.kt\npackage lib\nclass Thing\n\
+         //- src/jvmMain/kotlin/lib/Thing.kt\npackage lib\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nimport lib.Thing as PlatformThing\nfun main() { val x: /*^*/PlatformThing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_fully_qualified_name_prefers_specific_source_set() {
+    check(
+        "//- src/commonMain/kotlin/lib/Thing.kt\npackage lib\nclass Thing\n\
+         //- src/jvmMain/kotlin/lib/Thing.kt\npackage lib\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nfun main() { val x: lib./*^*/Thing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_nested_type_prefers_specific_source_set() {
+    check(
+        "//- src/commonMain/kotlin/lib/Outer.kt\npackage lib\nclass Outer {\n    class Thing\n}\n\
+         //- src/jvmMain/kotlin/lib/Outer.kt\npackage lib\nclass Outer {\n    class /*def*/Thing\n}\n\
+         //- Main.kt\npackage app\nimport lib.Outer\nfun main() { val x: Outer./*^*/Thing? = null }\n",
+    );
+}
+
+#[test]
+fn kmp_extracted_source_set_roots_prefer_specific_source_set() {
+    check(
+        "//- commonMain/lib/Thing.kt\npackage lib\nclass Thing\n\
+         //- jvmMain/lib/Thing.kt\npackage lib\nclass /*def*/Thing\n\
+         //- Main.kt\npackage app\nimport lib.Thing\nfun main() { val x: /*^*/Thing? = null }\n",
+    );
+}
+
 // --------------------------------------------------------------------------------------------
 // Member access (S6: type-directed where the receiver type is inferable, else unique-only)
 // --------------------------------------------------------------------------------------------

@@ -219,9 +219,11 @@ These are deliberate and documented, not bugs:
 - **JVM-targeted default imports.** Unqualified stdlib resolution assumes a JVM target
   (`kotlin.*`, `java.lang.*`, …); symbols from JS/Native-only default-import packages aren't
   auto-resolved.
-- **Multiplatform sources may yield multiple results.** A multiplatform library's `-sources.jar`
-  bundles several source sets (`commonMain`, `jvmMain`, …), so a symbol like `listOf` can resolve
-  to more than one location — your editor shows a pick list rather than a single jump.
+- **Multiplatform sources are narrowed conservatively.** When a symbol appears in a generic source
+  set (`main` / `commonMain`) and one or more specific source sets (`jvmMain`, `iosMain`,
+  …), ktlsp drops the generic duplicate and jumps to the specific candidate set. If several
+  specific source sets remain, your editor still shows a pick list rather than ktlsp guessing one
+  platform.
 - **Partial type-directed member resolution.** For `receiver.member`, ktlsp infers the receiver's
   type when it's a local `val`/parameter with an explicit annotation, a constructor call
   (`Foo().bar`), or `this`, and resolves the member against that type (picking the right overload
@@ -321,7 +323,7 @@ Useful scenarios:
   member goto, rename, signature help, implementation/type-definition, call/type hierarchy,
   workspace commands, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
-  `kotlin-stdlib` and JDK sources.
+  `kotlin-stdlib`'s `jvmMain` source set and JDK sources.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.
 - `gradle-live`, `gradle-compile`, and `comprehensive` exercise `dev/gradle-sample`; compile
   diagnostics remain opt-in because they run Gradle/the sidecar.

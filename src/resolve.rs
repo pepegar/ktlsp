@@ -806,6 +806,82 @@ fn to_def(e: &Entry) -> Def {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceSetSpecificity {
+    Generic,
+    Specific,
+}
+
+fn entries_to_defs(entries: Vec<&Entry>) -> Vec<Def> {
+    narrow_source_set_entries(entries).into_iter().map(to_def).collect()
+}
+
+fn narrow_source_set_entries(entries: Vec<&Entry>) -> Vec<&Entry> {
+    if entries.len() <= 1 {
+        return entries;
+    }
+
+    let mut classified = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let Some(kind) = source_set_specificity(&entry.path) else {
+            return entries;
+        };
+        classified.push((*entry, kind));
+    }
+
+    if classified
+        .iter()
+        .any(|(_, kind)| *kind == SourceSetSpecificity::Specific)
+    {
+        classified
+            .into_iter()
+            .filter(|(_, kind)| *kind == SourceSetSpecificity::Specific)
+            .map(|(entry, _)| entry)
+            .collect()
+    } else {
+        entries
+    }
+}
+
+fn source_set_specificity(path: &str) -> Option<SourceSetSpecificity> {
+    let segments: Vec<&str> = path
+        .split(|c| c == '/' || c == '\\')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    for pair in segments.windows(2) {
+        if pair[0] == "src" {
+            if let Some(kind) = classify_source_set(pair[1]) {
+                return Some(kind);
+            }
+        }
+    }
+
+    // Some sources jars preserve source-set roots directly (`commonMain/...`, `jvmMain/...`)
+    // instead of the Gradle project layout (`src/commonMain/kotlin/...`).
+    segments
+        .iter()
+        .find_map(|segment| match *segment {
+            "commonMain" => Some(SourceSetSpecificity::Generic),
+            source_set if is_specific_main_source_set(source_set) => {
+                Some(SourceSetSpecificity::Specific)
+            }
+            _ => None,
+        })
+}
+
+fn classify_source_set(source_set: &str) -> Option<SourceSetSpecificity> {
+    match source_set {
+        "main" | "commonMain" => Some(SourceSetSpecificity::Generic),
+        s if is_specific_main_source_set(s) => Some(SourceSetSpecificity::Specific),
+        _ => None,
+    }
+}
+
+fn is_specific_main_source_set(source_set: &str) -> bool {
+    source_set.ends_with("Main") && source_set != "Main" && source_set != "commonMain"
+}
+
 fn resolve_import_target(index: &Index, usage: Node, src: &str) -> Option<Vec<Def>> {
     let import = ancestor_of_kind(usage, "import")?;
     let qid = child_of_kind(import, "qualified_identifier")?;
@@ -862,7 +938,7 @@ fn resolve_nested_type(index: &Index, tree: &Tree, src: &str, usage: Node) -> Op
         let outer = &names[0];
         let inner = &names[1];
         let visible_outers = visible_outer_types(index, tree, src, outer);
-        let hits: Vec<Def> = index
+        let hits: Vec<&Entry> = index
             .lookup_by_name(inner)
             .iter()
             .filter(|e| e.sym.kind.is_type_like())
@@ -874,9 +950,8 @@ fn resolve_nested_type(index: &Index, tree: &Tree, src: &str, usage: Node) -> Op
                             && &e.sym.package == pkg
                     })
             })
-            .map(to_def)
             .collect();
-        return Some(hits);
+        return Some(entries_to_defs(hits));
     }
 
     None
@@ -963,13 +1038,13 @@ fn resolve_absolute_path(
         return Vec::new();
     };
     let prefix = &parts[..parts.len() - 1];
-    index
+    let hits: Vec<&Entry> = index
         .lookup_by_name(name)
         .iter()
         .filter(|e| kind_ok(e.sym.kind))
         .filter(|e| absolute_path_matches(e, prefix))
-        .map(to_def)
-        .collect()
+        .collect();
+    entries_to_defs(hits)
 }
 
 fn import_path_matches_entry(import: &Import, entry: &Entry) -> bool {
@@ -1059,12 +1134,12 @@ fn resolve_cross_file(index: &Index, tree: &Tree, src: &str, name: &str, uk: Use
     for imp in &imports {
         if imp.alias.as_deref() == Some(name) {
             let real = imp.simple_name();
-            return index
+            let hits: Vec<&Entry> = index
                 .lookup_by_name(real)
                 .iter()
                 .filter(|e| kind_ok(uk, e.sym.kind) && import_path_matches_entry(imp, e))
-                .map(to_def)
                 .collect();
+            return entries_to_defs(hits);
         }
     }
 
@@ -1133,6 +1208,6 @@ pub(crate) fn is_default_import_pkg(pkg: &str) -> bool {
 }
 
 fn pick(candidates: &[Entry], keep: impl Fn(&Entry) -> bool) -> Option<Vec<Def>> {
-    let hits: Vec<Def> = candidates.iter().filter(|e| keep(e)).map(to_def).collect();
-    (!hits.is_empty()).then_some(hits)
+    let hits: Vec<&Entry> = candidates.iter().filter(|e| keep(e)).collect();
+    (!hits.is_empty()).then_some(hits).map(entries_to_defs)
 }

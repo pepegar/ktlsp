@@ -2,8 +2,9 @@
 -- Headless Neovim test for *library* goto-definition.
 --
 -- Drives the real ktlsp server against a project (arg[1]) whose `gradle/libs.versions.toml`
--- declares kotlin-stdlib, and asserts that goto on `listOf(...)` and `java.sql.Connection` jumps
--- into indexed stdlib/JDK source. Run via dev/smoke_library.sh (which sets up the temp project).
+-- declares kotlin-stdlib, and asserts that goto on `listOf(...)` jumps into the JVM-specific
+-- stdlib source set while `java.sql.Connection` jumps into indexed JDK source. Run via
+-- dev/smoke_library.sh (which sets up the temp project).
 --
 --     nvim -l dev/nvim_library.lua <project-dir>
 
@@ -84,7 +85,7 @@ end
 
 local ok = true
 ok = check_definition("goto listOf", "listOf", 1, function(loc)
-  return loc.uri:match("kotlin%-stdlib") and loc.uri:match("%.kt$")
+  return loc.uri:match("kotlin%-stdlib") and loc.uri:match("jvmMain") and loc.uri:match("%.kt$")
 end) and ok
 ok = check_definition("goto java.sql.Connection", "Connection", 3, function(loc)
   return loc.uri:match("Connection%.java$")
