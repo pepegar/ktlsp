@@ -262,10 +262,7 @@ pub fn call_shape_query(
     let callee = call.named_child(0)?;
     let ident = match callee.kind() {
         "identifier" => callee,
-        "navigation_expression" => {
-            let selector = callee.named_child(1)?;
-            (selector.kind() == "identifier").then_some(selector)?
-        }
+        "navigation_expression" => return None,
         _ => return None,
     };
     let symbol = node_text(ident, src).to_string();
@@ -726,6 +723,33 @@ mod tests {
         let call = tree
             .root_node()
             .named_descendant_for_byte_range(src.find("collect()").unwrap(), src.find("collect()").unwrap())
+            .and_then(|node| {
+                let mut cur = Some(node);
+                while let Some(n) = cur {
+                    if n.kind() == "call_expression" {
+                        return Some(n);
+                    }
+                    cur = n.parent();
+                }
+                None
+            })
+            .expect("call expression");
+
+        assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
+    }
+
+    #[test]
+    fn call_shape_query_declines_member_calls_backed_only_by_free_function_fallback() {
+        let src = "class Items\nclass Bag(val items: Items)\nfun map(a: Int, b: Int, c: Int) {}\nfun main(b: Bag) { b.items.map() }\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = tree
+            .root_node()
+            .named_descendant_for_byte_range(src.find("map()").unwrap(), src.find("map()").unwrap())
             .and_then(|node| {
                 let mut cur = Some(node);
                 while let Some(n) = cur {
