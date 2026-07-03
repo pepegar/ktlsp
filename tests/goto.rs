@@ -192,6 +192,30 @@ fn lambda_local() {
 }
 
 #[test]
+fn constructor_property_wins_over_homonymous_member_function_in_value_position() {
+    check(
+        "class Service { fun bootstrapDoc() {} }\n\
+         class Api(private val /*def*/bootstrapPrivateDocument: Service) {\n\
+             private fun bootstrapPrivateDocument() {\n\
+                 /*^*/bootstrapPrivateDocument.bootstrapDoc()\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn member_resolution_uses_constructor_property_not_homonymous_member_function() {
+    check(
+        "class Service { fun /*def*/bootstrapDoc() {} }\n\
+         class Api(private val bootstrapPrivateDocument: Service) {\n\
+             private fun bootstrapPrivateDocument() {\n\
+                 bootstrapPrivateDocument./*^*/bootstrapDoc()\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
 fn when_subject_val() {
     check("fun main() {\n    when (val /*def*/s = 1) {\n        else -> println(/*^*/s)\n    }\n}\n");
 }

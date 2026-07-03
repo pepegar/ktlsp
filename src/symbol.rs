@@ -37,10 +37,7 @@ impl SymbolKind {
     /// True if a name in plain *value position* (`println(x)`) could resolve to this kind.
     pub fn is_value_like(self) -> bool {
         use SymbolKind::*;
-        matches!(
-            self,
-            Property | Function | Object | EnumEntry | Parameter | LocalVariable
-        )
+        matches!(self, Property | Object | EnumEntry | Parameter | LocalVariable)
     }
 }
 
