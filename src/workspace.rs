@@ -74,6 +74,10 @@ impl Workspace {
         self.completeness.jdk_index_complete = complete;
     }
 
+    pub fn open_doc_keys(&self) -> Vec<String> {
+        self.open_docs.keys().cloned().collect()
+    }
+
     /// Test helper for fixtures that intentionally model a closed source world.
     pub fn assume_index_complete_for_tests(&mut self) {
         self.completeness = resolve::CompletenessFacts::complete();

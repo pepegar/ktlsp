@@ -571,7 +571,13 @@ fn index_dependencies(
 /// Warm the index off the request path, reporting progress to the client when it supports work-done
 /// progress (rust-analyzer-style status: "scanning project", then "indexing <coordinate> (n/total)").
 /// Falls back to log messages otherwise. Summaries are always logged.
-async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBuf, progress: bool) {
+async fn index_workspace(
+    client: Client,
+    ws: Arc<Mutex<Workspace>>,
+    compile_diags: Arc<Mutex<HashMap<String, Vec<CompileDiagnostic>>>>,
+    root: PathBuf,
+    progress: bool,
+) {
     // 1. Project sources (fast).
     let scan_ws = ws.clone();
     let scan_root = root.clone();
@@ -641,6 +647,12 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         let mut guard = ws.lock().unwrap();
         guard.set_library_index_complete(stats.failed == 0 && stats.missing_sources == 0);
         guard.set_jdk_index_complete(stats.jdk_files > 0);
+    }
+    // Open buffers may have received conservative diagnostics before dependency/JDK indexing
+    // completed. Republish them now that the library completeness facts and durable symbols are in.
+    let open_keys = { ws.lock().unwrap().open_doc_keys() };
+    for key in open_keys {
+        publish_merged(&ws, &compile_diags, &client, &key).await;
     }
     client.log_message(MessageType::INFO, summary.clone()).await;
     if let Some(p) = ongoing {
@@ -844,8 +856,9 @@ impl LanguageServer for Backend {
             let ws = self.ws.clone();
             let client = self.client.clone();
             let progress = *self.progress_supported.lock().unwrap();
+            let compile_diags = self.compile_diags.clone();
             tokio::spawn(async move {
-                index_workspace(client, ws, root, progress).await;
+                index_workspace(client, ws, compile_diags, root, progress).await;
             });
         }
     }
