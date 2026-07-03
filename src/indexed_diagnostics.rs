@@ -12,6 +12,7 @@ use crate::semantic_query;
 
 pub fn compute(
     index: &Index,
+    file: &str,
     src: &str,
     tree: &Tree,
     facts: CompletenessFacts,
@@ -21,6 +22,7 @@ pub fn compute(
     }
     let mut out = Vec::new();
     collect_missing_references(index, tree, src, tree.root_node(), facts, &mut out);
+    collect_call_shape_mismatches(index, file, tree, src, tree.root_node(), &mut out);
     out
 }
 
@@ -51,5 +53,37 @@ fn collect_missing_references(
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
         collect_missing_references(index, tree, src, child, facts, out);
+    }
+}
+
+fn collect_call_shape_mismatches(
+    index: &Index,
+    file: &str,
+    tree: &Tree,
+    src: &str,
+    node: Node,
+    out: &mut Vec<Diagnostic>,
+) {
+    if node.kind() == "call_expression" {
+        if let Some(query) = semantic_query::call_shape_query(index, file, tree, src, node) {
+            out.push(Diagnostic {
+                start_byte: node.start_byte(),
+                end_byte: node.end_byte(),
+                severity: Severity::Error,
+                code: Some(DiagnosticCode::CallShapeMismatch),
+                message: format!(
+                    "No overload of {} accepts {} argument{}",
+                    query.symbol,
+                    query.arg_count,
+                    if query.arg_count == 1 { "" } else { "s" }
+                ),
+            });
+            return;
+        }
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_call_shape_mismatches(index, file, tree, src, child, out);
     }
 }

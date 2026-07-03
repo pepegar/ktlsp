@@ -29,6 +29,7 @@ pub enum DiagnosticCode {
     SyntaxError,
     UnusedImport,
     UnresolvedReference,
+    CallShapeMismatch,
 }
 
 impl DiagnosticCode {
@@ -37,6 +38,7 @@ impl DiagnosticCode {
             DiagnosticCode::SyntaxError => "syntax_error",
             DiagnosticCode::UnusedImport => "unused_import",
             DiagnosticCode::UnresolvedReference => "unresolved_reference",
+            DiagnosticCode::CallShapeMismatch => "call_shape_mismatch",
         }
     }
 }

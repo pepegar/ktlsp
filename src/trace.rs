@@ -111,6 +111,38 @@ pub fn request(
     });
 }
 
+pub fn semantic(
+    name: &str,
+    file: &str,
+    line: u32,
+    col: u32,
+    symbol: Option<&str>,
+    kind: &str,
+    status: &str,
+    reasons: &[String],
+) {
+    let short_file = Path::new(file).file_name().map(|s| s.to_string_lossy().into_owned());
+    record(&TraceEvent {
+        name: name.to_string(),
+        category: "semantic".to_string(),
+        ph: "i".to_string(),
+        ts: now_us(),
+        dur: 0,
+        pid: 1,
+        tid: 1,
+        args: serde_json::json!({
+            "file": short_file,
+            "path": file,
+            "line": line,
+            "col": col,
+            "symbol": symbol,
+            "kind": kind,
+            "status": status,
+            "reasons": reasons,
+        }),
+    });
+}
+
 /// The identifier token covering byte `offset` in `text` (cursor position), for "which member did
 /// goto fail on". Walks the maximal run of identifier characters around the offset.
 pub fn ident_at(text: &str, offset: usize) -> Option<String> {

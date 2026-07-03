@@ -3,7 +3,7 @@
 //! diagnostic must only fire when provably correct, so the negative tests (no false positives) matter
 //! most.
 
-use ktlsp::diagnostics::Diagnostic;
+use ktlsp::diagnostics::{Diagnostic, DiagnosticCode};
 use ktlsp::workspace::Workspace;
 
 fn diagnostics(src: &str) -> Vec<Diagnostic> {
@@ -266,4 +266,25 @@ fun probe(user: User) {
         "Main.kt",
     );
     assert!(d.is_empty(), "synthetic copy should suppress unresolved-member diagnostics: {d:?}");
+}
+
+#[test]
+fn wrong_arity_call_is_flagged_when_target_is_known() {
+    let d = complete_diagnostics("class Int\nfun ping(a: Int) {}\nfun main() { ping() }\n");
+    assert_eq!(d.len(), 1, "expected one call-shape diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::CallShapeMismatch));
+    assert_eq!(d[0].message, "No overload of ping accepts 0 arguments");
+}
+
+#[test]
+fn matching_overload_arity_is_not_flagged() {
+    let d = complete_diagnostics("class Int\nfun ping() {}\nfun ping(a: Int) {}\nfun main() { ping() }\n");
+    assert!(d.is_empty(), "matching overload should suppress call-shape diagnostics: {d:?}");
+}
+
+#[test]
+fn unresolved_call_is_not_repeated_as_call_shape_mismatch() {
+    let d = complete_diagnostics("fun main() { missingCall() }\n");
+    assert_eq!(d.len(), 1, "expected unresolved-reference only, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::UnresolvedReference));
 }

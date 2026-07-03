@@ -13,9 +13,8 @@ use walkdir::{DirEntry, WalkDir};
 use crate::actions::{self, Action};
 use crate::complete::{self, ScopeCompletion, ShapedCompletions};
 use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
-use crate::index::{Entry, Index, RefEntry, Tier, Usage};
+use crate::index::{Index, RefEntry, Tier, Usage};
 use crate::indexer::{extract_symbols, extract_usages};
-use crate::infer;
 use crate::imports::{self, ImportLayout};
 use crate::java::JavaParser;
 use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_of, Import, KotlinParser};
@@ -182,6 +181,27 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<crate::commands::ResolutionExplanation> {
+        let query = self.resolved_symbol_query(key, offset)?;
+        let reference = query.reference();
+        let targets = query
+            .targets
+            .iter()
+            .map(|d| format!("{}:{}..{}", d.file, d.start_byte, d.end_byte))
+            .collect::<Vec<_>>();
+        Some(crate::commands::ResolutionExplanation {
+            status: reference.status_label(),
+            kind: reference.kind_label(),
+            symbol: reference.symbol().map(str::to_string),
+            targets,
+            reasons: reference.reason_labels(),
+        })
+    }
+
+    pub fn resolved_symbol_query(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<semantic_query::ResolvedSymbolQuery> {
         let text = self.doc_text(key)?;
         let parsed;
         let (doc_text, tree): (&str, &Tree) = match self.open_docs.get(key) {
@@ -191,42 +211,23 @@ impl Workspace {
                 (&parsed.1, &parsed.0)
             }
         };
-        let ident = identifier_at(tree, offset)?;
-        let symbol = Some(node_text(ident, doc_text).to_string()).filter(|s| !s.is_empty());
-        let targets = resolve::goto(&self.index, key, doc_text, tree, offset)
-            .into_iter()
-            .map(|d| format!("{}:{}..{}", d.file, d.start_byte, d.end_byte))
-            .collect::<Vec<_>>();
-        let kind = match resolve::use_kind(ident) {
-            resolve::UseKind::Type => "type",
-            resolve::UseKind::Call => "call",
-            resolve::UseKind::MemberSelector => "member",
-            resolve::UseKind::Value => "value",
-        };
-        if !targets.is_empty() {
-            return Some(crate::commands::ResolutionExplanation {
-                status: "ok",
-                kind,
-                symbol,
-                targets,
-                reasons: Vec::new(),
-            });
-        }
-
-        let query = semantic_query::reference_query(
+        semantic_query::resolved_symbol_query(
             &self.index,
+            key,
             tree,
             doc_text,
-            ident,
+            offset,
             self.effective_completeness(),
-        )?;
-        Some(crate::commands::ResolutionExplanation {
-            status: query.status_label(),
-            kind: query.kind_label(),
-            symbol,
-            targets,
-            reasons: query.reason_labels(),
-        })
+        )
+    }
+
+    pub fn after_dot_query(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<semantic_query::MemberCompletionQuery> {
+        let text = self.doc_text(key)?;
+        semantic_query::after_dot_query(&self.index, &mut self.parser, &text, offset, MAX_COMPLETIONS)
     }
 
     /// `textDocument/completion`. Returns visible completion candidates at the cursor, or `None`
@@ -298,14 +299,7 @@ impl Workspace {
     /// The indexed symbol resolved at `offset`, for hover and future symbol-aware features. Local
     /// declarations are intentionally omitted for now because they are not in the cross-file index.
     pub fn symbol_at(&mut self, key: &str, offset: usize) -> Option<SymbolSummary> {
-        let target = self.goto_definition(key, offset).into_iter().next()?;
-        self.index
-            .entries_for_file(&target.file)
-            .iter()
-            .find(|entry| {
-                entry.sym.start_byte == target.start_byte && entry.sym.end_byte == target.end_byte
-            })
-            .map(SymbolSummary::from_entry)
+        self.resolved_symbol_query(key, offset)?.symbol_summary()
     }
 
     /// Project/library symbols matching `query`, capped and ordered for workspace/symbol.
@@ -563,94 +557,11 @@ impl Workspace {
         key: &str,
         offset: usize,
     ) -> Option<(String, Vec<ScopeCompletion>, ImportLayout)> {
-        let text = self.doc_text(key)?;
-        let (prefix, synthetic, syn_offset) = complete::dot_recovery(&text, offset)?;
-        // Reparse the synthetic buffer so a bare `expr.` becomes a clean navigation_expression with
-        // the surrounding scope intact (the cached tree of the real buffer is the collapsed one).
-        let tree = self.parser.parse(&synthetic);
-        let receiver = complete::navigation_receiver_at(&tree, syn_offset)?;
-        // Infer the receiver's type (package-qualified) via the unified inference layer — the same
-        // entry point goto uses, so completion and goto can never disagree. Silent omission when the
-        // type can't be determined.
-        let ctx = infer::FileCtx::from_tree(&tree, &synthetic);
-        let ty = infer::infer(&self.index, receiver, &synthetic, &ctx);
-        let ty_name = ty.name()?.to_string();
-        let ty_pkg = ty.package().map(str::to_string);
-
-        let vis = Visibility::new(&ctx.package, &ctx.imports);
-        let layout = imports::import_layout(&tree, &synthetic);
-
-        let candidates = self.member_candidates(&ty_name, ty_pkg, &prefix, &vis);
-        // Silent omission: an inferable type with zero matching members is treated as no result.
-        if candidates.is_empty() {
+        let query = self.after_dot_query(key, offset)?;
+        if query.candidates.is_empty() {
             return None;
         }
-        Some((prefix, candidates, layout))
-    }
-
-    /// Assemble the member set of type `ty` for `receiver.` completion as fully-stamped candidates:
-    /// own members (`container == ty`) UNION members inherited through the supertype chain UNION
-    /// applicable extensions (receiver == ty or a supertype). Deduped by `(label, kind)`. Each
-    /// candidate carries `tier`/`arity`/`package`/`container` from its `Entry`. Instance/inherited
-    /// members never carry `import_path` (reached through an in-scope receiver); an extension that is
-    /// not yet visible (per `vis`) carries its OWN FQN as `import_path` so it can be auto-imported.
-    fn member_candidates(
-        &self,
-        ty: &str,
-        ty_pkg: Option<String>,
-        prefix: &str,
-        vis: &Visibility,
-    ) -> Vec<ScopeCompletion> {
-        let mut out: Vec<ScopeCompletion> = Vec::new();
-        let mut seen: std::collections::HashSet<(String, SymbolKind)> = std::collections::HashSet::new();
-        // The frontier tracks (type name, resolved package) so a same-named type in another package
-        // can't contribute its members. `None` package means "don't filter" (ambiguous/unknown).
-        let mut visited: std::collections::HashSet<(String, Option<String>)> = std::collections::HashSet::new();
-        let mut frontier: Vec<(String, Option<String>, usize)> = vec![(ty.to_string(), ty_pkg, 0)];
-        while let Some((cur, cur_pkg, depth)) = frontier.pop() {
-            if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > SUPERTYPE_DEPTH_CAP {
-                continue;
-            }
-            for e in self.index.members_of(&cur) {
-                // Skip members of a same-named type in a different package.
-                if let Some(p) = &cur_pkg {
-                    if &e.sym.package != p {
-                        continue;
-                    }
-                }
-                push_member_candidate(&mut out, &mut seen, e, prefix, None);
-            }
-            for e in self.index.extensions_for(&cur) {
-                // An unimported extension is offered WITH its own FQN as an auto-import; a visible
-                // one (same package / explicitly imported / wildcard / default-import) gets none.
-                // (Extensions are matched by receiver simple-name + visibility — best-effort.)
-                let import_path = if vis.is_visible(&e.sym.package, &e.sym.name) {
-                    None
-                } else {
-                    Some(fqn(&e.sym.package, &e.sym.name))
-                };
-                push_member_candidate(&mut out, &mut seen, e, prefix, import_path);
-            }
-            for sup in self.index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
-                // Resolve the supertype's package: prefer a same-package supertype (the common case);
-                // otherwise leave it unfiltered (None) rather than guess.
-                let sup_pkg = match &cur_pkg {
-                    Some(p)
-                        if self
-                            .index
-                            .lookup_by_name(&sup)
-                            .iter()
-                            .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
-                    {
-                        Some(p.clone())
-                    }
-                    _ => None,
-                };
-                frontier.push((sup, sup_pkg, depth + 1));
-            }
-        }
-        out.truncate(MAX_COMPLETIONS);
-        out
+        Some((query.prefix, query.candidates, query.layout))
     }
 
     /// Stage A assembly: scope/name completion. Returns the prefix, the owned stamped candidates,
@@ -762,17 +673,22 @@ impl Workspace {
     /// LSP layer converts to positions and severities.
     pub fn diagnostics(&mut self, key: &str) -> Vec<crate::diagnostics::Diagnostic> {
         if let Some(doc) = self.open_docs.get(key) {
-            return self.diagnostics_for_tree(&doc.text, &doc.tree);
+            return self.diagnostics_for_tree(key, &doc.text, &doc.tree);
         }
         let text = match self.doc_text(key) {
             Some(t) => t,
             None => return Vec::new(),
         };
         let tree = self.parser.parse(&text);
-        self.diagnostics_for_tree(&text, &tree)
+        self.diagnostics_for_tree(key, &text, &tree)
     }
 
-    fn diagnostics_for_tree(&self, text: &str, tree: &Tree) -> Vec<crate::diagnostics::Diagnostic> {
+    fn diagnostics_for_tree(
+        &self,
+        key: &str,
+        text: &str,
+        tree: &Tree,
+    ) -> Vec<crate::diagnostics::Diagnostic> {
         let mut out = crate::diagnostics::compute(text, tree);
         if out
             .iter()
@@ -782,6 +698,7 @@ impl Workspace {
         }
         out.extend(crate::indexed_diagnostics::compute(
             &self.index,
+            key,
             text,
             tree,
             self.effective_completeness(),
@@ -1024,10 +941,6 @@ const MAX_COMPLETIONS: usize = complete::RESULT_CAP;
 
 const RENAME_REF_CAP: usize = 5000;
 
-/// Depth cap on the supertype walk for member assembly: guards a pathologically deep (or cyclic,
-/// alongside the visited set) chain. Mirrors `complete::assemble_members`' cap.
-const SUPERTYPE_DEPTH_CAP: usize = 32;
-
 /// A symbol's fully-qualified name (`package.name`), or the bare `name` when the package is empty.
 fn fqn(package: &str, name: &str) -> String {
     if package.is_empty() {
@@ -1059,33 +972,6 @@ fn has_ancestor_kind(node: Node<'_>, kinds: &[&str]) -> bool {
         current = parent.parent();
     }
     false
-}
-
-/// Stamp an indexed member/extension `Entry` into a completion candidate, prefix-filtered and
-/// deduped by `(label, kind)`. Carries `tier`/`arity`/`package`/`container`; `import_path` is
-/// `None` for instance/inherited members (reached through an in-scope receiver) and the extension's
-/// own FQN for an unimported extension.
-fn push_member_candidate(
-    out: &mut Vec<ScopeCompletion>,
-    seen: &mut std::collections::HashSet<(String, SymbolKind)>,
-    e: &Entry,
-    prefix: &str,
-    import_path: Option<String>,
-) {
-    let name = &e.sym.name;
-    if !name.starts_with(prefix) {
-        return;
-    }
-    if !seen.insert((name.clone(), e.sym.kind)) {
-        return;
-    }
-    let mut c = ScopeCompletion::new(name.clone(), e.sym.kind);
-    c.tier = e.tier;
-    c.arity = e.sym.arity;
-    c.package = e.sym.package.clone();
-    c.container = e.sym.container.clone();
-    c.import_path = import_path;
-    out.push(c);
 }
 
 fn tier_rank(tier: Tier) -> u8 {

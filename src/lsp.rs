@@ -1353,7 +1353,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
 
-        let (hover, symbol) = {
+        let (hover, symbol, semantic) = {
             let mut ws = self.ws.lock().unwrap();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
@@ -1361,17 +1361,28 @@ impl LanguageServer for Backend {
             };
             let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
-            let hover = ws.symbol_at(&key, offset).map(|s| Hover {
+            let query = ws.resolved_symbol_query(&key, offset);
+            let semantic = query.as_ref().map(|query| {
+                (
+                    query.reference().kind_label(),
+                    query.reference().status_label(),
+                    query.reference().reason_labels(),
+                )
+            });
+            let hover = query.and_then(|query| query.symbol_summary()).map(|s| Hover {
                 contents: HoverContents::Markup(MarkupContent {
                     kind: MarkupKind::Markdown,
                     value: s.hover_markdown(),
                 }),
                 range: None,
             });
-            (hover, symbol)
+            (hover, symbol, semantic)
         };
 
         let count = usize::from(hover.is_some());
+        if let Some((kind, status, reasons)) = semantic {
+            crate::trace::semantic("hover", &key, pos.line, pos.character, symbol.as_deref(), kind, status, &reasons);
+        }
         crate::trace::request(
             "hover",
             start,
@@ -1666,7 +1677,7 @@ impl LanguageServer for Backend {
         // build the `LineIndex` and compute the byte offset, then the offset is passed to
         // `ws.complete`, which internally accesses the cached tree exactly like `goto_definition`.
         let snippets = *self.snippets_supported.lock().unwrap();
-        let (items, is_incomplete, symbol) = {
+        let (items, is_incomplete, symbol, semantic) = {
             let mut ws = self.ws.lock().unwrap();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
@@ -1674,20 +1685,33 @@ impl LanguageServer for Backend {
             };
             let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
+            let semantic = ws.after_dot_query(&key, offset).map(|query| {
+                let status = if !query.candidates.is_empty() {
+                    "ok"
+                } else if !query.reasons.is_empty() {
+                    "unknown"
+                } else {
+                    "empty"
+                };
+                ("member", status, query.reasons)
+            });
             match ws.complete(&key, offset, snippets) {
                 Some(shaped) => {
                     let incomplete = shaped.is_incomplete;
                     let items =
                         shaped.items.into_iter().map(to_completion_item).collect::<Vec<_>>();
-                    (items, incomplete, symbol)
+                    (items, incomplete, symbol, semantic)
                 }
                 // No completion offered (e.g. not in a completable position): trace as empty rather
                 // than returning early, so "completion produced nothing here" is visible.
-                None => (Vec::new(), false, symbol),
+                None => (Vec::new(), false, symbol, semantic),
             }
         };
 
         let count = items.len();
+        if let Some((kind, status, reasons)) = semantic {
+            crate::trace::semantic("completion", &key, pos.line, pos.character, symbol.as_deref(), kind, status, &reasons);
+        }
         crate::trace::request(
             "completion",
             start,
