@@ -76,6 +76,16 @@ pub struct IndexedSymbol {
     /// lack the field) still deserialize.
     #[serde(default)]
     pub arity: Option<u8>,
+    /// For a `Function`: the minimum positional argument count accepted without named arguments,
+    /// accounting for trailing default parameters. `None` when unknown. Conservative call-shape
+    /// diagnostics only fire when this and `arity` are both known.
+    #[serde(default)]
+    pub min_arity: Option<u8>,
+    /// For a `Function`: whether the declaration uses `vararg`. Conservative call-shape
+    /// diagnostics decline when this is true because tree-sitter alone does not prove every legal
+    /// call count in the presence of varargs and named arguments.
+    #[serde(default)]
+    pub has_vararg: bool,
     /// For a `Function` (or property getter): its declared return type, as a [`TypeRef`] carrying
     /// the declaration file's package/import candidates. `None` when there is no explicit return
     /// annotation. Drives `val x = foo()` / chained-call inference.
@@ -120,6 +130,8 @@ impl IndexedSymbol {
             supertypes: Vec::new(),
             ext_receiver: None,
             arity: None,
+            min_arity: None,
+            has_vararg: false,
             return_type: None,
             value_type: None,
             params: Vec::new(),

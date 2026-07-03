@@ -282,7 +282,12 @@ pub fn call_shape_query(
     }
     if entries
         .iter()
-        .any(|entry| entry.sym.kind != SymbolKind::Function || entry.sym.arity.is_none())
+        .any(|entry| {
+            entry.sym.kind != SymbolKind::Function
+                || entry.sym.arity.is_none()
+                || entry.sym.min_arity.is_none()
+                || entry.sym.has_vararg
+        })
     {
         return None;
     }
@@ -290,7 +295,11 @@ pub fn call_shape_query(
     let mut arities = entries.iter().filter_map(|entry| entry.sym.arity).collect::<Vec<_>>();
     arities.sort_unstable();
     arities.dedup();
-    if arities.iter().any(|arity| *arity as usize == arg_count) {
+    if entries.iter().any(|entry| {
+        let min = entry.sym.min_arity.expect("guarded above") as usize;
+        let max = entry.sym.arity.expect("guarded above") as usize;
+        (min..=max).contains(&arg_count)
+    }) {
         return None;
     }
     Some(CallShapeQuery { symbol, arg_count, arities })
@@ -594,6 +603,8 @@ mod tests {
                 supertypes: Vec::new(),
                 ext_receiver: Some("Dog".into()),
                 arity: Some(1),
+                min_arity: Some(1),
+                has_vararg: false,
                 return_type: None,
                 value_type: None,
                 params: Vec::new(),
@@ -674,5 +685,59 @@ mod tests {
         assert_eq!(query.symbol, "ping");
         assert_eq!(query.arg_count, 0);
         assert_eq!(query.arities, vec![1]);
+    }
+
+    #[test]
+    fn call_shape_query_allows_trailing_default_arguments() {
+        let src = "fun manifest(value: Int, indent: String = \"  \") {}\nfun main() { manifest(1) }\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = tree
+            .root_node()
+            .named_descendant_for_byte_range(src.find("manifest(1)").unwrap(), src.find("manifest(1)").unwrap())
+            .and_then(|node| {
+                let mut cur = Some(node);
+                while let Some(n) = cur {
+                    if n.kind() == "call_expression" {
+                        return Some(n);
+                    }
+                    cur = n.parent();
+                }
+                None
+            })
+            .expect("call expression");
+
+        assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
+    }
+
+    #[test]
+    fn call_shape_query_declines_vararg_targets() {
+        let src = "fun collect(prefix: String, vararg names: String) {}\nfun main() { collect() }\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = tree
+            .root_node()
+            .named_descendant_for_byte_range(src.find("collect()").unwrap(), src.find("collect()").unwrap())
+            .and_then(|node| {
+                let mut cur = Some(node);
+                while let Some(n) = cur {
+                    if n.kind() == "call_expression" {
+                        return Some(n);
+                    }
+                    cur = n.parent();
+                }
+                None
+            })
+            .expect("call expression");
+
+        assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
     }
 }

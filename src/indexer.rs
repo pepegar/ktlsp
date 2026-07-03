@@ -239,10 +239,13 @@ fn push_function(
     documentation: Option<&str>,
     scope: &TypeScope,
 ) {
+    let shape = function_shape(decl);
     out.push(IndexedSymbol {
         ext_receiver: ext_receiver.map(str::to_string),
         documentation: documentation.map(str::to_string),
-        arity: Some(value_param_count(decl)),
+        arity: Some(shape.arity),
+        min_arity: Some(shape.min_arity),
+        has_vararg: shape.has_vararg,
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
         type_params: type_params_of(decl, src),
@@ -257,21 +260,54 @@ fn push_function(
     });
 }
 
-/// The number of value parameters on a `function_declaration`: the `parameter` named children of
-/// its `function_value_parameters` node (saturated at `u8::MAX`). Returns `0` when there is no
-/// `function_value_parameters` child (treated as zero-arg). Verified via `examples/dump`: a
-/// zero-arg `fun potato()` has an empty `function_value_parameters`; `fun add(a, b)` has two
-/// `parameter` children.
-fn value_param_count(decl: Node) -> u8 {
+struct FunctionShape {
+    arity: u8,
+    min_arity: u8,
+    has_vararg: bool,
+}
+
+/// The positional call shape of a `function_declaration`, derived from the named children under
+/// `function_value_parameters`.
+///
+/// tree-sitter-kotlin-ng models a default value as a named sibling after the `parameter`, so this
+/// scan pairs each non-`parameter` named child with the immediately preceding parameter and treats
+/// that parameter as optional for positional call counts. `vararg` arrives through a preceding
+/// `parameter_modifiers` node. We intentionally collapse varargs to a coarse flag rather than
+/// proving exact accepted counts; the diagnostic layer declines in that case.
+fn function_shape(decl: Node) -> FunctionShape {
     let Some(params) = child_of_kind(decl, "function_value_parameters") else {
-        return 0;
+        return FunctionShape { arity: 0, min_arity: 0, has_vararg: false };
     };
+    let mut meta: Vec<(bool, bool)> = Vec::new();
     let mut cursor = params.walk();
-    let n = params
-        .named_children(&mut cursor)
-        .filter(|c| c.kind() == "parameter")
-        .count();
-    n.min(u8::MAX as usize) as u8
+    let mut pending_vararg = false;
+    let mut has_vararg = false;
+    for child in params.named_children(&mut cursor) {
+        match child.kind() {
+            "parameter_modifiers" => {
+                pending_vararg = true;
+                has_vararg = true;
+            }
+            "parameter" => {
+                meta.push((false, pending_vararg));
+                pending_vararg = false;
+            }
+            _ => {
+                if let Some(last) = meta.last_mut() {
+                    last.0 = true;
+                }
+            }
+        }
+    }
+    let arity = meta.len().min(u8::MAX as usize) as u8;
+    let min_arity = meta
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (has_default, is_vararg))| (!has_default && !is_vararg).then_some(idx + 1))
+        .next_back()
+        .unwrap_or(0)
+        .min(u8::MAX as usize) as u8;
+    FunctionShape { arity, min_arity, has_vararg }
 }
 
 /// Push a type declaration's name with its `supertypes` and formal `type_params`.
@@ -621,6 +657,8 @@ fn push_synthetic_member(
         supertypes: Vec::new(),
         ext_receiver: None,
         arity,
+        min_arity: arity,
+        has_vararg: false,
         return_type,
         value_type,
         params,
@@ -1077,11 +1115,30 @@ object Reg { fun add() {} }
         let syms = index(src);
         let potato = syms.iter().find(|s| s.name == "potato").unwrap();
         assert_eq!(potato.arity, Some(0), "zero-arg function");
+        assert_eq!(potato.min_arity, Some(0), "zero-arg function has zero minimum arity");
         let add = syms.iter().find(|s| s.name == "add").unwrap();
         assert_eq!(add.arity, Some(2), "two-arg function");
+        assert_eq!(add.min_arity, Some(2), "two required params");
         // A non-function carries no arity.
         let prop = syms.iter().find(|s| s.name == "notAFn").unwrap();
         assert_eq!(prop.arity, None);
+    }
+
+    #[test]
+    fn function_min_arity_tracks_trailing_defaults_and_vararg() {
+        let src = "fun manifest(value: Value, indent: String = \"  \") = value\n\
+                   fun collect(prefix: String, vararg names: String) = prefix\n";
+        let syms = index(src);
+
+        let manifest = syms.iter().find(|s| s.name == "manifest").unwrap();
+        assert_eq!(manifest.arity, Some(2));
+        assert_eq!(manifest.min_arity, Some(1), "trailing default is optional positionally");
+        assert!(!manifest.has_vararg);
+
+        let collect = syms.iter().find(|s| s.name == "collect").unwrap();
+        assert_eq!(collect.arity, Some(2));
+        assert_eq!(collect.min_arity, Some(1), "vararg can be omitted");
+        assert!(collect.has_vararg);
     }
 
     #[test]
