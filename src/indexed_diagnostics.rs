@@ -7,7 +7,8 @@ use tree_sitter::{Node, Tree};
 use crate::diagnostics::{Diagnostic, DiagnosticCode, Severity};
 use crate::index::Index;
 use crate::parser::node_text;
-use crate::resolve::{self, CompletenessFacts, ResolutionStatus};
+use crate::resolve::CompletenessFacts;
+use crate::semantic_query;
 
 pub fn compute(
     index: &Index,
@@ -31,21 +32,20 @@ fn collect_missing_references(
     facts: CompletenessFacts,
     out: &mut Vec<Diagnostic>,
 ) {
-    if node.kind() == "identifier"
-        && matches!(
-            resolve::reference_status(index, tree, src, node, facts),
-            ResolutionStatus::DefinitelyAbsent
-        )
-    {
-        let name = node_text(node, src);
-        out.push(Diagnostic {
-            start_byte: node.start_byte(),
-            end_byte: node.end_byte(),
-            severity: Severity::Error,
-            code: Some(DiagnosticCode::UnresolvedReference),
-            message: format!("Unresolved reference: {name}"),
-        });
-        return;
+    if node.kind() == "identifier" {
+        if let Some(query) = semantic_query::reference_query(index, tree, src, node, facts) {
+            if query.is_definitely_absent() {
+                let name = node_text(node, src);
+                out.push(Diagnostic {
+                    start_byte: node.start_byte(),
+                    end_byte: node.end_byte(),
+                    severity: Severity::Error,
+                    code: Some(DiagnosticCode::UnresolvedReference),
+                    message: format!("Unresolved reference: {name}"),
+                });
+                return;
+            }
+        }
     }
 
     let mut cursor = node.walk();

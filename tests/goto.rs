@@ -216,6 +216,40 @@ fn member_resolution_uses_constructor_property_not_homonymous_member_function() 
 }
 
 #[test]
+fn goto_stdlib_generic_receiver_extension_from_destructured_nullable_local() {
+    check(
+        "//- kotlin/Stdlib.kt\npackage kotlin\n\
+         data class Pair<A, B>(val first: A, val second: B)\n\
+         class Other\n\
+         fun <T, R> T./*def*/let(block: (T) -> R): R = TODO()\n\
+         fun Other.let(block: (Other) -> Unit) = block(this)\n\
+         //- Main.kt\npackage app\n\
+         class Token { val value: Int = 1 }\n\
+         fun unshare(): Pair<Int, Token?> = TODO()\n\
+         fun f() {\n\
+             val (shareLinkId, migrationZedToken) = unshare()\n\
+             migrationZedToken?./*^*/let { token -> token.value + shareLinkId }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn goto_stdlib_result_extension_from_runcatching_receiver() {
+    check(
+        "//- kotlin/Stdlib.kt\npackage kotlin\n\
+         class Result<T>\n\
+         class OtherResult\n\
+         fun <R> runCatching(block: () -> R): Result<R> = TODO()\n\
+         fun <T> Result<T>./*def*/onFailure(action: (Throwable) -> Unit): Result<T> = this\n\
+         fun OtherResult.onFailure(action: () -> Unit): OtherResult = this\n\
+         //- Main.kt\npackage app\n\
+         fun f() {\n\
+             runCatching { 1 }./*^*/onFailure { }\n\
+         }\n",
+    );
+}
+
+#[test]
 fn when_subject_val() {
     check("fun main() {\n    when (val /*def*/s = 1) {\n        else -> println(/*^*/s)\n    }\n}\n");
 }

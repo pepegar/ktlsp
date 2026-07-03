@@ -538,6 +538,9 @@ fn decl_type(index: &Index, decl: Node, src: &str, ctx: &FileCtx, depth: usize) 
     };
     match parent.kind() {
         "variable_declaration" => {
+            if let Some(t) = destructured_decl_type(index, decl, src, ctx, depth) {
+                return t;
+            }
             // Explicit annotation (`val x: T`, `val x: T?`, `val x: List<T>`).
             if let Some(tr) = crate::indexer::value_type_of(parent, src) {
                 return resolve_type_ref(index, &tr, ctx, depth);
@@ -559,9 +562,44 @@ fn decl_type(index: &Index, decl: Node, src: &str, ctx: &FileCtx, depth: usize) 
     }
 }
 
+fn destructured_decl_type(
+    index: &Index,
+    decl: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    let multi = decl.parent()?.parent()?;
+    if multi.kind() != "multi_variable_declaration" {
+        return None;
+    }
+    let prop = multi.parent()?;
+    if prop.kind() != "property_declaration" {
+        return None;
+    }
+
+    let mut ordinal = None;
+    let mut cursor = multi.walk();
+    let mut seen = 0usize;
+    for child in multi.named_children(&mut cursor) {
+        if child.kind() != "variable_declaration" {
+            continue;
+        }
+        if child == decl.parent()? {
+            ordinal = Some(seen);
+            break;
+        }
+        seen += 1;
+    }
+    let ordinal = ordinal?;
+    let init = initializer_expr(prop, multi)?;
+    let init_ty = infer_depth(index, init, src, ctx, depth + 1);
+    init_ty.args().get(ordinal).cloned()
+}
+
 /// The initializer expression of a `property_declaration` (`val x = EXPR`): the first named child
 /// after the `variable_declaration` that is an actual expression (not a getter/setter/delegate).
-fn initializer_expr<'t>(prop: Node<'t>, var_decl: Node<'t>) -> Option<Node<'t>> {
+fn initializer_expr<'t>(prop: Node<'t>, binder: Node<'t>) -> Option<Node<'t>> {
     let mut cursor = prop.walk();
     let mut after = false;
     for child in prop.named_children(&mut cursor) {
@@ -572,7 +610,7 @@ fn initializer_expr<'t>(prop: Node<'t>, var_decl: Node<'t>) -> Option<Node<'t>> 
                 _ => return Some(child),
             }
         }
-        if child == var_decl {
+        if child == binder {
             after = true;
         }
     }
@@ -913,6 +951,11 @@ fn member_type(
                 extensions.push(e);
             }
         }
+        for e in generic_receiver_extensions(index, name, ctx) {
+            if member_type_ref(e, want_function).is_some() {
+                extensions.push(e);
+            }
+        }
         for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
             let sup_pkg = same_pkg_supertype(index, &sup, cur_pkg.as_deref());
             frontier.push((sup, sup_pkg, d + 1));
@@ -955,7 +998,7 @@ fn member_type(
             Some(tr) => tr,
             None => continue,
         };
-        let t = substitute_type_var(recv_ty, tr, index)
+        let t = substitute_type_var(index, recv_ty, e, tr)
             .unwrap_or_else(|| resolve_type_ref(index, tr, ctx, depth + 1));
         match &result {
             None => result = Some(t),
@@ -964,6 +1007,49 @@ fn member_type(
         }
     }
     result.unwrap_or(Type::Unknown)
+}
+
+fn generic_receiver_extensions<'a>(
+    index: &'a Index,
+    name: &str,
+    ctx: &FileCtx,
+) -> Vec<&'a Entry> {
+    index
+        .lookup_by_name(name)
+        .iter()
+        .filter(|e| e.sym.container.is_none())
+        .filter(|e| {
+            e.sym
+                .ext_receiver
+                .as_deref()
+                .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
+        })
+        .filter(|e| extension_is_visible(e, ctx))
+        .collect()
+}
+
+fn extension_is_visible(e: &Entry, ctx: &FileCtx) -> bool {
+    if e.sym.package == ctx.package {
+        return true;
+    }
+    if ctx
+        .imports
+        .iter()
+        .any(|imp| {
+            !imp.wildcard
+                && imp.alias.is_none()
+                && imp.simple_name() == e.sym.name
+                && imp.package() == e.sym.package
+        })
+    {
+        return true;
+    }
+    ctx.imports
+        .iter()
+        .filter(|imp| imp.wildcard)
+        .map(|imp| imp.package())
+        .chain(resolve::DEFAULT_IMPORT_PACKAGES.iter().map(|pkg| (*pkg).to_string()))
+        .any(|pkg| pkg == e.sym.package)
 }
 
 /// Whether a candidate's parameter types are each consistent with the corresponding argument type.
@@ -1028,14 +1114,28 @@ fn is_subtype(index: &Index, name: &str, pkg: Option<&str>, target: &str) -> boo
 /// `List<Foo>.first(): T` -> Foo. Deliberately conservative: requiring a single argument and an
 /// unresolvable name means it can never pick the wrong argument of a `Map<K, V>` (two args ->
 /// skipped -> Unknown -> silent omission), preserving the no-wrong-completion contract.
-fn substitute_type_var(recv_ty: &Type, tr: &TypeRef, index: &Index) -> Option<Type> {
-    if !tr.args.is_empty() || recv_ty.args().len() != 1 {
+fn substitute_type_var(
+    index: &Index,
+    recv_ty: &Type,
+    entry: &Entry,
+    tr: &TypeRef,
+) -> Option<Type> {
+    if !tr.args.is_empty() {
         return None;
     }
     if !index.lookup_type(&tr.name).is_empty() {
         return None; // a real concrete type, not a type variable
     }
-    let arg = &recv_ty.args()[0];
+    let container = entry.sym.container.as_deref()?;
+    let type_params = index
+        .lookup_type(container)
+        .into_iter()
+        .find(|e| e.sym.package == entry.sym.package && e.sym.container.is_none())?
+        .sym
+        .type_params
+        .clone();
+    let ordinal = type_params.iter().position(|tp| tp == &tr.name)?;
+    let arg = recv_ty.args().get(ordinal)?;
     arg.name().is_some().then(|| arg.clone())
 }
 

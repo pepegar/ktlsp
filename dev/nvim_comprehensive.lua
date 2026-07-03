@@ -85,6 +85,8 @@ local GOTO = {
   {"S","_sxGotoReturnType(): String","String","kotlin-stdlib"},
   {"S","val gotoTargetVar","User","Model.kt"},
   {"S","val sxGotoListOf = listOf","listOf","kotlin-stdlib"},
+  {"S","sxGotoLet./*ktlsp*/let","let","kotlin-stdlib"},
+  {"S","runCatching { 1 }./*ktlsp*/onFailure","onFailure","kotlin-stdlib"},
   {"R","val gotoJsonAnchor","Json","serialization-json"},
   {"C","val gotoFlow","Flow","coroutines"},
   {"O","fun _okGotoBuffer(): Buffer","Buffer","okio"},

@@ -251,7 +251,9 @@ the logic honest:
 | `symbol` | core data types (`SymbolKind`, `IndexedSymbol`, `Def`) — no LSP types |
 | `indexer` | extract declarations + identifier usages from a parse tree (descends into ERROR nodes) |
 | `index` | two-tier (volatile/durable) by-name symbol index + reverse usage index |
+| `knowledge` | shared proof-bounded semantic result type: found / absent / unknown |
 | `resolve` | the goto-definition algorithm (local scope walk + kind-aware cross-file) |
+| `semantic_query` | shared feature-facing semantic queries built on top of resolution facts |
 | `indexed_diagnostics` | index-backed diagnostics that require explicit completeness facts |
 | `coords` / `catalog` | Maven coordinates + Gradle version-catalog (`libs.versions.toml`) parsing |
 | `artifacts` / `jar` | locate/download `-sources.jar` (cache → Maven Central); zip-slip-safe extraction |
@@ -326,7 +328,8 @@ Useful scenarios:
   `kotlin-stdlib`'s `jvmMain` source set and JDK sources.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.
 - `gradle-live`, `gradle-compile`, and `comprehensive` exercise `dev/gradle-sample`; compile
-  diagnostics remain opt-in because they run Gradle/the sidecar.
+  diagnostics remain opt-in because they run Gradle/the sidecar. Stdlib extension goto cases like
+  `.let` and `.onFailure` are covered there.
 
 For new editor-visible features, add the pure Rust tests first, then extend or add a Neovim probe
 that exercises the behavior through a real LSP client. Route that probe through

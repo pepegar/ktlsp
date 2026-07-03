@@ -145,6 +145,17 @@ fun _sxGotoListOf() {
     val sxGotoListOf = listOf(1, 2, 3)
 }
 
+// goto on `let` call -> kotlin-stdlib Standard.kt
+fun _sxGotoLet() {
+    val sxGotoLet: String? = "hello"
+    sxGotoLet./*ktlsp*/let { it }
+}
+
+// goto on `onFailure` call -> kotlin-stdlib Result.kt
+fun _sxGotoOnFailure() {
+    runCatching { 1 }./*ktlsp*/onFailure { _ -> }
+}
+
 // goto on a project type used as element -> Model.kt (User).
 // NOTE: var name avoids the substring "User" so the harness can target the TYPE token cleanly.
 fun _sxGotoProjectType() {

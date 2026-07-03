@@ -18,6 +18,7 @@ use tree_sitter::{Node, Tree};
 
 use crate::index::{Entry, Index};
 use crate::infer;
+use crate::knowledge::Knowledge;
 use crate::parser::{
     child_of_kind, class_kind, first_ident, identifier_at, imports_of, name_field, node_text,
     package_of, Import,
@@ -58,12 +59,7 @@ pub enum IncompletenessReason {
     ReceiverTypeNotIndexed(String),
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ResolutionStatus<T> {
-    Found(T),
-    DefinitelyAbsent,
-    Unknown(Vec<IncompletenessReason>),
-}
+pub type ResolutionStatus<T> = Knowledge<T, IncompletenessReason>;
 
 impl IncompletenessReason {
     pub fn label(&self) -> String {
@@ -519,7 +515,14 @@ fn resolve_member(index: &Index, selector: Node, name: &str, src: &str, tree: &T
                 let ctx = infer::FileCtx::from_tree(tree, src);
                 let ty = infer::infer(index, receiver, src, &ctx);
                 if let Some(ty_name) = ty.name() {
-                    let hits = member_defs(index, ty_name, ty.package(), name);
+                    let hits = member_defs(
+                        index,
+                        ty_name,
+                        ty.package(),
+                        name,
+                        &ctx.imports,
+                        &ctx.package,
+                    );
                     if !hits.is_empty() {
                         return hits;
                     }
@@ -540,8 +543,15 @@ fn resolve_member(index: &Index, selector: Node, name: &str, src: &str, tree: &T
 /// own members, members inherited through the supertype closure, and extensions keyed on the type
 /// or a supertype. Package-filtered so a same-named type in a different package can't contribute.
 /// Bounded against deep / cyclic hierarchies.
-fn member_defs(index: &Index, ty: &str, ty_pkg: Option<&str>, name: &str) -> Vec<Def> {
-    let mut out = Vec::new();
+fn member_defs(
+    index: &Index,
+    ty: &str,
+    ty_pkg: Option<&str>,
+    name: &str,
+    imports: &[Import],
+    current_pkg: &str,
+) -> Vec<Def> {
+    let mut out: Vec<&Entry> = Vec::new();
     let mut visited: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut frontier: Vec<(String, Option<String>, usize)> =
         vec![(ty.to_string(), ty_pkg.map(str::to_string), 0)];
@@ -556,12 +566,12 @@ fn member_defs(index: &Index, ty: &str, ty_pkg: Option<&str>, name: &str) -> Vec
                 }
             }
             if e.sym.name == name {
-                out.push(to_def(e));
+                out.push(e);
             }
         }
         for e in index.extensions_for(&cur) {
-            if e.sym.name == name {
-                out.push(to_def(e));
+            if e.sym.name == name && extension_is_visible(e, imports, current_pkg) {
+                out.push(e);
             }
         }
         for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
@@ -580,7 +590,48 @@ fn member_defs(index: &Index, ty: &str, ty_pkg: Option<&str>, name: &str) -> Vec
             frontier.push((sup, sup_pkg, depth + 1));
         }
     }
-    out
+    for e in generic_receiver_extensions(index, name, imports, current_pkg) {
+        out.push(e);
+    }
+    entries_to_defs(out)
+}
+
+fn generic_receiver_extensions<'a>(
+    index: &'a Index,
+    name: &str,
+    imports: &[Import],
+    current_pkg: &str,
+) -> Vec<&'a Entry> {
+    index
+        .lookup_by_name(name)
+        .iter()
+        .filter(|e| e.sym.container.is_none())
+        .filter(|e| {
+            e.sym
+                .ext_receiver
+                .as_deref()
+                .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
+        })
+        .filter(|e| extension_is_visible(e, imports, current_pkg))
+        .collect()
+}
+
+fn extension_is_visible(e: &Entry, imports: &[Import], current_pkg: &str) -> bool {
+    if e.sym.package == current_pkg {
+        return true;
+    }
+    if imports
+        .iter()
+        .any(|imp| !imp.wildcard && imp.alias.is_none() && import_path_matches_entry(imp, e))
+    {
+        return true;
+    }
+    imports
+        .iter()
+        .filter(|imp| imp.wildcard)
+        .map(|imp| imp.package())
+        .chain(DEFAULT_IMPORT_PACKAGES.iter().map(|pkg| (*pkg).to_string()))
+        .any(|pkg| pkg == e.sym.package)
 }
 
 /// The name of the class/object enclosing `node`. `pub(crate)` so inference can type `this`.

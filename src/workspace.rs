@@ -22,6 +22,7 @@ use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_
 use crate::ranges::{self, FoldRange, SelectionRange};
 use crate::resolve;
 use crate::semantic;
+use crate::semantic_query;
 use crate::symbol::{Def, IndexedSymbol, SymbolKind};
 use crate::symbols::SymbolSummary;
 
@@ -212,26 +213,19 @@ impl Workspace {
             });
         }
 
-        let status = resolve::reference_status(
+        let query = semantic_query::reference_query(
             &self.index,
             tree,
             doc_text,
             ident,
             self.effective_completeness(),
-        );
-        let (status, reasons) = match status {
-            resolve::ResolutionStatus::Found(()) => ("ok", Vec::new()),
-            resolve::ResolutionStatus::DefinitelyAbsent => ("definitely-absent", Vec::new()),
-            resolve::ResolutionStatus::Unknown(reasons) => {
-                ("unknown", reasons.into_iter().map(|reason| reason.label()).collect())
-            }
-        };
+        )?;
         Some(crate::commands::ResolutionExplanation {
-            status,
-            kind,
+            status: query.status_label(),
+            kind: query.kind_label(),
             symbol,
             targets,
-            reasons,
+            reasons: query.reason_labels(),
         })
     }
 
