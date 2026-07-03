@@ -250,6 +250,46 @@ fn goto_stdlib_result_extension_from_runcatching_receiver() {
 }
 
 #[test]
+fn goto_stdlib_let_matches_real_matryoshka_shape() {
+    check(
+        "//- kotlin/Stdlib.kt\npackage kotlin\n\
+         data class Pair<A, B>(val first: A, val second: B)\n\
+         class ZedToken(val value: String)\n\
+         fun <T, R> T./*def*/let(block: (T) -> R): R = TODO()\n\
+         //- Main.kt\npackage app\n\
+         fun unshare(): Pair<String, ZedToken?> = TODO()\n\
+         fun f() {\n\
+             val (shareLinkId, migrationZedToken) = unshare()\n\
+             migrationZedToken?./*^*/let { token ->\n\
+                 token.value + shareLinkId\n\
+             }\n\
+         }\n",
+    );
+}
+
+#[test]
+fn goto_stdlib_onfailure_matches_real_matryoshka_shape() {
+    check(
+        "//- kotlin/Stdlib.kt\npackage kotlin\n\
+         class Throwable\n\
+         class Result<T>\n\
+         fun <R> runCatching(block: () -> R): Result<R> = TODO()\n\
+         fun <T, R> T.runCatching(block: T.() -> R): Result<R> = TODO()\n\
+         fun <T> Result<T>./*def*/onFailure(action: (Throwable) -> Unit): Result<T> = this\n\
+         //- Main.kt\npackage app\n\
+         class Logger { fun error(t: Throwable, msg: () -> String) {} }\n\
+         val logger = Logger()\n\
+         fun insertZedToken() {}\n\
+         fun f() {\n\
+             runCatching { insertZedToken() }\n\
+                 ./*^*/onFailure {\n\
+                     logger.error(it) { \"failed\" }\n\
+                 }\n\
+         }\n",
+    );
+}
+
+#[test]
 fn when_subject_val() {
     check("fun main() {\n    when (val /*def*/s = 1) {\n        else -> println(/*^*/s)\n    }\n}\n");
 }

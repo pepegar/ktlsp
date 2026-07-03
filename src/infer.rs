@@ -813,7 +813,7 @@ fn visible_top_level_entries<'a>(
     index
         .lookup_by_name(local_name)
         .iter()
-        .filter(|e| e.sym.kind == kind && e.sym.container.is_none())
+        .filter(|e| e.sym.kind == kind && e.sym.container.is_none() && e.sym.ext_receiver.is_none())
         .filter(|e| star_pkgs.contains(&e.sym.package))
         .collect()
 }
@@ -827,7 +827,12 @@ fn top_level_entries_exact<'a>(
     index
         .lookup_by_name(name)
         .iter()
-        .filter(|e| e.sym.kind == kind && e.sym.container.is_none() && e.sym.package == package)
+        .filter(|e| {
+            e.sym.kind == kind
+                && e.sym.container.is_none()
+                && e.sym.ext_receiver.is_none()
+                && e.sym.package == package
+        })
         .collect()
 }
 
