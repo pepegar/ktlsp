@@ -998,7 +998,7 @@ fn member_type(
             Some(tr) => tr,
             None => continue,
         };
-        let t = substitute_type_var(index, recv_ty, e, tr)
+        let t = substitute_type_var(index, recv_ty, e, tr, ctx, depth + 1)
             .unwrap_or_else(|| resolve_type_ref(index, tr, ctx, depth + 1));
         match &result {
             None => result = Some(t),
@@ -1119,24 +1119,46 @@ fn substitute_type_var(
     recv_ty: &Type,
     entry: &Entry,
     tr: &TypeRef,
+    ctx: &FileCtx,
+    depth: usize,
 ) -> Option<Type> {
-    if !tr.args.is_empty() {
+    let subst = receiver_type_bindings(index, recv_ty, entry)?;
+    if subst.is_empty() {
         return None;
     }
-    if !index.lookup_type(&tr.name).is_empty() {
-        return None; // a real concrete type, not a type variable
+    let tparams: HashSet<String> = subst.keys().cloned().collect();
+    Some(resolve_with_subst(index, tr, ctx, &tparams, &subst, depth + 1))
+}
+
+fn receiver_type_bindings(index: &Index, recv_ty: &Type, entry: &Entry) -> Option<HashMap<String, Type>> {
+    let type_params = receiver_type_params(index, recv_ty, entry)?;
+    if type_params.len() != recv_ty.args().len() {
+        return None;
     }
-    let container = entry.sym.container.as_deref()?;
-    let type_params = index
-        .lookup_type(container)
-        .into_iter()
-        .find(|e| e.sym.package == entry.sym.package && e.sym.container.is_none())?
-        .sym
-        .type_params
-        .clone();
-    let ordinal = type_params.iter().position(|tp| tp == &tr.name)?;
-    let arg = recv_ty.args().get(ordinal)?;
-    arg.name().is_some().then(|| arg.clone())
+    Some(type_params.into_iter().zip(recv_ty.args().iter().cloned()).collect())
+}
+
+fn receiver_type_params(index: &Index, recv_ty: &Type, entry: &Entry) -> Option<Vec<String>> {
+    if let Some(container) = entry.sym.container.as_deref() {
+        return named_type_params(index, container, &entry.sym.package);
+    }
+    let recv = entry.sym.ext_receiver.as_deref()?;
+    if entry.sym.type_params.iter().any(|tp| tp == recv) {
+        return Some(vec![recv.to_string()]);
+    }
+    if !recv_ty.args().is_empty() && entry.sym.type_params.len() >= recv_ty.args().len() {
+        return Some(entry.sym.type_params[..recv_ty.args().len()].to_vec());
+    }
+    named_type_params(index, recv, &entry.sym.package)
+}
+
+fn named_type_params(index: &Index, name: &str, preferred_pkg: &str) -> Option<Vec<String>> {
+    let matches = index.lookup_type(name);
+    matches
+        .iter()
+        .find(|e| e.sym.package == preferred_pkg && e.sym.container.is_none())
+        .or_else(|| (matches.len() == 1).then_some(&matches[0]))
+        .map(|e| e.sym.type_params.clone())
 }
 
 /// The declared type ref to read from a member entry: a function's `return_type` (when
