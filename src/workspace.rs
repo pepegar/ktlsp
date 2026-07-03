@@ -11,11 +11,10 @@ use tree_sitter::{Node, Tree};
 use walkdir::{DirEntry, WalkDir};
 
 use crate::actions::{self, Action};
-use crate::complete::{self, ScopeCompletion, ShapedCompletions};
+use crate::complete::{self, ShapedCompletions};
 use crate::hierarchy::{self, HierarchyItem, IncomingCall, OutgoingCall};
 use crate::index::{Index, RefEntry, Tier, Usage};
 use crate::indexer::{extract_symbols, extract_usages};
-use crate::imports::{self, ImportLayout};
 use crate::java::JavaParser;
 use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_of, Import, KotlinParser};
 use crate::ranges::{self, FoldRange, SelectionRange};
@@ -197,6 +196,27 @@ impl Workspace {
         })
     }
 
+    pub fn explain_completion(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<crate::commands::CompletionExplanation> {
+        let query = self.completion_query(key, offset)?;
+        Some(crate::commands::CompletionExplanation {
+            status: query.status_label(),
+            context: query.context_label(),
+            prefix: query.prefix,
+            candidate_count: query.candidates.len(),
+            reasons: query.reasons,
+            candidates: query
+                .candidates
+                .into_iter()
+                .take(20)
+                .map(|candidate| candidate.label)
+                .collect(),
+        })
+    }
+
     pub fn resolved_symbol_query(
         &mut self,
         key: &str,
@@ -225,9 +245,18 @@ impl Workspace {
         &mut self,
         key: &str,
         offset: usize,
-    ) -> Option<semantic_query::MemberCompletionQuery> {
+    ) -> Option<semantic_query::CompletionQuery> {
         let text = self.doc_text(key)?;
         semantic_query::after_dot_query(&self.index, &mut self.parser, &text, offset, MAX_COMPLETIONS)
+    }
+
+    pub fn completion_query(
+        &mut self,
+        key: &str,
+        offset: usize,
+    ) -> Option<semantic_query::CompletionQuery> {
+        let text = self.doc_text(key)?;
+        semantic_query::completion_query(&self.index, &mut self.parser, key, &text, offset, MAX_COMPLETIONS)
     }
 
     /// `textDocument/completion`. Returns visible completion candidates at the cursor, or `None`
@@ -248,33 +277,24 @@ impl Workspace {
         offset: usize,
         snippets_supported: bool,
     ) -> Option<ShapedCompletions> {
-        // Classify the context up front (cheap; uses the cached tree). Branch on it.
-        let ctx = {
-            let parsed;
-            let (text, tree): (&str, &Tree) = match self.open_docs.get(key) {
-                Some(doc) => (&doc.text, &doc.tree),
-                None => {
-                    let text = self.doc_text(key)?;
-                    parsed = (self.parser.parse(&text), text);
-                    (&parsed.1, &parsed.0)
-                }
-            };
-            complete::completion_context(tree, text, offset)
-        };
-        // Assemble owned candidates (with stamped fields) + the import layout under the lock; then
-        // run the pure ranking/shaping pass + per-item import-line resolution over that owned data.
-        let (prefix, candidates, layout) = match ctx {
-            complete::CompletionContext::ScopeName => self.assemble_scope_name(key, offset)?,
-            complete::CompletionContext::AfterDot => self.assemble_after_dot(key, offset)?,
-            // Import / package / string / comment / number: silent omission.
-            complete::CompletionContext::Import | complete::CompletionContext::None => return None,
-        };
+        let query = self.completion_query(key, offset)?;
+        if matches!(
+            query.context,
+            complete::CompletionContext::Import | complete::CompletionContext::None
+        ) {
+            return None;
+        }
 
-        let mut shaped = complete::shape(ctx, &prefix, candidates, snippets_supported);
+        let mut shaped = complete::shape(
+            query.context,
+            &query.prefix,
+            query.candidates,
+            snippets_supported,
+        );
         // Resolve each surviving item's auto-import line from the file's import layout. `shape`
         // leaves `ImportEdit.line` at 0 (the text is set); the line depends on the live tree, so it
         // is resolved here (where the layout is known).
-        if let Some((sorted_imports, anchor)) = layout.as_ref() {
+        if let Some((sorted_imports, anchor)) = query.layout.as_ref() {
             for item in &mut shaped.items {
                 if let Some(imp) = item.auto_import.as_mut() {
                     let fqn = imp.text.strip_prefix("import ").unwrap_or(&imp.text);
@@ -542,130 +562,6 @@ impl Workspace {
                 .collect();
         }
         crate::signature::signatures_for_entries(entries, active_parameter)
-    }
-
-    /// Stage B assembly: member completion after a dot. Receiver-type inference reuses the S6
-    /// machinery; the trailing-dot parse collapse is handled by splicing a synthetic placeholder
-    /// selector in at the cursor and reparsing (the partial-selector text becomes the prefix).
-    /// Instance/inherited members are always in scope (reached through a receiver in scope), so they
-    /// carry no `import_path`; an applicable EXTENSION that is not yet visible gets its own FQN as
-    /// `import_path` (Kotlin imports extensions by their own fully-qualified name). The import layout
-    /// (computed from the synthetic tree — same imports/package as the real file) flows out so the
-    /// extension's import line can be resolved.
-    fn assemble_after_dot(
-        &mut self,
-        key: &str,
-        offset: usize,
-    ) -> Option<(String, Vec<ScopeCompletion>, ImportLayout)> {
-        let query = self.after_dot_query(key, offset)?;
-        if query.candidates.is_empty() {
-            return None;
-        }
-        Some((query.prefix, query.candidates, query.layout))
-    }
-
-    /// Stage A assembly: scope/name completion. Returns the prefix, the owned stamped candidates,
-    /// and the file's import layout (for auto-import line resolution).
-    fn assemble_scope_name(
-        &mut self,
-        key: &str,
-        offset: usize,
-    ) -> Option<(String, Vec<ScopeCompletion>, ImportLayout)> {
-        // Grab the cached (text, tree) without holding a borrow across the index access. Do all
-        // tree-dependent work (context, prefix, scope, import layout) inside the borrow scope,
-        // collecting owned results.
-        let (prefix, mut items, pkg, imports, layout) = {
-            // Resolve the doc: open buffer (cached tree) or disk (parse once).
-            let parsed;
-            let (text, tree): (&str, &Tree) = match self.open_docs.get(key) {
-                Some(doc) => (&doc.text, &doc.tree),
-                None => {
-                    let text = self.doc_text(key)?;
-                    parsed = (self.parser.parse(&text), text);
-                    (&parsed.1, &parsed.0)
-                }
-            };
-
-            let (prefix, _anchor) = complete::prefix_at(tree, text, offset);
-            let items = complete::complete_scope(tree, text, offset, &prefix);
-            let pkg = package_of(tree, text);
-            let imports = imports_of(tree, text);
-            let layout = imports::import_layout(tree, text);
-            (prefix, items, pkg, imports, layout)
-        };
-
-        // Index-wide visible top-level names (skip the current file — its top-level symbols already
-        // come from `complete_scope`'s source_file arm). Apply the SAME visibility rules
-        // `resolve_cross_file` uses: explicit/alias import binds the name, OR same package, OR a
-        // wildcard import, OR a Kotlin default-import package. A symbol that is none of those is an
-        // unimported (but indexed) top-level symbol — offered WITH an auto-import edit.
-        let star_pkgs: Vec<String> = imports.iter().filter(|i| i.wildcard).map(|i| i.package()).collect();
-        let explicit_names: std::collections::HashSet<&str> =
-            imports.iter().filter(|i| !i.wildcard).filter_map(|i| i.local_name()).collect();
-
-        // Stable sort key for index additions: (label, tier-rank) so Volatile beats Durable and the
-        // surviving set is deterministic across the HashMap's randomized iteration order.
-        let mut index_items: Vec<(ScopeCompletion, u8)> = Vec::new();
-        for e in self.index.entries_with_prefix(&prefix, true) {
-            if e.path == key {
-                continue;
-            }
-            let already_visible = explicit_names.contains(e.sym.name.as_str())
-                || e.sym.package == pkg
-                || star_pkgs.contains(&e.sym.package)
-                || resolve::is_default_import_pkg(&e.sym.package);
-            let rank = match e.tier {
-                Tier::Volatile => 0,
-                Tier::Durable => 1,
-            };
-            // An unimported symbol gets an auto-import (its own FQN); a visible one gets none.
-            let import_path = if already_visible {
-                None
-            } else {
-                Some(fqn(&e.sym.package, &e.sym.name))
-            };
-            let mut c = ScopeCompletion::new(e.sym.name.clone(), e.sym.kind);
-            c.tier = e.tier;
-            c.arity = e.sym.arity;
-            c.package = e.sym.package.clone();
-            c.container = e.sym.container.clone();
-            c.import_path = import_path;
-            index_items.push((c, rank));
-        }
-
-        // Import aliases that match the prefix (the alias is the local name; kind unknown -> Object,
-        // already visible -> no import_path).
-        for imp in &imports {
-            if let Some(alias) = imp.alias.as_deref() {
-                if alias.starts_with(&prefix) {
-                    index_items
-                        .push((ScopeCompletion::new(alias.to_string(), SymbolKind::Object), 0));
-                }
-            }
-        }
-
-        // Keywords valid as a leading token, filtered by prefix.
-        for kw in KOTLIN_KEYWORDS {
-            if kw.starts_with(&prefix) {
-                index_items.push((ScopeCompletion::keyword(*kw), 0));
-            }
-        }
-
-        // Deterministic order before dedup/cap: by (label, tier-rank).
-        index_items.sort_by(|a, b| a.0.label.cmp(&b.0.label).then(a.1.cmp(&b.1)));
-
-        // Dedup against scope names already present (scope/local names win — keep first), and across
-        // the sorted index/keyword additions themselves.
-        let mut seen: std::collections::HashSet<String> =
-            items.iter().map(|c| c.label.clone()).collect();
-        for (c, _) in index_items {
-            if seen.insert(c.label.clone()) {
-                items.push(c);
-            }
-        }
-
-        items.truncate(MAX_COMPLETIONS);
-        Some((prefix, items, layout))
     }
 
     /// `textDocument/publishDiagnostics` source: name-based, high-confidence diagnostics for `key`,

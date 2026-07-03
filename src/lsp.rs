@@ -1312,7 +1312,9 @@ impl LanguageServer for Backend {
                 let count = self.ws.lock().unwrap().scan(&root);
                 Ok(Some(serde_json::json!({ "status": "ok", "indexedFiles": count })))
             }
-            crate::commands::EXPLAIN_RESOLUTION | crate::commands::DUMP_SYMBOL => {
+            crate::commands::EXPLAIN_RESOLUTION
+            | crate::commands::EXPLAIN_COMPLETION
+            | crate::commands::DUMP_SYMBOL => {
                 let Some((uri, position)) = command_uri_position(&params.arguments) else {
                     return Ok(Some(serde_json::json!({ "status": "invalid-arguments" })));
                 };
@@ -1326,17 +1328,34 @@ impl LanguageServer for Backend {
                         None => return Ok(Some(serde_json::json!({ "status": "missing-document" }))),
                     };
                     let offset = LineIndex::new(&text).offset(&text, position.line, position.character);
-                    let explanation = ws.explain_resolution(&key, offset).unwrap_or(
-                        crate::commands::ResolutionExplanation {
-                            status: "no-identifier",
-                            kind: "unknown",
-                            symbol: crate::trace::ident_at(&text, offset),
-                            targets: Vec::new(),
-                            reasons: Vec::new(),
-                        },
-                    );
-                    serde_json::to_value(explanation)
-                        .unwrap_or_else(|_| serde_json::json!({ "status": "error" }))
+                    match params.command.as_str() {
+                        crate::commands::EXPLAIN_COMPLETION => serde_json::to_value(
+                            ws.explain_completion(&key, offset).unwrap_or(
+                                crate::commands::CompletionExplanation {
+                                    status: "unknown",
+                                    context: "none",
+                                    prefix: String::new(),
+                                    candidate_count: 0,
+                                    reasons: vec!["non-completable-position".to_string()],
+                                    candidates: Vec::new(),
+                                },
+                            ),
+                        )
+                        .unwrap_or_else(|_| serde_json::json!({ "status": "error" })),
+                        _ => {
+                            let explanation = ws.explain_resolution(&key, offset).unwrap_or(
+                                crate::commands::ResolutionExplanation {
+                                    status: "no-identifier",
+                                    kind: "unknown",
+                                    symbol: crate::trace::ident_at(&text, offset),
+                                    targets: Vec::new(),
+                                    reasons: Vec::new(),
+                                },
+                            );
+                            serde_json::to_value(explanation)
+                                .unwrap_or_else(|_| serde_json::json!({ "status": "error" }))
+                        }
+                    }
                 };
                 Ok(Some(result))
             }
@@ -1685,16 +1704,9 @@ impl LanguageServer for Backend {
             };
             let offset = LineIndex::new(&text).offset(&text, pos.line, pos.character);
             let symbol = crate::trace::ident_at(&text, offset);
-            let semantic = ws.after_dot_query(&key, offset).map(|query| {
-                let status = if !query.candidates.is_empty() {
-                    "ok"
-                } else if !query.reasons.is_empty() {
-                    "unknown"
-                } else {
-                    "empty"
-                };
-                ("member", status, query.reasons)
-            });
+            let semantic = ws
+                .completion_query(&key, offset)
+                .map(|query| (query.context_label(), query.status_label(), query.reasons));
             match ws.complete(&key, offset, snippets) {
                 Some(shaped) => {
                     let incomplete = shaped.is_incomplete;

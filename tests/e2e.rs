@@ -783,6 +783,43 @@ async fn expanded_editor_surface_requests_round_trip() {
     assert_eq!(command.get("status").and_then(|v| v.as_str()), Some("ok"));
     assert_eq!(command.get("kind").and_then(|v| v.as_str()), Some("call"));
 
+    let completion_line =
+        text.lines().position(|line| line.contains("add(1, 2)")).unwrap() as u32;
+    let completion_col = text
+        .lines()
+        .nth(completion_line as usize)
+        .unwrap()
+        .find("add")
+        .unwrap() as u32
+        + 2;
+    let completion_explained = backend
+        .execute_command(ExecuteCommandParams {
+            command: "ktlsp.explainCompletion".into(),
+            arguments: vec![serde_json::json!({
+                "uri": uri.as_str(),
+                "position": { "line": completion_line, "character": completion_col }
+            })],
+            work_done_progress_params: Default::default(),
+        })
+        .await
+        .unwrap()
+        .expect("completion explanation should return a value");
+    assert_eq!(
+        completion_explained.get("status").and_then(|v| v.as_str()),
+        Some("ok")
+    );
+    assert_eq!(
+        completion_explained.get("context").and_then(|v| v.as_str()),
+        Some("scope-name")
+    );
+    assert!(
+        completion_explained
+            .get("candidates")
+            .and_then(|v| v.as_array())
+            .is_some_and(|items| items.iter().any(|item| item.as_str() == Some("add"))),
+        "{completion_explained:?}"
+    );
+
     let missing_line =
         text.lines().position(|line| line.contains("MissingHarnessType")).unwrap() as u32;
     let missing_col = text

@@ -504,6 +504,19 @@ do
       end
     end
     check("completion offers `helper`", has_helper, "got " .. #items .. " items")
+    local completion_explained = request("workspace/executeCommand", {
+      command = "ktlsp.explainCompletion",
+      arguments = {
+        { uri = uri, position = { line = l, character = c + 1 } },
+      },
+    })
+    check(
+      "executeCommand explainCompletion returns scope-name ok",
+      completion_explained ~= nil
+        and completion_explained.status == "ok"
+        and completion_explained.context == "scope-name",
+      vim.inspect(completion_explained)
+    )
   end
 end
 

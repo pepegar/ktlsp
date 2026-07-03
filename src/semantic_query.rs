@@ -62,12 +62,32 @@ impl ResolvedSymbolQuery {
     }
 }
 
-pub struct MemberCompletionQuery {
+impl CompletionQuery {
+    pub fn context_label(&self) -> &'static str {
+        match self.context {
+            complete::CompletionContext::ScopeName => "scope-name",
+            complete::CompletionContext::AfterDot => "member",
+            complete::CompletionContext::Import => "import",
+            complete::CompletionContext::None => "none",
+        }
+    }
+
+    pub fn status_label(&self) -> &'static str {
+        if !self.candidates.is_empty() {
+            "ok"
+        } else if !self.reasons.is_empty() {
+            "unknown"
+        } else {
+            "empty"
+        }
+    }
+}
+
+pub struct CompletionQuery {
+    pub context: complete::CompletionContext,
     pub prefix: String,
     pub candidates: Vec<ScopeCompletion>,
     pub layout: ImportLayout,
-    pub receiver_type_name: String,
-    pub receiver_type_package: Option<String>,
     pub reasons: Vec<String>,
 }
 
@@ -144,13 +164,47 @@ pub fn resolved_symbol_query(
     })
 }
 
+pub fn completion_query(
+    index: &Index,
+    parser: &mut KotlinParser,
+    file: &str,
+    src: &str,
+    offset: usize,
+    max_candidates: usize,
+) -> Option<CompletionQuery> {
+    let tree = parser.parse(src);
+    let context = complete::completion_context(&tree, src, offset);
+    match context {
+        complete::CompletionContext::ScopeName => {
+            scope_name_query(index, file, &tree, src, offset, max_candidates)
+        }
+        complete::CompletionContext::AfterDot => {
+            after_dot_query(index, parser, src, offset, max_candidates)
+        }
+        complete::CompletionContext::Import => Some(CompletionQuery {
+            context,
+            prefix: String::new(),
+            candidates: Vec::new(),
+            layout: None,
+            reasons: vec!["import-context".to_string()],
+        }),
+        complete::CompletionContext::None => Some(CompletionQuery {
+            context,
+            prefix: String::new(),
+            candidates: Vec::new(),
+            layout: None,
+            reasons: vec!["non-completable-position".to_string()],
+        }),
+    }
+}
+
 pub fn after_dot_query(
     index: &Index,
     parser: &mut KotlinParser,
     src: &str,
     offset: usize,
     max_candidates: usize,
-) -> Option<MemberCompletionQuery> {
+) -> Option<CompletionQuery> {
     let (prefix, synthetic, syn_offset) = complete::dot_recovery(src, offset)?;
     let tree = parser.parse(&synthetic);
     let receiver = complete::navigation_receiver_at(&tree, syn_offset)?;
@@ -164,16 +218,15 @@ pub fn member_completion_query(
     receiver: Node,
     prefix: String,
     max_candidates: usize,
-) -> Option<MemberCompletionQuery> {
+) -> Option<CompletionQuery> {
     let ctx = infer::FileCtx::from_tree(tree, src);
     let ty = infer::infer(index, receiver, src, &ctx);
     let Some(receiver_type_name) = ty.name().map(str::to_string) else {
-        return Some(MemberCompletionQuery {
+        return Some(CompletionQuery {
+            context: complete::CompletionContext::AfterDot,
             prefix,
             candidates: Vec::new(),
             layout: imports::import_layout(tree, src),
-            receiver_type_name: String::new(),
-            receiver_type_package: None,
             reasons: vec!["unknown-receiver-type".to_string()],
         });
     };
@@ -187,14 +240,12 @@ pub fn member_completion_query(
         &vis,
         max_candidates,
     );
-    let reasons = if candidates.is_empty() { vec!["no-visible-members".to_string()] } else { Vec::new() };
-    Some(MemberCompletionQuery {
+    Some(CompletionQuery {
+        context: complete::CompletionContext::AfterDot,
         prefix,
         candidates,
         layout: imports::import_layout(tree, src),
-        receiver_type_name,
-        receiver_type_package,
-        reasons,
+        reasons: Vec::new(),
     })
 }
 
@@ -243,6 +294,81 @@ pub fn call_shape_query(
         return None;
     }
     Some(CallShapeQuery { symbol, arg_count, arities })
+}
+
+pub fn scope_name_query(
+    index: &Index,
+    file: &str,
+    tree: &Tree,
+    src: &str,
+    offset: usize,
+    max_candidates: usize,
+) -> Option<CompletionQuery> {
+    let (prefix, mut items) = {
+        let (prefix, _anchor) = complete::prefix_at(tree, src, offset);
+        let items = complete::complete_scope(tree, src, offset, &prefix);
+        (prefix, items)
+    };
+    let pkg = crate::parser::package_of(tree, src);
+    let imports = crate::parser::imports_of(tree, src);
+    let layout = imports::import_layout(tree, src);
+    let star_pkgs: Vec<String> = imports.iter().filter(|i| i.wildcard).map(|i| i.package()).collect();
+    let explicit_names: HashSet<&str> =
+        imports.iter().filter(|i| !i.wildcard).filter_map(|i| i.local_name()).collect();
+
+    let mut index_items: Vec<(ScopeCompletion, u8)> = Vec::new();
+    for e in index.entries_with_prefix(&prefix, true) {
+        if e.path == file {
+            continue;
+        }
+        let already_visible = explicit_names.contains(e.sym.name.as_str())
+            || e.sym.package == pkg
+            || star_pkgs.contains(&e.sym.package)
+            || resolve::is_default_import_pkg(&e.sym.package);
+        let rank = match e.tier {
+            crate::index::Tier::Volatile => 0,
+            crate::index::Tier::Durable => 1,
+        };
+        let import_path = if already_visible {
+            None
+        } else {
+            Some(fqn(&e.sym.package, &e.sym.name))
+        };
+        let mut c = ScopeCompletion::new(e.sym.name.clone(), e.sym.kind);
+        c.tier = e.tier;
+        c.arity = e.sym.arity;
+        c.package = e.sym.package.clone();
+        c.container = e.sym.container.clone();
+        c.import_path = import_path;
+        index_items.push((c, rank));
+    }
+    for imp in &imports {
+        if let Some(alias) = imp.alias.as_deref() {
+            if alias.starts_with(&prefix) {
+                index_items.push((ScopeCompletion::new(alias.to_string(), SymbolKind::Object), 0));
+            }
+        }
+    }
+    for kw in KOTLIN_KEYWORDS {
+        if kw.starts_with(&prefix) {
+            index_items.push((ScopeCompletion::keyword(*kw), 0));
+        }
+    }
+    index_items.sort_by(|a, b| a.0.label.cmp(&b.0.label).then(a.1.cmp(&b.1)));
+    let mut seen: HashSet<String> = items.iter().map(|c| c.label.clone()).collect();
+    for (c, _) in index_items {
+        if seen.insert(c.label.clone()) {
+            items.push(c);
+        }
+    }
+    items.truncate(max_candidates);
+    Some(CompletionQuery {
+        context: complete::CompletionContext::ScopeName,
+        prefix,
+        candidates: items,
+        layout,
+        reasons: Vec::new(),
+    })
 }
 
 fn member_candidates(
@@ -380,6 +506,14 @@ impl Visibility {
     }
 }
 
+const KOTLIN_KEYWORDS: &[&str] = &[
+    "as", "break", "class", "continue", "do", "else", "false", "for", "fun", "if", "in",
+    "interface", "is", "null", "object", "package", "return", "super", "this", "throw", "true",
+    "try", "typealias", "typeof", "val", "var", "when", "while", "import", "private", "public",
+    "protected", "internal", "abstract", "final", "open", "override", "sealed", "data", "enum",
+    "companion", "lateinit", "inline", "suspend", "const",
+];
+
 #[cfg(test)]
 mod tests {
     use crate::parser::{identifier_at, KotlinParser};
@@ -473,6 +607,7 @@ mod tests {
         let mut parser = KotlinParser::new();
         let query = after_dot_query(&ws.index, &mut parser, &src, offset, 1000).expect("after-dot query");
 
+        assert_eq!(query.context_label(), "member");
         assert_eq!(query.prefix, "fe");
         assert!(query.candidates.iter().any(|c| c.label == "fetch"));
         assert!(
@@ -482,6 +617,33 @@ mod tests {
             "{:?}",
             query.candidates.iter().map(|c| (&c.label, &c.import_path)).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn scope_name_query_reports_auto_import_candidates_and_keywords() {
+        let mut ws = Workspace::new();
+        ws.open("Other.kt", "package other\nfun widgetXyz() {}\n".to_string());
+        let src = "package app\nfun main() { wi }\n";
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let offset = src.find("wi }").unwrap() + 2;
+        let query = scope_name_query(&ws.index, "Main.kt", &tree, src, offset, 1000)
+            .expect("scope query");
+
+        assert_eq!(query.context_label(), "scope-name");
+        assert!(query.candidates.iter().any(|c| {
+            c.label == "widgetXyz" && c.import_path.as_deref() == Some("other.widgetXyz")
+        }));
+
+        let kw_src = "fun main() { wh }\n";
+        let kw_tree = parser.parse(kw_src);
+        let kw_offset = kw_src.find("wh }").unwrap() + 2;
+        let kw_query = scope_name_query(&ws.index, "Main.kt", &kw_tree, kw_src, kw_offset, 1000)
+            .expect("keyword query");
+        assert!(kw_query.candidates.iter().any(|c| c.label == "while"));
+        assert!(kw_query.candidates.iter().any(|c| c.label == "when"));
     }
 
     #[test]
