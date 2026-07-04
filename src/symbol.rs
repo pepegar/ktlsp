@@ -86,6 +86,12 @@ pub struct IndexedSymbol {
     /// call count in the presence of varargs and named arguments.
     #[serde(default)]
     pub has_vararg: bool,
+    /// For a `Function` whose final parameter is lambda-eligible, the minimum positional argument
+    /// count accepted when that final parameter is supplied via trailing-lambda syntax. Example:
+    /// `fun f(a: Int = 0, block: () -> Unit)` has `min_arity = 2` for ordinary `f(...)` calls but
+    /// `trailing_lambda_min_arity = 1` for `f { ... }`.
+    #[serde(default)]
+    pub trailing_lambda_min_arity: Option<u8>,
     /// For a `Function` (or property getter): its declared return type, as a [`TypeRef`] carrying
     /// the declaration file's package/import candidates. `None` when there is no explicit return
     /// annotation. Drives `val x = foo()` / chained-call inference.
@@ -132,6 +138,7 @@ impl IndexedSymbol {
             arity: None,
             min_arity: None,
             has_vararg: false,
+            trailing_lambda_min_arity: None,
             return_type: None,
             value_type: None,
             params: Vec::new(),

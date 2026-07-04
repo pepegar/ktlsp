@@ -323,6 +323,23 @@ fn matching_overload_arity_is_not_flagged() {
 }
 
 #[test]
+fn defaults_before_trailing_lambda_are_not_flagged() {
+    let d = complete_diagnostics(
+        r#"
+class Name
+fun span(name: Name = Name(), block: () -> Name) {}
+fun main() {
+    span { Name() }
+}
+"#,
+    );
+    assert!(
+        d.is_empty(),
+        "trailing lambda should allow omitting earlier defaulted params: {d:?}"
+    );
+}
+
+#[test]
 fn wrong_arity_member_call_is_flagged_when_receiver_type_is_known() {
     let d = complete_diagnostics(
         r#"

@@ -246,6 +246,7 @@ fn push_function(
         arity: Some(shape.arity),
         min_arity: Some(shape.min_arity),
         has_vararg: shape.has_vararg,
+        trailing_lambda_min_arity: shape.trailing_lambda_min_arity,
         return_type: return_type_of(decl, src, scope),
         params: param_types_of(decl, src, scope),
         type_params: type_params_of(decl, src),
@@ -264,6 +265,7 @@ struct FunctionShape {
     arity: u8,
     min_arity: u8,
     has_vararg: bool,
+    trailing_lambda_min_arity: Option<u8>,
 }
 
 /// The positional call shape of a `function_declaration`, derived from the named children under
@@ -276,9 +278,14 @@ struct FunctionShape {
 /// proving exact accepted counts; the diagnostic layer declines in that case.
 fn function_shape(decl: Node) -> FunctionShape {
     let Some(params) = child_of_kind(decl, "function_value_parameters") else {
-        return FunctionShape { arity: 0, min_arity: 0, has_vararg: false };
+        return FunctionShape {
+            arity: 0,
+            min_arity: 0,
+            has_vararg: false,
+            trailing_lambda_min_arity: None,
+        };
     };
-    let mut meta: Vec<(bool, bool)> = Vec::new();
+    let mut meta: Vec<(bool, bool, bool)> = Vec::new();
     let mut cursor = params.walk();
     let mut pending_vararg = false;
     let mut has_vararg = false;
@@ -289,7 +296,7 @@ fn function_shape(decl: Node) -> FunctionShape {
                 has_vararg = true;
             }
             "parameter" => {
-                meta.push((false, pending_vararg));
+                meta.push((false, pending_vararg, parameter_accepts_trailing_lambda(child)));
                 pending_vararg = false;
             }
             _ => {
@@ -303,11 +310,34 @@ fn function_shape(decl: Node) -> FunctionShape {
     let min_arity = meta
         .iter()
         .enumerate()
-        .filter_map(|(idx, (has_default, is_vararg))| (!has_default && !is_vararg).then_some(idx + 1))
+        .filter_map(|(idx, (has_default, is_vararg, _))| (!has_default && !is_vararg).then_some(idx + 1))
         .next_back()
         .unwrap_or(0)
         .min(u8::MAX as usize) as u8;
-    FunctionShape { arity, min_arity, has_vararg }
+    let trailing_lambda_min_arity = meta
+        .last()
+        .filter(|(_, is_vararg, is_lambdaish)| !*is_vararg && *is_lambdaish)
+        .map(|_| {
+            let required_prefix = meta[..meta.len().saturating_sub(1)]
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, (has_default, is_vararg, _))| {
+                    (!has_default && !is_vararg).then_some(idx + 1)
+                })
+                .next_back()
+                .unwrap_or(0);
+            (required_prefix + 1).min(u8::MAX as usize) as u8
+        });
+    FunctionShape {
+        arity,
+        min_arity,
+        has_vararg,
+        trailing_lambda_min_arity,
+    }
+}
+
+fn parameter_accepts_trailing_lambda(parameter: Node) -> bool {
+    find_descendant(parameter, "function_type").is_some()
 }
 
 /// Push a type declaration's name with its `supertypes` and formal `type_params`.
@@ -659,6 +689,7 @@ fn push_synthetic_member(
         arity,
         min_arity: arity,
         has_vararg: false,
+        trailing_lambda_min_arity: None,
         return_type,
         value_type,
         params,
@@ -1139,6 +1170,22 @@ object Reg { fun add() {} }
         assert_eq!(collect.arity, Some(2));
         assert_eq!(collect.min_arity, Some(1), "vararg can be omitted");
         assert!(collect.has_vararg);
+        assert_eq!(collect.trailing_lambda_min_arity, None);
+    }
+
+    #[test]
+    fn function_shape_tracks_defaults_before_trailing_lambda() {
+        let src = "fun span(name: String = \"x\", block: () -> Unit) = block()\n";
+        let syms = index(src);
+
+        let span = syms.iter().find(|s| s.name == "span").unwrap();
+        assert_eq!(span.arity, Some(2));
+        assert_eq!(span.min_arity, Some(2), "plain positional call still needs both args");
+        assert_eq!(
+            span.trailing_lambda_min_arity,
+            Some(1),
+            "trailing lambda syntax may omit defaulted params before the lambda"
+        );
     }
 
     #[test]

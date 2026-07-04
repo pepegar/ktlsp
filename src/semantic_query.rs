@@ -14,7 +14,7 @@ use crate::imports::{self, ImportLayout};
 use crate::index::{Entry, Index};
 use crate::infer;
 use crate::knowledge::Knowledge;
-use crate::parser::{identifier_at, node_text, Import, KotlinParser};
+use crate::parser::{child_of_kind, identifier_at, node_text, Import, KotlinParser};
 use crate::resolve::{self, CompletenessFacts, ResolutionStatus, UseKind};
 use crate::symbol::{Def, SymbolKind};
 use crate::symbols::SymbolSummary;
@@ -365,20 +365,18 @@ fn top_level_call_shape_query(
         return None;
     }
     let arg_count = value_arg_count(call);
+    let uses_trailing_lambda = has_trailing_lambda(call);
     let mut arities = entries.iter().filter_map(|entry| entry.sym.arity).collect::<Vec<_>>();
     arities.sort_unstable();
     arities.dedup();
-    if entries.iter().any(|entry| {
-        let min = entry.sym.min_arity.expect("guarded above") as usize;
-        let max = entry.sym.arity.expect("guarded above") as usize;
-        (min..=max).contains(&arg_count)
-    }) {
+    if entries
+        .iter()
+        .any(|entry| call_accepts_arg_count(entry, arg_count, uses_trailing_lambda))
+    {
         let arity_compatible: Vec<&Entry> = entries
             .iter()
             .filter(|entry| {
-                let min = entry.sym.min_arity.expect("guarded above") as usize;
-                let max = entry.sym.arity.expect("guarded above") as usize;
-                (min..=max).contains(&arg_count)
+                call_accepts_arg_count(entry, arg_count, uses_trailing_lambda)
             })
             .collect();
         return argument_type_mismatch_query(index, tree, src, call, symbol, arg_count, arity_compatible);
@@ -417,21 +415,19 @@ fn member_call_shape_query(
         return None;
     }
     let arg_count = value_arg_count(call);
+    let uses_trailing_lambda = has_trailing_lambda(call);
     let mut arities = entries.iter().filter_map(|entry| entry.sym.arity).collect::<Vec<_>>();
     arities.sort_unstable();
     arities.dedup();
-    if entries.iter().any(|entry| {
-        let min = entry.sym.min_arity.expect("guarded above") as usize;
-        let max = entry.sym.arity.expect("guarded above") as usize;
-        (min..=max).contains(&arg_count)
-    }) {
+    if entries
+        .iter()
+        .any(|entry| call_accepts_arg_count(entry, arg_count, uses_trailing_lambda))
+    {
         let arity_compatible: Vec<&Entry> = entries
             .iter()
             .copied()
             .filter(|entry| {
-                let min = entry.sym.min_arity.expect("guarded above") as usize;
-                let max = entry.sym.arity.expect("guarded above") as usize;
-                (min..=max).contains(&arg_count)
+                call_accepts_arg_count(entry, arg_count, uses_trailing_lambda)
             })
             .collect();
         return argument_type_mismatch_query(index, tree, src, call, symbol, arg_count, arity_compatible);
@@ -780,6 +776,23 @@ fn value_arg_count(call: Node) -> usize {
     n
 }
 
+fn has_trailing_lambda(call: Node) -> bool {
+    child_of_kind(call, "annotated_lambda").is_some()
+}
+
+fn call_accepts_arg_count(entry: &Entry, arg_count: usize, uses_trailing_lambda: bool) -> bool {
+    let min = if uses_trailing_lambda {
+        entry
+            .sym
+            .trailing_lambda_min_arity
+            .unwrap_or_else(|| entry.sym.min_arity.expect("guarded above"))
+    } else {
+        entry.sym.min_arity.expect("guarded above")
+    } as usize;
+    let max = entry.sym.arity.expect("guarded above") as usize;
+    (min..=max).contains(&arg_count)
+}
+
 struct Visibility {
     pkg: String,
     star_pkgs: Vec<String>,
@@ -914,6 +927,7 @@ mod tests {
                 arity: Some(1),
                 min_arity: Some(1),
                 has_vararg: false,
+                trailing_lambda_min_arity: None,
                 return_type: None,
                 value_type: None,
                 params: Vec::new(),
@@ -1059,6 +1073,20 @@ mod tests {
         let mut parser = KotlinParser::new();
         let tree = parser.parse(src);
         let call = call_at(&tree, src, "manifest(1)");
+
+        assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
+    }
+
+    #[test]
+    fn call_shape_query_allows_defaults_before_trailing_lambda() {
+        let src = "fun span(name: String = \"x\", block: () -> Unit) {}\nfun main() { span { } }\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "span { }");
 
         assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
     }
