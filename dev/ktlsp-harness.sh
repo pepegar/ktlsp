@@ -13,6 +13,7 @@ scenarios:
   library        generated version-catalog project; goto into kotlin-stdlib sources
   goodnotes      committed GoodNotes-derived semantic probe; chains, apply, and KMP narrowing
   project        existing project health check; requires --root and --file
+  emacs-project  existing project health/perf probe through batch Emacs + Eglot
   gradle-live    dev/gradle-sample live probe; compile diagnostics only if KTLSP_LIVE_COMPILE=1
   gradle-compile same as gradle-live, with KTLSP_LIVE_COMPILE=1
   comprehensive  dev/gradle-sample broad library/project probe
@@ -20,6 +21,8 @@ scenarios:
 options:
   --root DIR       project root for scenarios that accept one
   --file FILE      Kotlin file for the project scenario
+  --needle TEXT    symbol/needle for the Emacs documentHighlight probe
+  --burst N        semanticTokens/full burst size for the Emacs probe
   --bin FILE       ktlsp binary to run
   --release        build/use target/release instead of target/debug
   --no-build       skip cargo build
@@ -41,6 +44,8 @@ fi
 
 root_arg=""
 file_arg=""
+needle_arg="${KTLSP_HARNESS_NEEDLE:-}"
+burst_arg="${KTLSP_HARNESS_BURST:-}"
 bin_arg="${KTLSP_BIN:-}"
 profile="debug"
 build=1
@@ -54,6 +59,14 @@ while [ $# -gt 0 ]; do
       ;;
     --file)
       file_arg="${2:?missing value for --file}"
+      shift 2
+      ;;
+    --needle)
+      needle_arg="${2:?missing value for --needle}"
+      shift 2
+      ;;
+    --burst)
+      burst_arg="${2:?missing value for --burst}"
       shift 2
       ;;
     --bin)
@@ -84,9 +97,16 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-if ! command -v nvim >/dev/null 2>&1; then
-  echo "nvim is required on PATH" >&2
-  exit 2
+if [[ "$scenario" == emacs-* ]]; then
+  if ! command -v emacs >/dev/null 2>&1; then
+    echo "emacs is required on PATH" >&2
+    exit 2
+  fi
+else
+  if ! command -v nvim >/dev/null 2>&1; then
+    echo "nvim is required on PATH" >&2
+    exit 2
+  fi
 fi
 
 if [ -z "$run_dir" ]; then
@@ -260,6 +280,16 @@ case "$scenario" in
       run_status=2
     else
       run_and_capture project nvim -l "$repo/dev/nvim_project.lua" "$root_arg" "$file_arg" "$bin_arg" || run_status=$?
+    fi
+    ;;
+  emacs-project)
+    if [ -z "$root_arg" ] || [ -z "$file_arg" ]; then
+      echo "emacs-project scenario requires --root and --file" >&2
+      run_status=2
+    else
+      run_and_capture emacs-project \
+        emacs --batch -l "$repo/dev/emacs_project.el" -- \
+        "$root_arg" "$file_arg" "$bin_arg" "${needle_arg:-KotlinLogging}" "${burst_arg:-6}" || run_status=$?
     fi
     ;;
   gradle-live)

@@ -327,6 +327,7 @@ dev/ktlsp-harness.sh features
 dev/ktlsp-harness.sh library
 dev/ktlsp-harness.sh goodnotes
 dev/ktlsp-harness.sh project --root /path/to/project --file /path/to/project/src/main/kotlin/App.kt
+dev/ktlsp-harness.sh emacs-project --root /path/to/project --file /path/to/project/src/main/kotlin/App.kt
 KTLSP_LIVE_COMPILE=1 dev/ktlsp-harness.sh gradle-live
 ```
 
@@ -344,6 +345,10 @@ Useful scenarios:
   `apply` receiver typing, and KMP source-set narrowing without depending on the external
   GoodNotes checkout.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.
+- `emacs-project` opens an existing Kotlin file through batch Emacs + Eglot, then measures a
+  small burst of `textDocument/semanticTokens/full`, a `documentHighlight`, and pull diagnostics.
+  Use `--needle` to target the highlight symbol and `--burst` to change the semantic-token burst
+  size. This is the closest harness to a real Emacs session when chasing editor-specific behavior.
 - `gradle-live`, `gradle-compile`, and `comprehensive` exercise `dev/gradle-sample`; compile
   diagnostics remain opt-in because they run Gradle/the sidecar. Stdlib extension goto cases like
   `.let` and `.onFailure` are covered there.

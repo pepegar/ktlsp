@@ -1333,7 +1333,8 @@ fn named_type_params(index: &Index, name: &str, preferred_pkg: &str) -> Option<V
     matches
         .iter()
         .find(|e| e.sym.package == preferred_pkg && e.sym.container.is_none())
-        .or_else(|| (matches.len() == 1).then_some(&matches[0]))
+        .copied()
+        .or_else(|| (matches.len() == 1).then(|| matches[0]))
         .map(|e| e.sym.type_params.clone())
 }
 
@@ -1363,6 +1364,37 @@ fn resolve_type_name(index: &Index, name: &str, ctx: &FileCtx, nullable: bool) -
         package: resolve_package(index, name, ctx),
         nullable,
         args: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::named_type_params;
+    use crate::index::{Index, Tier};
+    use crate::symbol::{IndexedSymbol, SymbolKind};
+
+    #[test]
+    fn named_type_params_returns_none_for_empty_lookup() {
+        let index = Index::new();
+        assert_eq!(named_type_params(&index, "Missing", "demo"), None);
+    }
+
+    #[test]
+    fn named_type_params_prefers_matching_package() {
+        let mut index = Index::new();
+
+        let mut demo = IndexedSymbol::new("Box", SymbolKind::Class, "demo", None, 0, 3);
+        demo.type_params = vec!["T".to_string()];
+        index.replace_file("demo.kt", vec![demo], Tier::Volatile);
+
+        let mut other = IndexedSymbol::new("Box", SymbolKind::Class, "other", None, 0, 3);
+        other.type_params = vec!["U".to_string()];
+        index.replace_file("other.kt", vec![other], Tier::Volatile);
+
+        assert_eq!(
+            named_type_params(&index, "Box", "demo"),
+            Some(vec!["T".to_string()])
+        );
     }
 }
 
