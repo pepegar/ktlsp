@@ -61,6 +61,9 @@ pub fn compute(src: &str, tree: &Tree) -> Vec<Diagnostic> {
     if !syntax.is_empty() {
         return syntax;
     }
+    if tree.root_node().has_error() {
+        return Vec::new();
+    }
     let mut out = unused_imports(tree, src);
     out.extend(duplicate_declarations(tree, src));
     out
@@ -78,14 +81,7 @@ fn syntax_errors(tree: &Tree, src: &str) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     collect_syntax_errors(root, src, &mut out);
     if out.is_empty() {
-        let (start_byte, end_byte) = diagnostic_range(src, root.start_byte(), root.end_byte());
-        out.push(Diagnostic {
-            start_byte,
-            end_byte,
-            severity: Severity::Error,
-            code: Some(DiagnosticCode::SyntaxError),
-            message: "Syntax error".to_string(),
-        });
+        return Vec::new();
     }
     out
 }
@@ -104,6 +100,9 @@ fn collect_syntax_errors(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
     }
 
     if node.is_error() {
+        if ancestor_has_newline_generic_call_ambiguity(node, src) {
+            return;
+        }
         let (start_byte, end_byte) = diagnostic_range(src, node.start_byte(), node.end_byte());
         out.push(Diagnostic {
             start_byte,
@@ -123,6 +122,61 @@ fn collect_syntax_errors(node: Node, src: &str, out: &mut Vec<Diagnostic>) {
     for child in node.children(&mut cursor) {
         collect_syntax_errors(child, src, out);
     }
+}
+
+fn ancestor_has_newline_generic_call_ambiguity(node: Node, src: &str) -> bool {
+    let mut current = Some(node);
+    while let Some(n) = current {
+        if n.kind() == "property_declaration" && looks_like_newline_generic_call_ambiguity(n, src) {
+            return true;
+        }
+        current = n.parent();
+    }
+    false
+}
+
+fn looks_like_newline_generic_call_ambiguity(node: Node, src: &str) -> bool {
+    let text = node_text(node, src);
+    if !text.contains('\n') || !text.contains('=') {
+        return false;
+    }
+    text.lines().skip(1).map(str::trim_start).any(looks_like_generic_call_start)
+}
+
+fn looks_like_generic_call_start(line: &str) -> bool {
+    let mut chars = line.chars().peekable();
+    let Some(first) = chars.peek().copied() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.next();
+    while let Some(ch) = chars.peek().copied() {
+        if ch == '_' || ch.is_ascii_alphanumeric() {
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if chars.next() != Some('<') {
+        return false;
+    }
+    let mut depth = 1usize;
+    while let Some(ch) = chars.next() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                depth -= 1;
+                if depth == 0 {
+                    return matches!(chars.peek(), Some('(') | Some('.'));
+                }
+            }
+            '\n' => return false,
+            _ => {}
+        }
+    }
+    false
 }
 
 fn diagnostic_range(src: &str, start: usize, end: usize) -> (usize, usize) {
@@ -548,6 +602,26 @@ mod tests {
         assert!(
             d.iter().all(|diag| diag.start_byte < diag.end_byte),
             "zero-width parser errors should be expanded to a visible range: {d:?}"
+        );
+    }
+
+    #[test]
+    fn suppresses_generic_call_newline_ambiguity_false_positive() {
+        let src = "fun t() {\n  val injected = AtomicBoolean(false)\n  get<Foo>().bar.add { x -> x }\n}\n";
+        let d = diags(src);
+        assert!(
+            d.is_empty(),
+            "newline-separated generic call should not surface a syntax diagnostic: {d:?}"
+        );
+    }
+
+    #[test]
+    fn suppressed_parse_ambiguity_does_not_run_semantic_diagnostics() {
+        let src = "import a.b.Helper\nfun t() {\n  val injected = AtomicBoolean(false)\n  get<Foo>().bar.add { x -> Helper() }\n}\n";
+        let d = diags(src);
+        assert!(
+            d.is_empty(),
+            "suppressed parser ambiguity should not emit follow-on semantic diagnostics: {d:?}"
         );
     }
 }

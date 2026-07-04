@@ -325,10 +325,17 @@ pub fn call_shape_query(
     if call.kind() != "call_expression" {
         return None;
     }
-    let callee = call.named_child(0)?;
+    let normalized = outer_trailing_lambda_call(call);
+    if normalized != call {
+        return None;
+    }
+    if uses_named_arguments(normalized) {
+        return None;
+    }
+    let callee = callable_callee(normalized)?;
     match callee.kind() {
-        "identifier" => top_level_call_shape_query(index, file, tree, src, call, callee),
-        "navigation_expression" => member_call_shape_query(index, tree, src, call, callee),
+        "identifier" => top_level_call_shape_query(index, file, tree, src, normalized, callee),
+        "navigation_expression" => member_call_shape_query(index, tree, src, normalized, callee),
         _ => None,
     }
 }
@@ -346,10 +353,11 @@ fn top_level_call_shape_query(
         return None;
     }
     let defs = resolve::goto(index, file, src, tree, ident.start_byte());
-    let entries = defs
+    let mut entries = defs
         .into_iter()
         .filter_map(|def| hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte))
         .collect::<Vec<_>>();
+    entries = expand_same_file_function_overloads(index, file, &symbol, entries);
     if entries.is_empty() {
         return None;
     }
@@ -666,6 +674,44 @@ fn argument_type_mismatch_query(
     Some(CallShapeQuery { symbol, arg_count, arities: Vec::new(), argument_types: Some(labels) })
 }
 
+fn expand_same_file_function_overloads(
+    index: &Index,
+    file: &str,
+    symbol: &str,
+    entries: Vec<Entry>,
+) -> Vec<Entry> {
+    let Some(seed) = entries
+        .iter()
+        .find(|entry| entry.path == file && entry.sym.kind == SymbolKind::Function)
+    else {
+        return entries;
+    };
+    let mut expanded = index
+        .lookup_by_name(symbol)
+        .iter()
+        .filter(|entry| {
+            entry.path == file
+                && entry.sym.kind == SymbolKind::Function
+                && entry.sym.container == seed.sym.container
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if expanded.is_empty() {
+        entries
+    } else {
+        expanded.sort_by(|a, b| {
+            a.sym.container
+                .cmp(&b.sym.container)
+                .then(a.sym.start_byte.cmp(&b.sym.start_byte))
+                .then(a.sym.end_byte.cmp(&b.sym.end_byte))
+        });
+        expanded.dedup_by(|a, b| {
+            a.path == b.path && a.sym.start_byte == b.sym.start_byte && a.sym.end_byte == b.sym.end_byte
+        });
+        expanded
+    }
+}
+
 fn synth_arg_types(index: &Index, call: Node, src: &str, ctx: &infer::FileCtx) -> Vec<Type> {
     let mut out = Vec::new();
     let va = if let Some(va) = call.child_by_field_name("valueArguments") {
@@ -764,20 +810,19 @@ fn value_arg_count(call: Node) -> usize {
                     .named_children(&mut args_cursor)
                     .filter(|x| x.kind() == "value_argument")
                     .count();
+            } else if child.kind() == "call_expression" && n == 0 {
+                n += value_arg_count(child);
             }
         }
     }
-    if call
-        .named_child(call.named_child_count().saturating_sub(1))
-        .is_some_and(|child| child.kind() == "annotated_lambda")
-    {
+    if has_trailing_lambda(call) {
         n += 1;
     }
     n
 }
 
 fn has_trailing_lambda(call: Node) -> bool {
-    child_of_kind(call, "annotated_lambda").is_some()
+    child_of_kind(call, "annotated_lambda").is_some() || child_of_kind(call, "lambda_literal").is_some()
 }
 
 fn call_accepts_arg_count(entry: &Entry, arg_count: usize, uses_trailing_lambda: bool) -> bool {
@@ -791,6 +836,50 @@ fn call_accepts_arg_count(entry: &Entry, arg_count: usize, uses_trailing_lambda:
     } as usize;
     let max = entry.sym.arity.expect("guarded above") as usize;
     (min..=max).contains(&arg_count)
+}
+
+fn outer_trailing_lambda_call(mut call: Node) -> Node {
+    while let Some(parent) = call.parent() {
+        if parent.kind() == "call_expression"
+            && parent.named_child(0) == Some(call)
+            && has_trailing_lambda(parent)
+        {
+            call = parent;
+        } else {
+            break;
+        }
+    }
+    call
+}
+
+fn callable_callee(mut call: Node) -> Option<Node> {
+    loop {
+        let callee = call.named_child(0)?;
+        if callee.kind() == "call_expression" {
+            call = callee;
+        } else {
+            return Some(callee);
+        }
+    }
+}
+
+fn uses_named_arguments(call: Node) -> bool {
+    if let Some(args) = child_of_kind(call, "value_arguments") {
+        let mut cursor = args.walk();
+        for arg in args.named_children(&mut cursor) {
+            if arg.kind() != "value_argument" {
+                continue;
+            }
+            let count = arg.named_child_count();
+            if count >= 2 && arg.named_child(0).is_some_and(|child| child.kind() == "identifier") {
+                return true;
+            }
+        }
+        return false;
+    }
+    call.named_child(0)
+        .filter(|child| child.kind() == "call_expression")
+        .is_some_and(uses_named_arguments)
 }
 
 struct Visibility {
@@ -1087,6 +1176,48 @@ mod tests {
         let mut parser = KotlinParser::new();
         let tree = parser.parse(src);
         let call = call_at(&tree, src, "span { }");
+
+        assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
+    }
+
+    #[test]
+    fn call_shape_query_allows_trailing_lambda_on_wrapped_call_expression() {
+        let src = "fun throttleDelay(a: Int, b: Int, c: Int, d: Int, block: () -> Unit) {}\nfun main() { throttleDelay(1, 2, 3, 4) { } }\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "throttleDelay(1, 2, 3, 4) { }");
+
+        assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
+    }
+
+    #[test]
+    fn call_shape_query_declines_named_argument_calls() {
+        let src = "fun buildNote(noteId: String, parentId: String? = null, modifiedId: String? = null, modifiedParentId: String? = null) {}\nfun main() { buildNote(noteId = \"a\", modifiedId = \"b\") }\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "buildNote(noteId = \"a\", modifiedId = \"b\")");
+
+        assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
+    }
+
+    #[test]
+    fn call_shape_query_uses_same_file_overload_set_for_members() {
+        let src = "class Service {\n    fun executeWebhook(info: String, isNew: Boolean) {}\n    private fun executeWebhook(info: Int) {}\n    fun run() { executeWebhook(1) }\n}\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "executeWebhook(1)");
 
         assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
     }
