@@ -268,17 +268,35 @@ impl DuplicateKind {
 struct Binding {
     kind: DuplicateKind,
     name: String,
+    signature: String,
     start_byte: usize,
     end_byte: usize,
 }
 
 impl Binding {
     fn new(kind: DuplicateKind, node: Node, src: &str) -> Self {
+        let name = node_text(node, src).to_string();
         Binding {
             kind,
-            name: node_text(node, src).to_string(),
+            signature: name.clone(),
+            name,
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
+        }
+    }
+
+    fn property(decl: Node, name: Node, src: &str) -> Self {
+        let name_text = node_text(name, src).to_string();
+        let signature = match property_extension_receiver(decl, src) {
+            Some(receiver) => format!("{name_text}@{receiver}"),
+            None => name_text.clone(),
+        };
+        Binding {
+            kind: DuplicateKind::Property,
+            name: name_text,
+            signature,
+            start_byte: name.start_byte(),
+            end_byte: name.end_byte(),
         }
     }
 }
@@ -291,7 +309,8 @@ fn check_scope(
 ) {
     let mut seen: HashMap<(DuplicateKind, String), Binding> = HashMap::new();
     for binding in seeded {
-        seen.entry((binding.kind, binding.name.clone())).or_insert(binding);
+        seen.entry((binding.kind, binding.signature.clone()))
+            .or_insert(binding);
     }
 
     let mut cursor = scope.walk();
@@ -309,7 +328,7 @@ fn scope_bindings(node: Node, src: &str) -> Vec<Binding> {
             .unwrap_or_default(),
         "property_declaration" => property_name_nodes(node)
             .into_iter()
-            .map(|name| Binding::new(DuplicateKind::Property, name, src))
+            .map(|name| Binding::property(node, name, src))
             .collect(),
         "enum_entry" => first_ident(node)
             .map(|name| vec![Binding::new(DuplicateKind::EnumEntry, name, src)])
@@ -323,7 +342,7 @@ fn record_duplicate(
     binding: Binding,
     out: &mut Vec<Diagnostic>,
 ) {
-    let key = (binding.kind, binding.name.clone());
+    let key = (binding.kind, binding.signature.clone());
     if seen.contains_key(&key) {
         out.push(Diagnostic {
             start_byte: binding.start_byte,
@@ -468,6 +487,36 @@ fn property_name_nodes(node: Node) -> Vec<Node> {
         }
     }
     out
+}
+
+fn property_extension_receiver(decl: Node, src: &str) -> Option<String> {
+    let mut cursor = decl.walk();
+    for child in decl.named_children(&mut cursor) {
+        match child.kind() {
+            "variable_declaration" => return None,
+            "user_type" => return first_ident(child).map(|id| node_text(id, src).to_string()),
+            "nullable_type" => {
+                return find_descendant(child, "user_type")
+                    .and_then(first_ident)
+                    .map(|id| node_text(id, src).to_string())
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn find_descendant<'t>(node: Node<'t>, kind: &str) -> Option<Node<'t>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if let Some(found) = find_descendant(child, kind) {
+            return Some(found);
+        }
+    }
+    None
 }
 
 fn has_child_token(node: Node, token: &str) -> bool {

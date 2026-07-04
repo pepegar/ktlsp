@@ -141,6 +141,35 @@ class Account(val id: String) {
 }
 
 #[test]
+fn member_extension_property_does_not_conflict_with_plain_property() {
+    let src = r#"
+class C {
+    val asPresentableStringWithoutSensitiveInfo: String = ""
+
+    private val String.asPresentableStringWithoutSensitiveInfo: String
+        get() = this
+}
+"#;
+    assert!(diagnostics(src).is_empty());
+}
+
+#[test]
+fn duplicate_extension_property_with_same_receiver_is_flagged() {
+    let src = r#"
+class C {
+    val String.id: String
+        get() = this
+
+    val String.id: Int
+        get() = length
+}
+"#;
+    let m = messages(src);
+    assert_eq!(m.len(), 1);
+    assert!(m[0].contains("Duplicate property: id"));
+}
+
+#[test]
 fn duplicate_function_parameter_is_flagged() {
     let m = messages("fun rename(name: String, name: String) {}\n");
     assert_eq!(m.len(), 1);
