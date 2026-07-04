@@ -70,10 +70,16 @@ fn infer_depth(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize
         // Defensive: should the grammar ever expose a boolean_literal kind.
         "boolean_literal" => resolve_type_name(index, "Boolean", ctx, false),
         "identifier" => infer_identifier(index, node, src, ctx, depth),
-        "this_expression" => match resolve::enclosing_type_name(node, src) {
-            Some(name) => resolve_type_name(index, &name, ctx, false),
-            None => Type::Unknown,
-        },
+        "this_expression" => {
+            if let Some(t) = lambda_receiver_type(index, node, src, ctx, depth) {
+                t
+            } else {
+                match resolve::enclosing_type_name(node, src) {
+                    Some(name) => resolve_type_name(index, &name, ctx, false),
+                    None => Type::Unknown,
+                }
+            }
+        }
         "parenthesized_expression" => match node.named_child(0) {
             Some(inner) => infer_depth(index, inner, src, ctx, depth + 1),
             None => Type::Unknown,
@@ -392,6 +398,31 @@ const ELEMENT_LAMBDA_OPS: &[&str] = &[
     "collect", "collectIndexed", "forEachIndexed", "fold", "reduce", "maxOf", "minOf", "withIndex",
 ];
 
+/// Scope-style operations whose trailing lambda binds `this` to the receiver.
+const RECEIVER_LAMBDA_OPS: &[&str] = &["apply", "run", "runCatching"];
+
+/// Operations whose generic return type is determined by the trailing lambda's result.
+const RETURN_BINDING_LAMBDA_OPS: &[&str] = &["let", "map", "mapCatching", "run", "runCatching"];
+
+/// The type of `this` inside a receiver-style scope lambda such as `recv.apply { this }`
+/// or `recv.run { this }`.
+fn lambda_receiver_type(
+    index: &Index,
+    this_expr: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    let mut cur = this_expr.parent();
+    while let Some(n) = cur {
+        if n.kind() == "lambda_literal" {
+            return lambda_receiver_for_this(index, n, src, ctx, depth);
+        }
+        cur = n.parent();
+    }
+    None
+}
+
 /// The type of a lambda parameter `name` (implicit `it` OR a named param like `{ user -> … }`) inside
 /// the trailing lambda of a scope/collection call:
 /// - `recv.let { … }` / `recv.also { … }` → the parameter is `recv`'s type.
@@ -476,6 +507,34 @@ fn lambda_receiver_or_element(
         }
     } else {
         None
+    }
+}
+
+/// Given a `lambda_literal` that is the trailing lambda of a receiver-style scope call, return the
+/// type that `this` refers to inside the lambda body.
+fn lambda_receiver_for_this(
+    index: &Index,
+    lambda: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    let call = lambda.parent()?.parent()?; // lambda_literal -> annotated_lambda -> call_expression
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let callee = call.named_child(0)?;
+    match callee.kind() {
+        "navigation_expression" => {
+            let recv = callee.named_child(0)?;
+            let sel = node_text(callee.named_child(1)?, src);
+            if !RECEIVER_LAMBDA_OPS.contains(&sel) {
+                return None;
+            }
+            let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
+            recv_ty.name().is_some().then_some(recv_ty)
+        }
+        _ => None,
     }
 }
 
@@ -654,6 +713,17 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
                         solve::unify_into(last, a, &tset, &mut subst);
                     }
                 }
+                bind_lambda_return_type(
+                    index,
+                    cname,
+                    node,
+                    src,
+                    ctx,
+                    &ret_tr,
+                    &tset,
+                    &mut subst,
+                    depth,
+                );
                 return resolve_with_subst(index, &ret_tr, ctx, &tset, &subst, depth);
             }
             Type::Unknown
@@ -672,6 +742,8 @@ fn infer_call(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: usize)
                 true,
                 Some(value_arg_count(node)),
                 Some(&arg_types),
+                Some(node),
+                src,
                 ctx,
                 depth,
             )
@@ -868,6 +940,9 @@ fn resolve_with_subst(
     subst: &HashMap<String, Type>,
     depth: usize,
 ) -> Type {
+    if let Some(bound) = subst.get(&tr.name) {
+        return bound.clone();
+    }
     if tparams.contains(&tr.name) {
         return subst.get(&tr.name).cloned().unwrap_or(Type::Unknown);
     }
@@ -908,7 +983,7 @@ fn infer_navigation(index: &Index, node: Node, src: &str, ctx: &FileCtx, depth: 
         return Type::Unknown;
     };
     let recv_ty = infer_depth(index, recv, src, ctx, depth + 1);
-    member_type(index, &recv_ty, node_text(sel, src), false, None, None, ctx, depth)
+    member_type(index, &recv_ty, node_text(sel, src), false, None, None, None, src, ctx, depth)
 }
 
 /// The type of member `name` accessed on receiver type `recv_ty`. Resolves overloads as a Kotlin-style
@@ -926,6 +1001,8 @@ fn member_type(
     want_function: bool,
     arg_count: Option<usize>,
     arg_types: Option<&[Type]>,
+    call: Option<Node>,
+    src: &str,
     ctx: &FileCtx,
     depth: usize,
 ) -> Type {
@@ -1003,7 +1080,7 @@ fn member_type(
             Some(tr) => tr,
             None => continue,
         };
-        let t = substitute_type_var(index, recv_ty, e, tr, ctx, depth + 1)
+        let t = resolve_member_type_with_subst(index, recv_ty, e, name, tr, call, src, ctx, depth + 1)
             .unwrap_or_else(|| resolve_type_ref(index, tr, ctx, depth + 1));
         match &result {
             None => result = Some(t),
@@ -1012,6 +1089,28 @@ fn member_type(
         }
     }
     result.unwrap_or(Type::Unknown)
+}
+
+fn resolve_member_type_with_subst(
+    index: &Index,
+    recv_ty: &Type,
+    entry: &Entry,
+    op_name: &str,
+    tr: &TypeRef,
+    call: Option<Node>,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    let mut subst = receiver_type_bindings(index, recv_ty, entry)?;
+    let tparams: HashSet<String> = entry.sym.type_params.iter().cloned().collect();
+    if let Some(call) = call {
+        bind_lambda_return_type(index, op_name, call, src, ctx, tr, &tparams, &mut subst, depth);
+    }
+    if subst.is_empty() {
+        return None;
+    }
+    Some(resolve_with_subst(index, tr, ctx, &tparams, &subst, depth + 1))
 }
 
 fn generic_receiver_extensions<'a>(
@@ -1082,6 +1181,16 @@ fn args_consistent(
     true
 }
 
+pub fn argument_types_consistent(
+    index: &Index,
+    params: &[TypeRef],
+    type_params: &[String],
+    args: &[Type],
+    ctx: &FileCtx,
+) -> bool {
+    args_consistent(index, params, type_params, args, ctx, 0)
+}
+
 /// Gradual consistency of an actual argument type with a formal parameter type: an `Unknown` on either
 /// side is consistent; an exact head match is consistent; an actual that is a subtype of the formal is
 /// consistent; otherwise inconsistent.
@@ -1119,28 +1228,90 @@ fn is_subtype(index: &Index, name: &str, pkg: Option<&str>, target: &str) -> boo
 /// `List<Foo>.first(): T` -> Foo. Deliberately conservative: requiring a single argument and an
 /// unresolvable name means it can never pick the wrong argument of a `Map<K, V>` (two args ->
 /// skipped -> Unknown -> silent omission), preserving the no-wrong-completion contract.
-fn substitute_type_var(
-    index: &Index,
-    recv_ty: &Type,
-    entry: &Entry,
-    tr: &TypeRef,
-    ctx: &FileCtx,
-    depth: usize,
-) -> Option<Type> {
-    let subst = receiver_type_bindings(index, recv_ty, entry)?;
-    if subst.is_empty() {
-        return None;
-    }
-    let tparams: HashSet<String> = subst.keys().cloned().collect();
-    Some(resolve_with_subst(index, tr, ctx, &tparams, &subst, depth + 1))
-}
-
 fn receiver_type_bindings(index: &Index, recv_ty: &Type, entry: &Entry) -> Option<HashMap<String, Type>> {
     let type_params = receiver_type_params(index, recv_ty, entry)?;
     if type_params.len() != recv_ty.args().len() {
         return None;
     }
     Some(type_params.into_iter().zip(recv_ty.args().iter().cloned()).collect())
+}
+
+fn bind_lambda_return_type(
+    index: &Index,
+    op_name: &str,
+    call: Node,
+    src: &str,
+    ctx: &FileCtx,
+    ret_tr: &TypeRef,
+    tparams: &HashSet<String>,
+    subst: &mut HashMap<String, Type>,
+    depth: usize,
+) {
+    if !RETURN_BINDING_LAMBDA_OPS.contains(&op_name) {
+        return;
+    }
+    let Some(lambda_ty) = trailing_lambda_result_type(index, call, src, ctx, depth) else {
+        return;
+    };
+    if lambda_ty.name().is_none() {
+        return;
+    }
+    let mut needed = Vec::new();
+    collect_unbound_return_type_params(ret_tr, tparams, subst, &mut needed);
+    needed.sort();
+    needed.dedup();
+    if needed.len() == 1 {
+        subst.entry(needed[0].clone()).or_insert(lambda_ty);
+    }
+}
+
+fn collect_unbound_return_type_params(
+    tr: &TypeRef,
+    tparams: &HashSet<String>,
+    subst: &HashMap<String, Type>,
+    out: &mut Vec<String>,
+) {
+    if tparams.contains(&tr.name) && !subst.contains_key(&tr.name) {
+        out.push(tr.name.clone());
+    }
+    for arg in &tr.args {
+        collect_unbound_return_type_params(arg, tparams, subst, out);
+    }
+}
+
+fn trailing_lambda_result_type(
+    index: &Index,
+    call: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    let annotated = child_of_kind(call, "annotated_lambda")?;
+    let lambda = child_of_kind(annotated, "lambda_literal")?;
+    let expr = lambda_tail_expr(lambda)?;
+    Some(infer_depth(index, expr, src, ctx, depth + 1))
+}
+
+fn lambda_tail_expr(lambda: Node) -> Option<Node> {
+    let mut cursor = lambda.walk();
+    let mut tail = None;
+    for child in lambda.named_children(&mut cursor) {
+        if child.kind() == "lambda_parameters" {
+            continue;
+        }
+        tail = Some(child);
+    }
+    let tail = tail?;
+    if tail.kind() == "statements" {
+        let mut cursor = tail.walk();
+        let mut stmt = None;
+        for child in tail.named_children(&mut cursor) {
+            stmt = Some(child);
+        }
+        stmt
+    } else {
+        Some(tail)
+    }
 }
 
 fn receiver_type_params(index: &Index, recv_ty: &Type, entry: &Entry) -> Option<Vec<String>> {

@@ -14,6 +14,8 @@
 //! selector resolves only if its name is unique in the index — an editor prefers no result over
 //! several wrong ones.
 
+use std::collections::{BTreeMap, BTreeSet};
+
 use tree_sitter::{Node, Tree};
 
 use crate::index::{Entry, Index};
@@ -23,14 +25,19 @@ use crate::parser::{
     child_of_kind, class_kind, first_ident, identifier_at, imports_of, name_field, node_text,
     package_of, Import,
 };
+use crate::project_model::{self, ProjectPackageScope};
 use crate::symbol::{Def, SymbolKind};
 
 /// Coarse index/source completeness facts used only for negative diagnostics. These are deliberately
 /// separate from the symbol index: an empty lookup proves absence only when the caller knows the
 /// relevant source worlds have been indexed cleanly.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CompletenessFacts {
     pub project_scan_complete: bool,
+    pub project_packages_complete: BTreeSet<String>,
+    pub project_scoped_packages_complete: BTreeSet<ProjectPackageScope>,
+    pub project_packages_with_unknown_scope: BTreeSet<String>,
+    pub project_package_modules: BTreeMap<String, BTreeSet<String>>,
     pub library_index_complete: bool,
     pub jdk_index_complete: bool,
 }
@@ -39,6 +46,10 @@ impl CompletenessFacts {
     pub fn complete() -> Self {
         Self {
             project_scan_complete: true,
+            project_packages_complete: BTreeSet::new(),
+            project_scoped_packages_complete: BTreeSet::new(),
+            project_packages_with_unknown_scope: BTreeSet::new(),
+            project_package_modules: BTreeMap::new(),
             library_index_complete: true,
             jdk_index_complete: true,
         }
@@ -48,6 +59,7 @@ impl CompletenessFacts {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum IncompletenessReason {
     ProjectPackageIncomplete(String),
+    ProjectSourceSetPackageIncomplete(ProjectPackageScope),
     LibraryPackageIncomplete(String),
     JdkPackageIncomplete(String),
     NotSimpleTypeName,
@@ -66,6 +78,9 @@ impl IncompletenessReason {
         match self {
             IncompletenessReason::ProjectPackageIncomplete(pkg) => {
                 format!("project-package-incomplete:{pkg}")
+            }
+            IncompletenessReason::ProjectSourceSetPackageIncomplete(scope) => {
+                format!("project-source-set-package-incomplete:{}", scope.label())
             }
             IncompletenessReason::LibraryPackageIncomplete(pkg) => {
                 format!("library-package-incomplete:{pkg}")
@@ -126,10 +141,11 @@ pub(crate) fn use_kind(usage: Node) -> UseKind {
 
 pub fn reference_status(
     index: &Index,
+    file: &str,
     tree: &Tree,
     src: &str,
     usage: Node,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> ResolutionStatus<()> {
     if usage.kind() != "identifier" {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleName]);
@@ -138,7 +154,7 @@ pub fn reference_status(
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
     }
     match use_kind(usage) {
-        UseKind::Type => simple_type_name_status(index, tree, src, usage, facts),
+        UseKind::Type => simple_type_name_status(index, file, tree, src, usage, facts),
         UseKind::Call | UseKind::Value => {
             if is_navigation_receiver(usage) {
                 return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
@@ -146,9 +162,9 @@ pub fn reference_status(
             if !is_simple_identifier(usage) {
                 return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleName]);
             }
-            simple_name_status(index, tree, src, usage, use_kind(usage), facts)
+            simple_name_status(index, file, tree, src, usage, use_kind(usage), facts)
         }
-        UseKind::MemberSelector => member_name_status(index, tree, src, usage, facts),
+        UseKind::MemberSelector => member_name_status(index, file, tree, src, usage, facts),
     }
 }
 
@@ -164,10 +180,11 @@ pub fn reference_status(
 /// unsure; diagnostics need a proof boundary for the negative case.
 pub fn simple_type_name_status(
     index: &Index,
+    file: &str,
     tree: &Tree,
     src: &str,
     usage: Node,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> ResolutionStatus<()> {
     if use_kind(usage) != UseKind::Type {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotTypePosition]);
@@ -175,7 +192,7 @@ pub fn simple_type_name_status(
     if !is_simple_user_type_identifier(usage, src) {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleTypeName]);
     }
-    simple_name_status(index, tree, src, usage, UseKind::Type, facts)
+    simple_name_status(index, file, tree, src, usage, UseKind::Type, facts)
 }
 
 fn is_simple_user_type_identifier(usage: Node, src: &str) -> bool {
@@ -228,11 +245,12 @@ fn has_ancestor_kind(node: Node<'_>, kinds: &[&str]) -> bool {
 
 fn simple_name_status(
     index: &Index,
+    file: &str,
     tree: &Tree,
     src: &str,
     usage: Node,
     uk: UseKind,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> ResolutionStatus<()> {
     let name = node_text(usage, src);
     if local_decl(usage, name, uk, src).is_some() {
@@ -242,7 +260,7 @@ fn simple_name_status(
         return ResolutionStatus::Found(());
     }
 
-    let reasons = visible_package_reasons(tree, src, name, facts);
+    let reasons = visible_package_reasons(file, tree, src, name, facts);
     if reasons.is_empty() {
         ResolutionStatus::DefinitelyAbsent
     } else {
@@ -252,10 +270,11 @@ fn simple_name_status(
 
 fn member_name_status(
     index: &Index,
+    file: &str,
     tree: &Tree,
     src: &str,
     usage: Node,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> ResolutionStatus<()> {
     let name = node_text(usage, src);
     if !resolve_member(index, usage, name, src, tree).is_empty() {
@@ -280,7 +299,7 @@ fn member_name_status(
     };
 
     let mut reasons = hierarchy_package_reasons(index, root, root_pkg, facts);
-    reasons.extend(visible_package_reasons(tree, src, name, facts));
+    reasons.extend(visible_package_reasons(file, tree, src, name, facts));
     dedup_reasons(&mut reasons);
     if reasons.is_empty() {
         ResolutionStatus::DefinitelyAbsent
@@ -293,7 +312,7 @@ fn hierarchy_package_reasons(
     index: &Index,
     root: &str,
     root_pkg: &str,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> Vec<IncompletenessReason> {
     let mut reasons = Vec::new();
     let mut visited = std::collections::HashSet::new();
@@ -312,7 +331,7 @@ fn hierarchy_package_reasons(
             continue;
         }
         for entry in &entries {
-            package_world_reasons(&pkg, Some(*entry), root_pkg, facts, &mut reasons);
+            package_world_reasons(&pkg, Some(*entry), &entry.path, root_pkg, facts, &mut reasons);
         }
         for sup in index.supertypes_of_in(&name, Some(&pkg)) {
             let sup_pkg = if index.lookup_type(&sup).iter().any(|e| e.sym.package == pkg) {
@@ -328,10 +347,11 @@ fn hierarchy_package_reasons(
 }
 
 fn visible_package_reasons(
+    file: &str,
     tree: &Tree,
     src: &str,
     local_name: &str,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> Vec<IncompletenessReason> {
     let imports = imports_of(tree, src);
     let current_pkg = package_of(tree, src);
@@ -352,7 +372,7 @@ fn visible_package_reasons(
         push_visible_package(&mut visible_pkgs, (*pkg).to_string());
     }
     for pkg in visible_pkgs {
-        package_world_reasons(&pkg, None, &current_pkg, facts, &mut reasons);
+        package_world_reasons(&pkg, None, file, &current_pkg, facts, &mut reasons);
     }
     dedup_reasons(&mut reasons);
     reasons
@@ -367,8 +387,9 @@ fn push_visible_package(out: &mut Vec<String>, package: String) {
 fn package_world_reasons(
     package: &str,
     entry: Option<&Entry>,
+    current_file: &str,
     current_file_pkg: &str,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
     out: &mut Vec<IncompletenessReason>,
 ) {
     let from_project = entry
@@ -383,13 +404,46 @@ fn package_world_reasons(
         .unwrap_or(!from_project && !from_jdk);
 
     if from_project && !facts.project_scan_complete {
-        out.push(IncompletenessReason::ProjectPackageIncomplete(package.to_string()));
+        if entry.is_none() && package == current_file_pkg {
+            if let Some(reasons) = source_set_package_reasons(package, current_file, facts) {
+                out.extend(reasons);
+                return;
+            }
+        }
+        if !facts.project_packages_complete.contains(package) {
+            out.push(IncompletenessReason::ProjectPackageIncomplete(package.to_string()));
+        }
     }
     if from_library && !facts.library_index_complete {
         out.push(IncompletenessReason::LibraryPackageIncomplete(package.to_string()));
     }
     if from_jdk && !facts.jdk_index_complete {
         out.push(IncompletenessReason::JdkPackageIncomplete(package.to_string()));
+    }
+}
+
+fn source_set_package_reasons(
+    package: &str,
+    current_file: &str,
+    facts: &CompletenessFacts,
+) -> Option<Vec<IncompletenessReason>> {
+    let current_scope = project_model::project_scope_for_path(current_file)?;
+    if facts.project_packages_with_unknown_scope.contains(package) {
+        return None;
+    }
+    let package_modules = facts.project_package_modules.get(package)?;
+    if package_modules.len() != 1 || !package_modules.contains(&current_scope.module) {
+        return None;
+    }
+    let missing = project_model::related_package_scopes(&current_scope, package)
+        .into_iter()
+        .filter(|scope| !facts.project_scoped_packages_complete.contains(scope))
+        .map(IncompletenessReason::ProjectSourceSetPackageIncomplete)
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Some(Vec::new())
+    } else {
+        Some(missing)
     }
 }
 

@@ -251,6 +251,46 @@ fun probe(user: User) {
 }
 
 #[test]
+fn missing_member_after_result_chain_is_flagged_when_world_is_closed() {
+    let d = complete_workspace_diagnostics(
+        &[
+            (
+                "Stdlib.kt",
+                r#"
+package kotlin
+
+class Throwable
+class String
+class Result<T>
+
+fun <R> runCatching(block: () -> R): Result<R> = TODO()
+fun <T> Result<T>.onFailure(action: (Throwable) -> Unit): Result<T> = this
+fun <T> Result<T>.getOrThrow(): T = TODO()
+"#,
+            ),
+            (
+                "Main.kt",
+                r#"
+package app
+
+data class Account(val email: String)
+
+fun account(): Account = Account("")
+
+fun probe() {
+    runCatching { account() }.onFailure { }.getOrThrow().missingMember
+}
+"#,
+            ),
+        ],
+        "Main.kt",
+    );
+    assert_eq!(d.len(), 1, "expected one unresolved member diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::UnresolvedReference));
+    assert_eq!(d[0].message, "Unresolved reference: missingMember");
+}
+
+#[test]
 fn synthetic_data_class_copy_is_not_flagged() {
     let d = complete_workspace_diagnostics(
         &[(
@@ -280,6 +320,118 @@ fn wrong_arity_call_is_flagged_when_target_is_known() {
 fn matching_overload_arity_is_not_flagged() {
     let d = complete_diagnostics("class Int\nfun ping() {}\nfun ping(a: Int) {}\nfun main() { ping() }\n");
     assert!(d.is_empty(), "matching overload should suppress call-shape diagnostics: {d:?}");
+}
+
+#[test]
+fn wrong_arity_member_call_is_flagged_when_receiver_type_is_known() {
+    let d = complete_diagnostics(
+        r#"
+class Greeter {
+    fun ping() {}
+}
+fun main(g: Greeter) {
+    g.ping(1)
+}
+"#,
+    );
+    assert_eq!(d.len(), 1, "expected one call-shape diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::CallShapeMismatch));
+    assert_eq!(d[0].message, "No overload of ping accepts 1 argument");
+}
+
+#[test]
+fn wrong_arity_member_call_on_generic_receiver_extension_is_flagged() {
+    let d = complete_workspace_diagnostics(
+        &[(
+            "Main.kt",
+            r#"
+class Throwable
+class Result<T>(val value: T)
+class Account
+fun account(): Account = Account()
+fun <R> runCatching(block: () -> R): Result<R> = Result(block())
+fun <T> Result<T>.getOrThrow(): T = value
+fun probe() { runCatching { account() }.getOrThrow(1) }
+"#,
+        )],
+        "Main.kt",
+    );
+    assert_eq!(d.len(), 1, "expected one call-shape diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::CallShapeMismatch));
+    assert_eq!(d[0].message, "No overload of getOrThrow accepts 1 argument");
+}
+
+#[test]
+fn wrong_argument_type_top_level_call_is_flagged_when_every_target_rejects_it() {
+    let d = complete_diagnostics(
+        r#"
+class Cat
+class Dog
+fun adopt(cat: Cat) {}
+fun main() { adopt(Dog()) }
+"#,
+    );
+    assert_eq!(d.len(), 1, "expected one call-shape diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::CallShapeMismatch));
+    assert_eq!(d[0].message, "No overload of adopt accepts argument type (Dog)");
+}
+
+#[test]
+fn wrong_argument_type_member_call_is_flagged_when_receiver_type_is_known() {
+    let d = complete_diagnostics(
+        r#"
+class Cat
+class Dog
+class Shelter {
+    fun adopt(cat: Cat) {}
+}
+fun main(s: Shelter) {
+    s.adopt(Dog())
+}
+"#,
+    );
+    assert_eq!(d.len(), 1, "expected one call-shape diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::CallShapeMismatch));
+    assert_eq!(d[0].message, "No overload of adopt accepts argument type (Dog)");
+}
+
+#[test]
+fn wrong_argument_type_member_call_on_generic_receiver_extension_is_flagged() {
+    let d = complete_workspace_diagnostics(
+        &[(
+            "Main.kt",
+            r#"
+class Throwable
+class Result<T>(val value: T)
+class Account
+fun account(): Account = Account()
+fun <R> runCatching(block: () -> R): Result<R> = Result(block())
+fun <T> Result<T>.report(error: Throwable) {}
+fun probe() { runCatching { account() }.report(account()) }
+"#,
+        )],
+        "Main.kt",
+    );
+    assert_eq!(d.len(), 1, "expected one call-shape diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::CallShapeMismatch));
+    assert_eq!(d[0].message, "No overload of report accepts argument type (Account)");
+}
+
+#[test]
+fn wrong_argument_type_stays_silent_when_actual_argument_type_is_unknown() {
+    let d = complete_diagnostics(
+        r#"
+class Cat
+fun adopt(cat: Cat) {}
+fun main() {
+    val pet = missingPet
+    adopt(pet)
+}
+"#,
+    );
+    assert_eq!(d.len(), 1, "expected only the unresolved-reference diagnostic, got {d:?}");
+    assert_eq!(d[0].code, Some(DiagnosticCode::UnresolvedReference));
+    assert_eq!(d[0].message, "Unresolved reference: missingPet");
 }
 
 #[test]

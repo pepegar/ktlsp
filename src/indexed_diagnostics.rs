@@ -15,27 +15,28 @@ pub fn compute(
     file: &str,
     src: &str,
     tree: &Tree,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> Vec<Diagnostic> {
     if tree.root_node().has_error() {
         return Vec::new();
     }
     let mut out = Vec::new();
-    collect_missing_references(index, tree, src, tree.root_node(), facts, &mut out);
+    collect_missing_references(index, file, tree, src, tree.root_node(), facts, &mut out);
     collect_call_shape_mismatches(index, file, tree, src, tree.root_node(), &mut out);
     out
 }
 
 fn collect_missing_references(
     index: &Index,
+    file: &str,
     tree: &Tree,
     src: &str,
     node: Node,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
     out: &mut Vec<Diagnostic>,
 ) {
     if node.kind() == "identifier" {
-        if let Some(query) = semantic_query::reference_query(index, tree, src, node, facts) {
+        if let Some(query) = semantic_query::reference_query(index, file, tree, src, node, facts) {
             if query.is_definitely_absent() {
                 let name = node_text(node, src);
                 out.push(Diagnostic {
@@ -52,7 +53,7 @@ fn collect_missing_references(
 
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_missing_references(index, tree, src, child, facts, out);
+        collect_missing_references(index, file, tree, src, child, facts, out);
     }
 }
 
@@ -71,12 +72,7 @@ fn collect_call_shape_mismatches(
                 end_byte: node.end_byte(),
                 severity: Severity::Error,
                 code: Some(DiagnosticCode::CallShapeMismatch),
-                message: format!(
-                    "No overload of {} accepts {} argument{}",
-                    query.symbol,
-                    query.arg_count,
-                    if query.arg_count == 1 { "" } else { "s" }
-                ),
+                message: query.diagnostic_message(),
             });
             return;
         }

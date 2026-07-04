@@ -29,6 +29,7 @@ pub mod java;
 pub mod knowledge;
 pub mod lsp;
 pub mod parser;
+pub mod project_model;
 pub mod ranges;
 pub mod refactor;
 pub mod rename;

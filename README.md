@@ -160,21 +160,30 @@ symbol index. Today that means tree-sitter syntax errors, unused imports, duplic
 declarations in local scopes (classifiers, properties, enum entries, value parameters,
 primary-constructor parameters, and type parameters), plus unresolved simple type, value, call, and
 member references when ktlsp can prove the relevant visible scope is complete, plus wrong-arity
-call-shape mismatches when every resolved callable target has a known indexed arity and none match
-the call site. These checks run without Gradle or the Kotlin compiler. Syntax errors come directly
-from tree-sitter recovery nodes; semantic checks are still gated on a clean parse so ktlsp does not
-guess from a partial tree.
+call-shape mismatches for top-level and member calls when every resolved callable target has a
+known indexed arity and none match the call site, plus wrong-argument-type mismatches when every
+arity-compatible target rejects the inferred argument types. These checks run without Gradle or the
+Kotlin compiler. Syntax errors come directly from tree-sitter recovery nodes; semantic checks are
+still gated on a clean parse so ktlsp does not guess from a partial tree. The same fast-diagnostic engine now backs both push
+`textDocument/publishDiagnostics` and pull `textDocument/diagnostic` / `workspace/diagnostic`.
 
 The unresolved-reference diagnostics are intentionally conservative: ktlsp only fires when the
 query-local visibility world is closed enough to prove absence. `ktlsp.explainResolution` exposes
 the same model directly, returning `ok`, `definitely-absent`, or `unknown` together with explicit
-incompleteness reasons such as `project-package-incomplete:app` or
+incompleteness reasons such as `project-package-incomplete:app`,
+`project-source-set-package-incomplete:module=:feature,source-set=commonMain,package=app`, or
 `library-package-incomplete:kotlin.collections`. `ktlsp.explainCompletion` does the same for
 completion, reporting the completion context, the typed prefix, candidate count, and explicit
-decline reasons such as `unknown-receiver-type` or `import-context`. Fast diagnostics still
-deliberately do not report type mismatches, exhaustiveness errors, or full overload-resolution
-failures. Those require Kotlin compiler semantics; use the opt-in compile diagnostics backend below
-when you want the compiler as the oracle.
+decline reasons such as `unknown-receiver-type` or `import-context`.
+
+Pull-diagnostic workspace scope is configurable through `initializationOptions.diagnostics.scope`:
+
+- `openFilesOnly` (default) returns pull workspace diagnostics for open buffers only.
+- `workspace` returns pull workspace diagnostics for the scanned project files.
+
+Fast diagnostics still deliberately do not report type mismatches, exhaustiveness errors, or full
+overload-resolution failures. Those require Kotlin compiler semantics; use the opt-in compile
+diagnostics backend below when you want the compiler as the oracle.
 
 ## Compile diagnostics (opt-in, off by default)
 
@@ -316,6 +325,7 @@ one place:
 dev/ktlsp-harness.sh basic
 dev/ktlsp-harness.sh features
 dev/ktlsp-harness.sh library
+dev/ktlsp-harness.sh goodnotes
 dev/ktlsp-harness.sh project --root /path/to/project --file /path/to/project/src/main/kotlin/App.kt
 KTLSP_LIVE_COMPILE=1 dev/ktlsp-harness.sh gradle-live
 ```
@@ -330,6 +340,9 @@ Useful scenarios:
   workspace commands, and did-change reparse.
 - `library` creates a disposable Gradle-like project with a version catalog and checks goto into
   `kotlin-stdlib`'s `jvmMain` source set and JDK sources.
+- `goodnotes` runs a committed GoodNotes-derived semantic probe covering `Result` chains,
+  `apply` receiver typing, and KMP source-set narrowing without depending on the external
+  GoodNotes checkout.
 - `project` opens an existing Kotlin file and checks LSP health/capabilities.
 - `gradle-live`, `gradle-compile`, and `comprehensive` exercise `dev/gradle-sample`; compile
   diagnostics remain opt-in because they run Gradle/the sidecar. Stdlib extension goto cases like

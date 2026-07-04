@@ -13,10 +13,12 @@ use crate::hierarchy;
 use crate::imports::{self, ImportLayout};
 use crate::index::{Entry, Index};
 use crate::infer;
+use crate::knowledge::Knowledge;
 use crate::parser::{identifier_at, node_text, Import, KotlinParser};
 use crate::resolve::{self, CompletenessFacts, ResolutionStatus, UseKind};
 use crate::symbol::{Def, SymbolKind};
 use crate::symbols::SymbolSummary;
+use crate::types::Type;
 
 pub struct ReferenceQuery {
     kind: UseKind,
@@ -73,28 +75,65 @@ impl CompletionQuery {
     }
 
     pub fn status_label(&self) -> &'static str {
-        if !self.candidates.is_empty() {
-            "ok"
-        } else if !self.reasons.is_empty() {
-            "unknown"
-        } else {
-            "empty"
+        completion_status_label(&self.status)
+    }
+
+    pub fn reason_labels(&self) -> Vec<String> {
+        completion_reason_labels(&self.status)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompletionIncompletenessReason {
+    ImportContext,
+    NonCompletablePosition,
+    UnknownReceiverType,
+}
+
+impl CompletionIncompletenessReason {
+    pub fn label(&self) -> &'static str {
+        match self {
+            CompletionIncompletenessReason::ImportContext => "import-context",
+            CompletionIncompletenessReason::NonCompletablePosition => "non-completable-position",
+            CompletionIncompletenessReason::UnknownReceiverType => "unknown-receiver-type",
         }
     }
 }
+
+pub type CompletionStatus = Knowledge<(), CompletionIncompletenessReason>;
 
 pub struct CompletionQuery {
     pub context: complete::CompletionContext,
     pub prefix: String,
     pub candidates: Vec<ScopeCompletion>,
     pub layout: ImportLayout,
-    pub reasons: Vec<String>,
+    pub status: CompletionStatus,
 }
 
 pub struct CallShapeQuery {
     pub symbol: String,
     pub arg_count: usize,
     pub arities: Vec<u8>,
+    pub argument_types: Option<Vec<String>>,
+}
+
+impl CallShapeQuery {
+    pub fn diagnostic_message(&self) -> String {
+        if let Some(types) = &self.argument_types {
+            return format!(
+                "No overload of {} accepts argument type{} ({})",
+                self.symbol,
+                if types.len() == 1 { "" } else { "s" },
+                types.join(", ")
+            );
+        }
+        format!(
+            "No overload of {} accepts {} argument{}",
+            self.symbol,
+            self.arg_count,
+            if self.arg_count == 1 { "" } else { "s" }
+        )
+    }
 }
 
 fn kind_label(kind: UseKind) -> &'static str {
@@ -121,19 +160,38 @@ fn reason_labels(status: &ResolutionStatus<()>) -> Vec<String> {
     }
 }
 
+fn completion_status_label(status: &CompletionStatus) -> &'static str {
+    match status {
+        CompletionStatus::Found(()) => "ok",
+        CompletionStatus::DefinitelyAbsent => "empty",
+        CompletionStatus::Unknown(_) => "unknown",
+    }
+}
+
+fn completion_reason_labels(status: &CompletionStatus) -> Vec<String> {
+    match status {
+        CompletionStatus::Unknown(reasons) => reasons
+            .iter()
+            .map(|reason| reason.label().to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub fn reference_query(
     index: &Index,
+    file: &str,
     tree: &Tree,
     src: &str,
     usage: Node,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> Option<ReferenceQuery> {
     if usage.kind() != "identifier" {
         return None;
     }
     let symbol = Some(node_text(usage, src).to_string()).filter(|s| !s.is_empty());
     let kind = resolve::use_kind(usage);
-    let status = resolve::reference_status(index, tree, src, usage, facts);
+    let status = resolve::reference_status(index, file, tree, src, usage, facts);
     Some(ReferenceQuery { kind, symbol, status })
 }
 
@@ -143,7 +201,7 @@ pub fn resolved_symbol_query(
     tree: &Tree,
     src: &str,
     offset: usize,
-    facts: CompletenessFacts,
+    facts: &CompletenessFacts,
 ) -> Option<ResolvedSymbolQuery> {
     let usage = identifier_at(tree, offset)?;
     let symbol = Some(node_text(usage, src).to_string()).filter(|s| !s.is_empty());
@@ -155,7 +213,7 @@ pub fn resolved_symbol_query(
     let status = if entry.is_some() {
         ResolutionStatus::Found(())
     } else {
-        resolve::reference_status(index, tree, src, usage, facts)
+        resolve::reference_status(index, file, tree, src, usage, facts)
     };
     Some(ResolvedSymbolQuery {
         reference: ReferenceQuery { kind, symbol, status },
@@ -186,14 +244,16 @@ pub fn completion_query(
             prefix: String::new(),
             candidates: Vec::new(),
             layout: None,
-            reasons: vec!["import-context".to_string()],
+            status: CompletionStatus::Unknown(vec![CompletionIncompletenessReason::ImportContext]),
         }),
         complete::CompletionContext::None => Some(CompletionQuery {
             context,
             prefix: String::new(),
             candidates: Vec::new(),
             layout: None,
-            reasons: vec!["non-completable-position".to_string()],
+            status: CompletionStatus::Unknown(vec![
+                CompletionIncompletenessReason::NonCompletablePosition,
+            ]),
         }),
     }
 }
@@ -227,7 +287,9 @@ pub fn member_completion_query(
             prefix,
             candidates: Vec::new(),
             layout: imports::import_layout(tree, src),
-            reasons: vec!["unknown-receiver-type".to_string()],
+            status: CompletionStatus::Unknown(vec![
+                CompletionIncompletenessReason::UnknownReceiverType,
+            ]),
         });
     };
     let receiver_type_package = ty.package().map(str::to_string);
@@ -243,9 +305,13 @@ pub fn member_completion_query(
     Some(CompletionQuery {
         context: complete::CompletionContext::AfterDot,
         prefix,
+        status: if candidates.is_empty() {
+            CompletionStatus::DefinitelyAbsent
+        } else {
+            CompletionStatus::Found(())
+        },
         candidates,
         layout: imports::import_layout(tree, src),
-        reasons: Vec::new(),
     })
 }
 
@@ -260,11 +326,21 @@ pub fn call_shape_query(
         return None;
     }
     let callee = call.named_child(0)?;
-    let ident = match callee.kind() {
-        "identifier" => callee,
-        "navigation_expression" => return None,
-        _ => return None,
-    };
+    match callee.kind() {
+        "identifier" => top_level_call_shape_query(index, file, tree, src, call, callee),
+        "navigation_expression" => member_call_shape_query(index, tree, src, call, callee),
+        _ => None,
+    }
+}
+
+fn top_level_call_shape_query(
+    index: &Index,
+    file: &str,
+    tree: &Tree,
+    src: &str,
+    call: Node,
+    ident: Node,
+) -> Option<CallShapeQuery> {
     let symbol = node_text(ident, src).to_string();
     if symbol.is_empty() {
         return None;
@@ -297,9 +373,70 @@ pub fn call_shape_query(
         let max = entry.sym.arity.expect("guarded above") as usize;
         (min..=max).contains(&arg_count)
     }) {
+        let arity_compatible: Vec<&Entry> = entries
+            .iter()
+            .filter(|entry| {
+                let min = entry.sym.min_arity.expect("guarded above") as usize;
+                let max = entry.sym.arity.expect("guarded above") as usize;
+                (min..=max).contains(&arg_count)
+            })
+            .collect();
+        return argument_type_mismatch_query(index, tree, src, call, symbol, arg_count, arity_compatible);
+    }
+    Some(CallShapeQuery { symbol, arg_count, arities, argument_types: None })
+}
+
+fn member_call_shape_query(
+    index: &Index,
+    tree: &Tree,
+    src: &str,
+    call: Node,
+    callee: Node,
+) -> Option<CallShapeQuery> {
+    let recv = callee.named_child(0)?;
+    let ident = callee.named_child(1)?;
+    if ident.kind() != "identifier" {
         return None;
     }
-    Some(CallShapeQuery { symbol, arg_count, arities })
+    let symbol = node_text(ident, src).to_string();
+    if symbol.is_empty() {
+        return None;
+    }
+    let ctx = infer::FileCtx::from_tree(tree, src);
+    let recv_ty = infer::infer(index, recv, src, &ctx);
+    let entries = member_call_entries(index, &recv_ty, &symbol, &Visibility::new(&ctx.package, &ctx.imports));
+    if entries.is_empty() {
+        return None;
+    }
+    if entries.iter().any(|entry| {
+        entry.sym.kind != SymbolKind::Function
+            || entry.sym.arity.is_none()
+            || entry.sym.min_arity.is_none()
+            || entry.sym.has_vararg
+    }) {
+        return None;
+    }
+    let arg_count = value_arg_count(call);
+    let mut arities = entries.iter().filter_map(|entry| entry.sym.arity).collect::<Vec<_>>();
+    arities.sort_unstable();
+    arities.dedup();
+    if entries.iter().any(|entry| {
+        let min = entry.sym.min_arity.expect("guarded above") as usize;
+        let max = entry.sym.arity.expect("guarded above") as usize;
+        (min..=max).contains(&arg_count)
+    }) {
+        let arity_compatible: Vec<&Entry> = entries
+            .iter()
+            .copied()
+            .filter(|entry| {
+                let min = entry.sym.min_arity.expect("guarded above") as usize;
+                let max = entry.sym.arity.expect("guarded above") as usize;
+                (min..=max).contains(&arg_count)
+            })
+            .collect();
+        return argument_type_mismatch_query(index, tree, src, call, symbol, arg_count, arity_compatible);
+    }
+    Some(CallShapeQuery { symbol, arg_count, arities, argument_types: None })
 }
 
 pub fn scope_name_query(
@@ -371,9 +508,13 @@ pub fn scope_name_query(
     Some(CompletionQuery {
         context: complete::CompletionContext::ScopeName,
         prefix,
+        status: if items.is_empty() {
+            CompletionStatus::DefinitelyAbsent
+        } else {
+            CompletionStatus::Found(())
+        },
         candidates: items,
         layout,
-        reasons: Vec::new(),
     })
 }
 
@@ -426,6 +567,160 @@ fn member_candidates(
     }
     out.truncate(max_candidates);
     out
+}
+
+fn member_call_entries<'a>(
+    index: &'a Index,
+    recv_ty: &Type,
+    name: &str,
+    vis: &Visibility,
+) -> Vec<&'a Entry> {
+    let Some(root) = recv_ty.name() else {
+        return Vec::new();
+    };
+    let root_pkg = recv_ty.package().map(str::to_string);
+    let mut visited: HashSet<(String, Option<String>)> = HashSet::new();
+    let mut frontier: Vec<(String, Option<String>, usize)> = vec![(root.to_string(), root_pkg, 0)];
+    let mut members: Vec<&Entry> = Vec::new();
+    let mut extensions: Vec<&Entry> = Vec::new();
+    while let Some((cur, cur_pkg, depth)) = frontier.pop() {
+        if !visited.insert((cur.clone(), cur_pkg.clone())) || depth > 32 {
+            continue;
+        }
+        for e in index.members_of(&cur) {
+            if let Some(p) = &cur_pkg {
+                if &e.sym.package != p {
+                    continue;
+                }
+            }
+            if e.sym.name == name && e.sym.kind == SymbolKind::Function {
+                members.push(e);
+            }
+        }
+        for e in index.extensions_for(&cur) {
+            if e.sym.name == name && e.sym.kind == SymbolKind::Function && vis.is_visible(&e.sym.package, &e.sym.name) {
+                extensions.push(e);
+            }
+        }
+        for e in generic_receiver_extensions(index, name, vis) {
+            if e.sym.kind == SymbolKind::Function {
+                extensions.push(e);
+            }
+        }
+        for sup in index.supertypes_of_in(&cur, cur_pkg.as_deref()) {
+            let sup_pkg = match &cur_pkg {
+                Some(p)
+                    if index
+                        .lookup_by_name(&sup)
+                        .iter()
+                        .any(|e| e.sym.kind.is_type_like() && &e.sym.package == p) =>
+                {
+                    Some(p.clone())
+                }
+                _ => None,
+            };
+            frontier.push((sup, sup_pkg, depth + 1));
+        }
+    }
+    if !members.is_empty() {
+        members
+    } else {
+        extensions
+    }
+}
+
+fn generic_receiver_extensions<'a>(index: &'a Index, name: &str, vis: &Visibility) -> Vec<&'a Entry> {
+    index
+        .lookup_by_name(name)
+        .iter()
+        .filter(|e| e.sym.kind == SymbolKind::Function && e.sym.container.is_none())
+        .filter(|e| {
+            e.sym
+                .ext_receiver
+                .as_deref()
+                .is_some_and(|recv| e.sym.type_params.iter().any(|tp| tp == recv))
+        })
+        .filter(|e| vis.is_visible(&e.sym.package, &e.sym.name))
+        .collect()
+}
+
+fn argument_type_mismatch_query(
+    index: &Index,
+    tree: &Tree,
+    src: &str,
+    call: Node,
+    symbol: String,
+    arg_count: usize,
+    entries: Vec<&Entry>,
+) -> Option<CallShapeQuery> {
+    if entries.is_empty() {
+        return None;
+    }
+    let ctx = infer::FileCtx::from_tree(tree, src);
+    let arg_types = synth_arg_types(index, call, src, &ctx);
+    let mut labels = Vec::with_capacity(arg_types.len());
+    for ty in &arg_types {
+        labels.push(type_label(ty)?);
+    }
+    if entries.iter().any(|entry| {
+        infer::argument_types_consistent(index, &entry.sym.params, &entry.sym.type_params, &arg_types, &ctx)
+    }) {
+        return None;
+    }
+    Some(CallShapeQuery { symbol, arg_count, arities: Vec::new(), argument_types: Some(labels) })
+}
+
+fn synth_arg_types(index: &Index, call: Node, src: &str, ctx: &infer::FileCtx) -> Vec<Type> {
+    let mut out = Vec::new();
+    let va = if let Some(va) = call.child_by_field_name("valueArguments") {
+        Some(va)
+    } else {
+        let mut cursor = call.walk();
+        let found = call
+            .named_children(&mut cursor)
+            .find(|child| child.kind() == "value_arguments");
+        found
+    };
+    let Some(va) = va else {
+        return out;
+    };
+    let mut cursor = va.walk();
+    for arg in va.named_children(&mut cursor) {
+        if arg.kind() != "value_argument" {
+            continue;
+        }
+        let n = arg.named_child_count();
+        let ty = (n > 0)
+            .then(|| arg.named_child(n - 1))
+            .flatten()
+            .map_or(Type::Unknown, |expr| infer::infer(index, expr, src, ctx));
+        out.push(ty);
+    }
+    out
+}
+
+fn type_label(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Class {
+            name,
+            nullable,
+            args,
+            ..
+        } => {
+            let mut out = name.clone();
+            if !args.is_empty() {
+                let inner = args.iter().map(type_label).collect::<Option<Vec<_>>>()?;
+                out.push('<');
+                out.push_str(&inner.join(", "));
+                out.push('>');
+            }
+            if *nullable {
+                out.push('?');
+            }
+            Some(out)
+        }
+        Type::Unknown => None,
+    }
 }
 
 fn push_member_candidate(
@@ -527,6 +822,22 @@ mod tests {
 
     use super::*;
 
+    fn call_at<'t>(tree: &'t Tree, src: &str, needle: &str) -> Node<'t> {
+        tree.root_node()
+            .named_descendant_for_byte_range(src.find(needle).unwrap(), src.find(needle).unwrap())
+            .and_then(|node| {
+                let mut cur = Some(node);
+                while let Some(n) = cur {
+                    if n.kind() == "call_expression" {
+                        return Some(n);
+                    }
+                    cur = n.parent();
+                }
+                None
+            })
+            .expect("call expression")
+    }
+
     #[test]
     fn query_reports_definitely_absent_for_closed_missing_call() {
         let mut ws = Workspace::new();
@@ -540,10 +851,11 @@ mod tests {
         let ident = identifier_at(&tree, offset).unwrap();
         let query = reference_query(
             &ws.index,
+            "Main.kt",
             &tree,
             src,
             ident,
-            resolve::CompletenessFacts::complete(),
+            &resolve::CompletenessFacts::complete(),
         )
         .unwrap();
 
@@ -569,7 +881,7 @@ mod tests {
             &tree,
             src,
             src.rfind("helper").unwrap(),
-            resolve::CompletenessFacts::complete(),
+            &resolve::CompletenessFacts::complete(),
         )
         .expect("resolved symbol query");
 
@@ -616,6 +928,9 @@ mod tests {
         let query = after_dot_query(&ws.index, &mut parser, &src, offset, 1000).expect("after-dot query");
 
         assert_eq!(query.context_label(), "member");
+        assert_eq!(query.status_label(), "ok");
+        assert!(matches!(query.status, CompletionStatus::Found(())));
+        assert!(query.reason_labels().is_empty());
         assert_eq!(query.prefix, "fe");
         assert!(query.candidates.iter().any(|c| c.label == "fetch"));
         assert!(
@@ -641,6 +956,7 @@ mod tests {
             .expect("scope query");
 
         assert_eq!(query.context_label(), "scope-name");
+        assert_eq!(query.status_label(), "ok");
         assert!(query.candidates.iter().any(|c| {
             c.label == "widgetXyz" && c.import_path.as_deref() == Some("other.widgetXyz")
         }));
@@ -655,6 +971,68 @@ mod tests {
     }
 
     #[test]
+    fn completion_query_reports_unknown_in_import_context() {
+        let mut ws = Workspace::new();
+        let src = "import ko\n";
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let offset = src.find("ko").unwrap() + 1;
+        let query = completion_query(&ws.index, &mut parser, "Main.kt", src, offset, 1000)
+            .expect("completion query");
+
+        assert_eq!(query.context_label(), "import");
+        assert_eq!(query.status_label(), "unknown");
+        assert_eq!(query.reason_labels(), vec!["import-context".to_string()]);
+    }
+
+    #[test]
+    fn member_completion_query_reports_unknown_receiver_type() {
+        let mut ws = Workspace::new();
+        let src = "fun main() { unknown.member }\n";
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let receiver = tree
+            .root_node()
+            .named_descendant_for_byte_range(src.find("unknown").unwrap(), src.find("unknown").unwrap())
+            .expect("receiver")
+            .parent()
+            .expect("navigation")
+            .named_child(0)
+            .expect("receiver child");
+        let query = member_completion_query(&ws.index, &tree, src, receiver, "me".to_string(), 1000)
+            .expect("member query");
+
+        assert_eq!(query.context_label(), "member");
+        assert_eq!(query.status_label(), "unknown");
+        assert_eq!(
+            query.reason_labels(),
+            vec!["unknown-receiver-type".to_string()]
+        );
+        assert!(query.candidates.is_empty());
+    }
+
+    #[test]
+    fn scope_name_query_reports_empty_when_no_candidates_exist() {
+        let mut ws = Workspace::new();
+        let src = "fun main() { zzzz }\n";
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let offset = src.find("zzzz").unwrap() + 4;
+        let query = scope_name_query(&ws.index, "Main.kt", &tree, src, offset, 1000)
+            .expect("scope query");
+
+        assert_eq!(query.context_label(), "scope-name");
+        assert_eq!(query.status_label(), "empty");
+        assert!(query.reason_labels().is_empty());
+        assert!(query.candidates.is_empty());
+    }
+
+    #[test]
     fn call_shape_query_reports_wrong_arity_when_every_target_is_known() {
         let src = "fun ping(a: Int) {}\nfun main() { ping() }\n";
         let mut ws = Workspace::new();
@@ -663,20 +1041,7 @@ mod tests {
 
         let mut parser = KotlinParser::new();
         let tree = parser.parse(src);
-        let call = tree
-            .root_node()
-            .named_descendant_for_byte_range(src.find("ping()").unwrap(), src.find("ping()").unwrap())
-            .and_then(|node| {
-                let mut cur = Some(node);
-                while let Some(n) = cur {
-                    if n.kind() == "call_expression" {
-                        return Some(n);
-                    }
-                    cur = n.parent();
-                }
-                None
-            })
-            .expect("call expression");
+        let call = call_at(&tree, src, "ping()");
 
         let query = call_shape_query(&ws.index, "Main.kt", &tree, src, call).expect("call-shape query");
         assert_eq!(query.symbol, "ping");
@@ -693,20 +1058,7 @@ mod tests {
 
         let mut parser = KotlinParser::new();
         let tree = parser.parse(src);
-        let call = tree
-            .root_node()
-            .named_descendant_for_byte_range(src.find("manifest(1)").unwrap(), src.find("manifest(1)").unwrap())
-            .and_then(|node| {
-                let mut cur = Some(node);
-                while let Some(n) = cur {
-                    if n.kind() == "call_expression" {
-                        return Some(n);
-                    }
-                    cur = n.parent();
-                }
-                None
-            })
-            .expect("call expression");
+        let call = call_at(&tree, src, "manifest(1)");
 
         assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
     }
@@ -720,20 +1072,7 @@ mod tests {
 
         let mut parser = KotlinParser::new();
         let tree = parser.parse(src);
-        let call = tree
-            .root_node()
-            .named_descendant_for_byte_range(src.find("collect()").unwrap(), src.find("collect()").unwrap())
-            .and_then(|node| {
-                let mut cur = Some(node);
-                while let Some(n) = cur {
-                    if n.kind() == "call_expression" {
-                        return Some(n);
-                    }
-                    cur = n.parent();
-                }
-                None
-            })
-            .expect("call expression");
+        let call = call_at(&tree, src, "collect()");
 
         assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
     }
@@ -747,21 +1086,121 @@ mod tests {
 
         let mut parser = KotlinParser::new();
         let tree = parser.parse(src);
-        let call = tree
-            .root_node()
-            .named_descendant_for_byte_range(src.find("map()").unwrap(), src.find("map()").unwrap())
-            .and_then(|node| {
-                let mut cur = Some(node);
-                while let Some(n) = cur {
-                    if n.kind() == "call_expression" {
-                        return Some(n);
-                    }
-                    cur = n.parent();
-                }
-                None
-            })
-            .expect("call expression");
+        let call = call_at(&tree, src, "map()");
 
         assert!(call_shape_query(&ws.index, "Main.kt", &tree, src, call).is_none());
+    }
+
+    #[test]
+    fn call_shape_query_reports_wrong_arity_for_known_member_call() {
+        let src = "class Greeter { fun ping() {} }\nfun main(g: Greeter) { g.ping(1) }\n";
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "ping(1)");
+
+        let query = call_shape_query(&ws.index, "Main.kt", &tree, src, call).expect("call-shape query");
+        assert_eq!(query.symbol, "ping");
+        assert_eq!(query.arg_count, 1);
+        assert_eq!(query.arities, vec![0]);
+    }
+
+    #[test]
+    fn call_shape_query_reports_wrong_arity_for_generic_receiver_extension() {
+        let src = r#"
+class Throwable
+class Result<T>
+class Account
+fun account(): Account = Account()
+fun <R> runCatching(block: () -> R): Result<R> = TODO()
+fun <T> Result<T>.getOrThrow(): T = TODO()
+fun main() { runCatching { account() }.getOrThrow(1) }
+"#;
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "getOrThrow(1)");
+
+        let query = call_shape_query(&ws.index, "Main.kt", &tree, src, call).expect("call-shape query");
+        assert_eq!(query.symbol, "getOrThrow");
+        assert_eq!(query.arg_count, 1);
+        assert_eq!(query.arities, vec![0]);
+    }
+
+    #[test]
+    fn call_shape_query_reports_argument_type_mismatch_for_top_level_call() {
+        let src = r#"
+class Cat
+class Dog
+fun adopt(cat: Cat) {}
+fun main() { adopt(Dog()) }
+"#;
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "adopt(Dog())");
+
+        let query = call_shape_query(&ws.index, "Main.kt", &tree, src, call).expect("call-shape query");
+        assert_eq!(query.symbol, "adopt");
+        assert_eq!(query.arg_count, 1);
+        assert_eq!(query.argument_types, Some(vec!["Dog".to_string()]));
+    }
+
+    #[test]
+    fn call_shape_query_reports_argument_type_mismatch_for_known_member_call() {
+        let src = r#"
+class Cat
+class Dog
+class Shelter {
+    fun adopt(cat: Cat) {}
+}
+fun main(s: Shelter) { s.adopt(Dog()) }
+"#;
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "adopt(Dog())");
+
+        let query = call_shape_query(&ws.index, "Main.kt", &tree, src, call).expect("call-shape query");
+        assert_eq!(query.symbol, "adopt");
+        assert_eq!(query.arg_count, 1);
+        assert_eq!(query.argument_types, Some(vec!["Dog".to_string()]));
+    }
+
+    #[test]
+    fn call_shape_query_reports_argument_type_mismatch_for_generic_receiver_extension() {
+        let src = r#"
+class Throwable
+class Result<T>(val value: T)
+class Account
+fun account(): Account = Account()
+fun <R> runCatching(block: () -> R): Result<R> = Result(block())
+fun <T> Result<T>.report(error: Throwable) {}
+fun main() { runCatching { account() }.report(account()) }
+"#;
+        let mut ws = Workspace::new();
+        ws.assume_index_complete_for_tests();
+        ws.open("Main.kt", src.to_string());
+
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let call = call_at(&tree, src, "report(account())");
+
+        let query = call_shape_query(&ws.index, "Main.kt", &tree, src, call).expect("call-shape query");
+        assert_eq!(query.symbol, "report");
+        assert_eq!(query.arg_count, 1);
+        assert_eq!(query.argument_types, Some(vec!["Account".to_string()]));
     }
 }

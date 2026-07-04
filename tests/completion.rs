@@ -759,6 +759,13 @@ fn member_completion_chained_calls() {
 }
 
 #[test]
+fn result_chain_get_or_throw_preserves_inner_type() {
+    let input = "//- kotlin/Stdlib.kt\npackage kotlin\nclass Throwable\nclass Result<T>\nfun <R> runCatching(block: () -> R): Result<R> = TODO()\nfun <T> Result<T>.onFailure(action: (Throwable) -> Unit): Result<T> = this\nfun <T> Result<T>.getOrThrow(): T = TODO()\n\
+                 //- Main.kt\npackage app\ndata class Account(val email: String)\nclass Logger { fun error(t: Throwable, msg: () -> String) {} }\nval logger = Logger()\nfun account(): Account = Account(\"a\")\nfun f() {\n    runCatching { account() }\n        .onFailure { logger.error(it) { \"failed\" } }\n        .getOrThrow()\n        .ema/*^*/\n}\n";
+    check_contains(input, &["email"]);
+}
+
+#[test]
 fn member_completion_on_property_type() {
     // A property's declared type drives member completion on it.
     let input = "//- lib.kt\npackage app\n\
@@ -1177,6 +1184,20 @@ fn lambda_it_in_let_is_whole_receiver() {
     // Regression: let/also still give `it` the whole receiver type (not an element).
     let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\nfun makeFoo(): Foo = Foo()\n\
                  //- Main.kt\npackage app\nfun f() {\n    makeFoo().let {\n        it.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn lambda_this_in_apply_is_whole_receiver() {
+    let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\nfun makeFoo(): Foo = Foo()\n\
+                 //- Main.kt\npackage app\nfun f() {\n    makeFoo().apply {\n        this.ba/*^*/\n    }\n}\n";
+    check_contains(input, &["bar"]);
+}
+
+#[test]
+fn lambda_this_in_run_is_whole_receiver() {
+    let input = "//- lib.kt\npackage app\nclass Foo {\n    fun bar() {}\n}\nfun makeFoo(): Foo = Foo()\n\
+                 //- Main.kt\npackage app\nfun f() {\n    makeFoo().run {\n        this.ba/*^*/\n    }\n}\n";
     check_contains(input, &["bar"]);
 }
 

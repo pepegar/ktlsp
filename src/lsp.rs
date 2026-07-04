@@ -33,6 +33,12 @@ use crate::workspace::Workspace;
 /// we coalesce rapid edits before recomputing.
 const DIAGNOSTIC_DEBOUNCE: Duration = Duration::from_millis(300);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DiagnosticScope {
+    OpenFilesOnly,
+    Workspace,
+}
+
 pub struct Backend {
     client: Client,
     ws: Arc<Mutex<Workspace>>,
@@ -72,6 +78,7 @@ pub struct Backend {
     /// Compile-diagnostics backend from `initialization_options.compile_diagnostics.backend`:
     /// `"kotlin-daemon"` uses the warm incremental sidecar; anything else (default) uses gradle.
     use_daemon: Mutex<bool>,
+    diagnostic_scope: Mutex<DiagnosticScope>,
     formatter: Mutex<Option<FormatterConfig>>,
 }
 
@@ -93,6 +100,7 @@ impl Backend {
             coverage_notified: Arc::new(Mutex::new(false)),
             progress_supported: Arc::new(Mutex::new(false)),
             use_daemon: Mutex::new(false),
+            diagnostic_scope: Mutex::new(DiagnosticScope::OpenFilesOnly),
             formatter: Mutex::new(None),
         }
     }
@@ -695,6 +703,18 @@ fn use_daemon_from(opts: &Option<serde_json::Value>) -> bool {
         == Some("kotlin-daemon")
 }
 
+fn diagnostic_scope_from(opts: &Option<serde_json::Value>) -> DiagnosticScope {
+    match opts
+        .as_ref()
+        .and_then(|v| v.get("diagnostics"))
+        .and_then(|d| d.get("scope"))
+        .and_then(|s| s.as_str())
+    {
+        Some("workspace") => DiagnosticScope::Workspace,
+        _ => DiagnosticScope::OpenFilesOnly,
+    }
+}
+
 fn formatter_from(opts: &Option<serde_json::Value>) -> Option<FormatterConfig> {
     let formatting = opts.as_ref()?.get("formatting")?;
     let command = formatting.get("command")?.as_str()?.to_string();
@@ -759,6 +779,8 @@ impl LanguageServer for Backend {
         *self.compile_enabled.lock().unwrap() =
             compile_enabled_from(&params.initialization_options);
         *self.use_daemon.lock().unwrap() = use_daemon_from(&params.initialization_options);
+        *self.diagnostic_scope.lock().unwrap() =
+            diagnostic_scope_from(&params.initialization_options);
         let formatter = formatter_from(&params.initialization_options);
         *self.formatter.lock().unwrap() = formatter.clone();
 
@@ -777,6 +799,14 @@ impl LanguageServer for Backend {
                         change: Some(TextDocumentSyncKind::FULL),
                         save: Some(TextDocumentSyncSaveOptions::Supported(true)),
                         ..Default::default()
+                    },
+                )),
+                diagnostic_provider: Some(DiagnosticServerCapabilities::Options(
+                    DiagnosticOptions {
+                        identifier: Some("ktlsp-fast".into()),
+                        inter_file_dependencies: true,
+                        workspace_diagnostics: true,
+                        work_done_progress_options: Default::default(),
                     },
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
@@ -919,6 +949,62 @@ impl LanguageServer for Backend {
         // generation, so a worker that subscribes afterward still sees this save and runs once.
         self.trigger_compile(key);
         self.start_worker_once(root);
+    }
+
+    async fn diagnostic(
+        &self,
+        params: DocumentDiagnosticParams,
+    ) -> Result<DocumentDiagnosticReportResult> {
+        let Some(key) = uri_to_key(&params.text_document.uri) else {
+            return Ok(DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+                related_documents: None,
+                full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                    result_id: None,
+                    items: Vec::new(),
+                },
+            })
+            .into());
+        };
+        let items = merged_lsp_diagnostics(&self.ws, &self.compile_diags, &key);
+        Ok(DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
+            related_documents: None,
+            full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                result_id: None,
+                items,
+            },
+        })
+        .into())
+    }
+
+    async fn workspace_diagnostic(
+        &self,
+        _params: WorkspaceDiagnosticParams,
+    ) -> Result<WorkspaceDiagnosticReportResult> {
+        let scope = *self.diagnostic_scope.lock().unwrap();
+        let keys = {
+            let ws = self.ws.lock().unwrap();
+            match scope {
+                DiagnosticScope::OpenFilesOnly => ws.open_doc_keys(),
+                DiagnosticScope::Workspace => ws.project_doc_keys(),
+            }
+        };
+        let mut items = Vec::new();
+        for key in keys {
+            let Some(uri) = key_to_uri(&key) else {
+                continue;
+            };
+            items.push(WorkspaceDocumentDiagnosticReport::Full(
+                WorkspaceFullDocumentDiagnosticReport {
+                    uri,
+                    version: None,
+                    full_document_diagnostic_report: FullDocumentDiagnosticReport {
+                        result_id: None,
+                        items: merged_lsp_diagnostics(&self.ws, &self.compile_diags, &key),
+                    },
+                },
+            ));
+        }
+        Ok(WorkspaceDiagnosticReport { items }.into())
     }
 
     async fn goto_definition(
@@ -1719,7 +1805,7 @@ impl LanguageServer for Backend {
             let symbol = crate::trace::ident_at(&text, offset);
             let semantic = ws
                 .completion_query(&key, offset)
-                .map(|query| (query.context_label(), query.status_label(), query.reasons));
+                .map(|query| (query.context_label(), query.status_label(), query.reason_labels()));
             match ws.complete(&key, offset, snippets) {
                 Some(shaped) => {
                     let incomplete = shaped.is_incomplete;
@@ -2403,6 +2489,15 @@ async fn publish_merged(
         Some(u) => u,
         None => return,
     };
+    let items = merged_lsp_diagnostics(ws, compile_diags, key);
+    client.publish_diagnostics(uri, items, None).await;
+}
+
+fn merged_lsp_diagnostics(
+    ws: &Arc<Mutex<Workspace>>,
+    compile_diags: &Arc<Mutex<HashMap<String, Vec<CompileDiagnostic>>>>,
+    key: &str,
+) -> Vec<Diagnostic> {
     // Acquire ws and compile_diags one at a time (never nested) so there is no lock-ordering hazard.
     let (text, fast) = {
         let mut ws = ws.lock().unwrap();
@@ -2414,7 +2509,7 @@ async fn publish_merged(
             None => (None, Vec::new()),
         }
     };
-    let items = match text {
+    match text {
         Some(text) => {
             let line_index = LineIndex::new(&text);
             let mut items: Vec<Diagnostic> =
@@ -2426,10 +2521,8 @@ async fn publish_merged(
             }
             items
         }
-        // No text on disk/buffer (deleted file): clear by publishing nothing.
         None => Vec::new(),
-    };
-    client.publish_diagnostics(uri, items, None).await;
+    }
 }
 
 /// Fold a compile run into the merge store and publish: group diagnostics by canonical key (dropping
@@ -2615,6 +2708,19 @@ mod tests {
         assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": "true" } }))));
         assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": 1 } }))));
         assert!(!compile_enabled_from(&Some(json!({ "compile_diagnostics": { "enabled": false } }))));
+    }
+
+    #[test]
+    fn diagnostic_scope_defaults_to_open_files_only() {
+        assert_eq!(diagnostic_scope_from(&None), DiagnosticScope::OpenFilesOnly);
+        assert_eq!(
+            diagnostic_scope_from(&Some(json!({ "diagnostics": { "scope": "workspace" } }))),
+            DiagnosticScope::Workspace
+        );
+        assert_eq!(
+            diagnostic_scope_from(&Some(json!({ "diagnostics": { "scope": "nope" } }))),
+            DiagnosticScope::OpenFilesOnly
+        );
     }
 
     #[test]

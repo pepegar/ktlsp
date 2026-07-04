@@ -610,6 +610,13 @@ fn member_selector_picks_overload_via_this() {
 }
 
 #[test]
+fn member_selector_picks_overload_via_apply_lambda_this() {
+    check(
+        "class A {\n    fun /*def*/run2() {}\n}\nclass B {\n    fun run2() {}\n}\nfun makeA(): A = A()\nfun caller() {\n    makeA().apply {\n        this./*^*/run2()\n    }\n}\n",
+    );
+}
+
+#[test]
 fn member_selector_unknown_receiver_type_stays_ambiguous() {
     // Receiver type can't be inferred (param of an unindexed type), and the member is ambiguous,
     // so we still return nothing rather than guess.

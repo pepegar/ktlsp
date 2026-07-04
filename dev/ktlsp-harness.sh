@@ -11,6 +11,7 @@ scenarios:
   basic          generated two-file project; local + cross-file goto
   features       dev/sample feature smoke; refs, completion, auto-import, edits
   library        generated version-catalog project; goto into kotlin-stdlib sources
+  goodnotes      committed GoodNotes-derived semantic probe; chains, apply, and KMP narrowing
   project        existing project health check; requires --root and --file
   gradle-live    dev/gradle-sample live probe; compile diagnostics only if KTLSP_LIVE_COMPILE=1
   gradle-compile same as gradle-live, with KTLSP_LIVE_COMPILE=1
@@ -248,6 +249,10 @@ case "$scenario" in
   library)
     project="${root_arg:-$(write_library_project)}"
     run_and_capture library nvim -l "$repo/dev/nvim_library.lua" "$project" || run_status=$?
+    ;;
+  goodnotes)
+    project="${root_arg:-$repo/dev/goodnotes-semantic}"
+    run_and_capture goodnotes nvim -l "$repo/dev/nvim_goodnotes_semantic.lua" "$project" "$bin_arg" || run_status=$?
     ;;
   project)
     if [ -z "$root_arg" ] || [ -z "$file_arg" ]; then

@@ -2,7 +2,7 @@
 //! the LSP layer drives. All keys are the caller's canonical identity string (a path or URI
 //! string); we never re-derive identity from the filesystem at query time.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::Path;
 use std::process::Command;
 use std::sync::{mpsc, Arc, Mutex};
@@ -17,6 +17,7 @@ use crate::index::{Index, RefEntry, Tier, Usage};
 use crate::indexer::{extract_symbols, extract_usages};
 use crate::java::JavaParser;
 use crate::parser::{compute_edit, identifier_at, imports_of, node_text, package_of, Import, KotlinParser};
+use crate::project_model::{self, ProjectScope};
 use crate::ranges::{self, FoldRange, SelectionRange};
 use crate::resolve;
 use crate::semantic;
@@ -33,9 +34,17 @@ struct DocState {
 
 struct ProjectFileIndex {
     key: String,
+    package: String,
     symbols: Vec<IndexedSymbol>,
     usages: Vec<Usage>,
     clean: bool,
+}
+
+#[derive(Clone)]
+struct ProjectFileMeta {
+    package: String,
+    clean: bool,
+    scope: Option<ProjectScope>,
 }
 
 pub struct Workspace {
@@ -44,6 +53,8 @@ pub struct Workspace {
     open_docs: HashMap<String, DocState>,
     parser: KotlinParser,
     completeness: resolve::CompletenessFacts,
+    project_file_meta: HashMap<String, ProjectFileMeta>,
+    project_scan_initialized: bool,
 }
 
 impl Default for Workspace {
@@ -59,6 +70,8 @@ impl Workspace {
             open_docs: HashMap::new(),
             parser: KotlinParser::new(),
             completeness: resolve::CompletenessFacts::default(),
+            project_file_meta: HashMap::new(),
+            project_scan_initialized: false,
         }
     }
 
@@ -78,9 +91,17 @@ impl Workspace {
         self.open_docs.keys().cloned().collect()
     }
 
+    pub fn project_doc_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self.project_file_meta.keys().cloned().collect();
+        keys.sort();
+        keys
+    }
+
     /// Test helper for fixtures that intentionally model a closed source world.
     pub fn assume_index_complete_for_tests(&mut self) {
         self.completeness = resolve::CompletenessFacts::complete();
+        self.project_scan_initialized = false;
+        self.project_file_meta.clear();
     }
 
     /// Current text for a key: the open buffer if present, else the file on disk.
@@ -99,6 +120,7 @@ impl Workspace {
         self.index.replace_file(key, syms, Tier::Volatile);
         let usages = extract_usages(tree, text);
         self.index.replace_file_refs(key, usages);
+        self.record_project_file_meta(key, pkg, !tree.root_node().has_error());
     }
 
     /// Parse `text` from scratch and (re)index the file. Used for non-open files (scan/close),
@@ -136,7 +158,13 @@ impl Workspace {
         self.open_docs.remove(key);
         match std::fs::read_to_string(key) {
             Ok(text) => self.reindex(key, &text),
-            Err(_) => self.index.remove_file(key),
+            Err(_) => {
+                self.index.remove_file(key);
+                if self.project_scan_initialized {
+                    self.project_file_meta.remove(key);
+                    self.recompute_project_completeness();
+                }
+            }
         }
     }
 
@@ -154,13 +182,32 @@ impl Workspace {
         }
         let batches = parse_project_files(paths);
         let n = batches.len();
-        let clean = batches.iter().all(|batch| batch.clean);
+        self.project_scan_initialized = true;
+        self.project_file_meta.clear();
         for batch in batches {
+            self.project_file_meta.insert(
+                batch.key.clone(),
+                ProjectFileMeta {
+                    package: batch.package.clone(),
+                    clean: batch.clean,
+                    scope: project_model::project_scope_for_path(&batch.key),
+                },
+            );
             self.index
                 .replace_file(&batch.key, batch.symbols, Tier::Volatile);
             self.index.replace_file_refs(&batch.key, batch.usages);
         }
-        self.set_project_scan_complete(clean);
+        for (key, doc) in &self.open_docs {
+            self.project_file_meta.insert(
+                key.clone(),
+                ProjectFileMeta {
+                    package: package_of(&doc.tree, &doc.text),
+                    clean: !doc.tree.root_node().has_error(),
+                    scope: project_model::project_scope_for_path(key),
+                },
+            );
+        }
+        self.recompute_project_completeness();
         n
     }
 
@@ -206,12 +253,14 @@ impl Workspace {
         offset: usize,
     ) -> Option<crate::commands::CompletionExplanation> {
         let query = self.completion_query(key, offset)?;
+        let reasons = query.reason_labels();
+        let candidate_count = query.candidates.len();
         Some(crate::commands::CompletionExplanation {
             status: query.status_label(),
             context: query.context_label(),
             prefix: query.prefix,
-            candidate_count: query.candidates.len(),
-            reasons: query.reasons,
+            candidate_count,
+            reasons,
             candidates: query
                 .candidates
                 .into_iter()
@@ -241,7 +290,7 @@ impl Workspace {
             tree,
             doc_text,
             offset,
-            self.effective_completeness(),
+            &self.effective_completeness(),
         )
     }
 
@@ -601,21 +650,75 @@ impl Workspace {
             key,
             text,
             tree,
-            self.effective_completeness(),
+            &self.effective_completeness(),
         ));
         out
     }
 
     fn effective_completeness(&self) -> resolve::CompletenessFacts {
-        let mut facts = self.completeness;
-        if self
-            .open_docs
-            .values()
-            .any(|doc| doc.tree.root_node().has_error())
-        {
-            facts.project_scan_complete = false;
+        self.completeness.clone()
+    }
+
+    fn record_project_file_meta(&mut self, key: &str, package: String, clean: bool) {
+        if !self.project_scan_initialized {
+            return;
         }
-        facts
+        self.project_file_meta
+            .insert(
+                key.to_string(),
+                ProjectFileMeta {
+                    package,
+                    clean,
+                    scope: project_model::project_scope_for_path(key),
+                },
+            );
+        self.recompute_project_completeness();
+    }
+
+    fn recompute_project_completeness(&mut self) {
+        if !self.project_scan_initialized {
+            return;
+        }
+        self.completeness.project_scan_complete =
+            self.project_file_meta.values().all(|meta| meta.clean);
+        let mut clean_packages = BTreeSet::new();
+        let mut dirty_packages = BTreeSet::new();
+        let mut clean_scoped_packages = BTreeSet::new();
+        let mut dirty_scoped_packages = BTreeSet::new();
+        let mut packages_with_unknown_scope = BTreeSet::new();
+        let mut package_modules = HashMap::<String, BTreeSet<String>>::new();
+        for meta in self.project_file_meta.values() {
+            if meta.clean {
+                clean_packages.insert(meta.package.clone());
+            } else {
+                dirty_packages.insert(meta.package.clone());
+            }
+            match &meta.scope {
+                Some(scope) => {
+                    package_modules
+                        .entry(meta.package.clone())
+                        .or_default()
+                        .insert(scope.module.clone());
+                    let scoped = scope.package_scope(meta.package.clone());
+                    if meta.clean {
+                        clean_scoped_packages.insert(scoped);
+                    } else {
+                        dirty_scoped_packages.insert(scoped);
+                    }
+                }
+                None => {
+                    packages_with_unknown_scope.insert(meta.package.clone());
+                }
+            }
+        }
+        clean_packages.retain(|pkg| !dirty_packages.contains(pkg));
+        clean_scoped_packages.retain(|scope| !dirty_scoped_packages.contains(scope));
+        self.completeness.project_packages_complete = clean_packages;
+        self.completeness.project_scoped_packages_complete = clean_scoped_packages;
+        self.completeness.project_packages_with_unknown_scope = packages_with_unknown_scope;
+        self.completeness.project_package_modules = package_modules
+            .into_iter()
+            .collect();
     }
 
     /// `textDocument/codeAction`: conservative import actions over the current document.
@@ -1006,22 +1109,33 @@ fn parse_project_file(
     java: &mut JavaParser,
 ) -> Option<ProjectFileIndex> {
     let text = std::fs::read_to_string(path).ok()?;
-    let (symbols, usages, clean) = match path.extension().and_then(|e| e.to_str()) {
+    let (package, symbols, usages, clean) = match path.extension().and_then(|e| e.to_str()) {
         Some("kt") | Some("kts") => {
             let tree = kotlin.parse(&text);
             let clean = !tree.root_node().has_error();
             let pkg = package_of(&tree, &text);
-            (extract_symbols(&tree, &text, &pkg), extract_usages(&tree, &text), clean)
+            (
+                pkg.clone(),
+                extract_symbols(&tree, &text, &pkg),
+                extract_usages(&tree, &text),
+                clean,
+            )
         }
         Some("java") => {
             let tree = java.parse(&text);
             let clean = !tree.root_node().has_error();
-            (crate::java::extract_symbols(&tree, &text), Vec::new(), clean)
+            let symbols = crate::java::extract_symbols(&tree, &text);
+            let package = symbols
+                .first()
+                .map(|sym| sym.package.clone())
+                .unwrap_or_default();
+            (package, symbols, Vec::new(), clean)
         }
         _ => return None,
     };
     Some(ProjectFileIndex {
         key: path.to_string_lossy().to_string(),
+        package,
         symbols,
         usages,
         clean,

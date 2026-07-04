@@ -93,6 +93,10 @@ async fn initialize_open_and_goto_definition() {
         init.capabilities.execute_command_provider.is_some(),
         "server must advertise workspace command support"
     );
+    assert!(
+        init.capabilities.diagnostic_provider.is_some(),
+        "server must advertise pull diagnostics support"
+    );
     // and completion support with a `.` trigger character
     let completion = init
         .capabilities
@@ -122,6 +126,42 @@ async fn initialize_open_and_goto_definition() {
             },
         })
         .await;
+
+    let diagnostic = backend
+        .diagnostic(DocumentDiagnosticParams {
+            text_document: TextDocumentIdentifier { uri: uri.clone() },
+            identifier: None,
+            previous_result_id: None,
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    match diagnostic {
+        DocumentDiagnosticReportResult::Report(DocumentDiagnosticReport::Full(report)) => {
+            assert!(
+                report.full_document_diagnostic_report.items.is_empty(),
+                "clean file should have no fast diagnostics: {report:?}"
+            );
+        }
+        other => panic!("expected full document diagnostic report, got {other:?}"),
+    }
+
+    let workspace_diag = backend
+        .workspace_diagnostic(WorkspaceDiagnosticParams {
+            identifier: None,
+            previous_result_ids: Vec::new(),
+            work_done_progress_params: Default::default(),
+            partial_result_params: Default::default(),
+        })
+        .await
+        .unwrap();
+    match workspace_diag {
+        WorkspaceDiagnosticReportResult::Report(report) => {
+            assert_eq!(report.items.len(), 1, "one open buffer should be reported: {report:?}");
+        }
+        other => panic!("expected workspace diagnostic report, got {other:?}"),
+    }
 
     // goto-definition on the `helper()` call on line 1
     let character = text.lines().nth(2).unwrap().find("helper").unwrap() as u32;

@@ -14,6 +14,8 @@ Use `dev/ktlsp-harness.sh` for editor-facing validation:
   did-change behavior.
 - `dev/ktlsp-harness.sh library` — use when dependency-source indexing, default imports, stdlib, or
   external library symbols may be affected.
+- `dev/ktlsp-harness.sh goodnotes` — use when validating GoodNotes-derived semantic shapes such as
+  result chains, receiver-style scope functions, or KMP source-set narrowing.
 - `dev/ktlsp-harness.sh project --root <dir> --file <file.kt>` — use for ad hoc reproduction on a
   real or generated Kotlin project.
 - `dev/ktlsp-harness.sh gradle-live` — use for the broader `dev/gradle-sample` editor probe,
