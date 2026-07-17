@@ -1,0 +1,20 @@
+[package]
+name = "ktcore"
+version = "0.1.0"
+edition = "2021"
+description = "Shared parser, indexing, inference, and diagnostics core for Kotlin tools"
+license = "MIT"
+repository = "https://github.com/pepegar/ktlsp"
+
+[lib]
+name = "ktcore"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+tree-sitter.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-kotlin-ng.workspace = true
+tracing.workspace = true
+walkdir.workspace = true

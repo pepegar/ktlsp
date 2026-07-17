@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ktlsp | Fast Kotlin Language Tooling in Rust</title>
+    <meta
+      name="description"
+      content="ktlsp is a fast, lightweight Kotlin language server in Rust focused on navigation, editor feedback, and conservative correctness."
+    />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=IBM+Plex+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <div class="page-shell">
+      <header class="site-header">
+        <div class="brand-block">
+          <span class="eyebrow">ktlsp</span>
+          <p class="brand-copy">Fast Kotlin language tooling in Rust.</p>
+        </div>
+        <nav class="site-nav" aria-label="Primary">
+          <a href="https://github.com/pepegar/ktlsp">GitHub</a>
+          <a href="https://github.com/pepegar/ktlsp/blob/main/README.md">README</a>
+        </nav>
+      </header>
+
+      <main>
+        <section class="hero">
+          <div class="hero-copy">
+            <p class="kicker">Toward a production-ready Kotlin LSP</p>
+            <h1>Useful editor answers without dragging a full compiler stack into every request.</h1>
+            <p class="lede">
+              ktlsp is a lightweight Kotlin language server built around tree-sitter, a Rust core,
+              and a conservative semantic model. It favors fast startup, fast navigation, and
+              returning no result over returning the wrong result.
+            </p>
+            <div class="hero-actions">
+              <a class="button button-primary" href="https://github.com/pepegar/ktlsp">View repository</a>
+              <a class="button button-secondary" href="https://github.com/pepegar/ktlsp/blob/main/README.md">Read setup guide</a>
+            </div>
+          </div>
+
+          <aside class="signal-panel" aria-label="Project highlights">
+            <div>
+              <span class="signal-label">Design goal</span>
+              <strong>Fast, conservative, hackable</strong>
+            </div>
+            <div>
+              <span class="signal-label">Runtime model</span>
+              <strong>Rust + tree-sitter + LSP over stdio</strong>
+            </div>
+            <div>
+              <span class="signal-label">Current surface</span>
+              <strong>Navigation, completion, diagnostics, dependency source jumps</strong>
+            </div>
+            <div>
+              <span class="signal-label">Distribution</span>
+              <strong>Tagged GitHub Releases with precompiled binaries</strong>
+            </div>
+          </aside>
+        </section>
+
+        <section class="section-grid">
+          <article>
+            <p class="section-tag">Why it exists</p>
+            <h2>Keep the editing loop fast.</h2>
+            <p>
+              ktlsp is aimed at Kotlin developers who want responsive editor feedback and real
+              source navigation without accepting heavyweight startup or opaque behavior.
+            </p>
+          </article>
+          <article>
+            <p class="section-tag">What it does today</p>
+            <h2>Cover the features that make daily navigation workable.</h2>
+            <p>
+              Goto definition, references, completion, hover, rename, semantic tokens, hierarchy
+              features, import assistance, and conservative diagnostics are already in place.
+            </p>
+          </article>
+          <article>
+            <p class="section-tag">What makes it credible</p>
+            <h2>Validation goes through a real editor harness.</h2>
+            <p>
+              Editor-visible changes are meant to be proven through `dev/ktlsp-harness.sh`, not
+              only through pure Rust tests, so regressions show up where users actually feel them.
+            </p>
+          </article>
+          <article>
+            <p class="section-tag">How it ships</p>
+            <h2>Release tags now produce downloadable binaries.</h2>
+            <p>
+              The initial release pipeline packages `ktlsp` for Linux, macOS, and Windows and
+              publishes those archives to GitHub Releases with checksums.
+            </p>
+          </article>
+        </section>
+
+        <section class="feature-band">
+          <div>
+            <p class="section-tag">Feature surface</p>
+            <h2>Built around the practical LSP loop.</h2>
+          </div>
+          <div class="feature-columns">
+            <ul>
+              <li>Workspace and library goto definition</li>
+              <li>Find references and rename</li>
+              <li>Completion and import actions</li>
+              <li>Hover, symbols, highlights</li>
+            </ul>
+            <ul>
+              <li>Semantic tokens and inlay hints</li>
+              <li>Selection and folding ranges</li>
+              <li>Implementation and type definition</li>
+              <li>Call and type hierarchy</li>
+            </ul>
+          </div>
+        </section>
+
+        <section class="readiness-strip">
+          <div>
+            <p class="section-tag">Readiness</p>
+            <h2>Not 1.0 yet, but pointed in the right direction.</h2>
+          </div>
+          <p>
+            The project should be presented honestly: strong performance characteristics, a growing
+            editor-validation story, and clear gaps around semantic depth, compatibility guarantees,
+            packaging, and release hardening.
+          </p>
+        </section>
+
+        <section class="steps">
+          <div>
+            <p class="section-tag">Path forward</p>
+            <h2>How ktlsp becomes production ready.</h2>
+          </div>
+          <ol>
+            <li>Raise semantic correctness and tighten diagnostics behavior.</li>
+            <li>Expand harness coverage for every editor-visible feature.</li>
+            <li>Improve installation, packaging, and release discipline.</li>
+            <li>Document compatibility, troubleshooting, and operational expectations.</li>
+          </ol>
+        </section>
+
+        <section class="footer-cta">
+          <p class="section-tag">Get involved</p>
+          <h2>Use it, break it, validate it, and tighten it.</h2>
+          <p>
+            The shortest path to a stronger release is disciplined real-editor testing paired with
+            clear documentation and focused fixes.
+          </p>
+          <a class="button button-primary" href="https://github.com/pepegar/ktlsp">Open the repository</a>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

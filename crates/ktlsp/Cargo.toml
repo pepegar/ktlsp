@@ -1,0 +1,51 @@
+[package]
+name = "ktlsp"
+version = "0.1.0"
+edition = "2021"
+description = "A simple, fast Kotlin language server (goto-definition) built on tree-sitter"
+license = "MIT"
+repository = "https://github.com/pepegar/ktlsp"
+
+[[bin]]
+name = "ktlsp"
+path = "src/main.rs"
+
+[[bin]]
+name = "bench"
+path = "src/bin/bench.rs"
+
+[lib]
+name = "ktlsp"
+path = "src/lib.rs"
+
+[dependencies]
+ktcore = { path = "../ktcore" }
+# LSP transport. Pinned: 0.21+ uses impl-Trait-in-trait (NO async_trait), trait is not object-safe.
+tower-lsp-server.workspace = true
+tokio.workspace = true
+# Parsing. Grammar locked to tree-sitter-kotlin-ng (verified node kinds via examples/dump.rs).
+tree-sitter.workspace = true
+tree-sitter-kotlin-ng.workspace = true
+tree-sitter-java.workspace = true
+# Workspace scanning.
+walkdir.workspace = true
+# Logging to STDERR only (stdout is the JSON-RPC wire).
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+# Library-source indexing: download (blocking, rustls - no OpenSSL), extract jars, parse catalogs.
+ureq.workspace = true
+zip.workspace = true
+toml.workspace = true
+serde.workspace = true
+# Reading `initialization_options` (typed `Option<serde_json::Value>` by ls-types, which doesn't
+# re-export Value).
+serde_json.workspace = true
+# Persistent library-symbol cache: serialize indexed symbols keyed by a jar fingerprint.
+bincode.workspace = true
+sha2.workspace = true
+salsa.workspace = true
+zstd.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+pprof = { version = "0.15", default-features = false, features = ["flamegraph"] }
