@@ -83,15 +83,15 @@ formatter such as `ktfmt`.
 A July 2026 protocol-level comparison used Pinterest ktlint (multi-module JVM) and Square Okio
 (Kotlin Multiplatform), with one cold run and medians of three warm process restarts.
 
-| Workload | Metric | ktlsp | JetBrains Kotlin LSP |
-| --- | --- | ---: | ---: |
-| ktlint, cold | First verified cross-file definition | **0.51 s** | 11.12 s |
-| ktlint, warm | First verified cross-file definition | **0.51 s** | 1.98 s |
-| ktlint, warm | Completion latency | **0.8 ms** | 182.2 ms |
-| ktlint, warm | References latency | **5.9 ms** | 58.3 ms |
-| ktlint, warm | Rename edit computation | **5.4 ms** | 2,903.6 ms |
-| ktlint, warm | Post-index/import RSS | 1,390.9 MiB | **1,173.9 MiB** |
-| Okio KMP, cold | First verified cross-file definition | **0.51 s** | No result within 60 s |
+| Workload | Metric | ktlsp | JetBrains Kotlin LSP | Relative result |
+| --- | --- | ---: | ---: | ---: |
+| ktlint, cold | First verified cross-file definition | **0.51 s** | 11.12 s | ktlsp **21.7x sooner** |
+| ktlint, warm | First verified cross-file definition | **0.51 s** | 1.98 s | ktlsp **3.9x sooner** |
+| ktlint, warm | Completion latency | **0.8 ms** | 182.2 ms | ktlsp **228x faster** |
+| ktlint, warm | References latency | **5.9 ms** | 58.3 ms | ktlsp **9.9x faster** |
+| ktlint, warm | Rename edit computation | **5.4 ms** | 2,903.6 ms | ktlsp **538x faster** |
+| ktlint, warm | Post-index/import RSS | 1,390.9 MiB | **1,173.9 MiB** | ktlsp uses **1.18x the RSS** |
+| Okio KMP, cold | First verified cross-file definition | **0.51 s** | No result within 60 s | ktlsp **>116x sooner** within timeout |
 
 `ktlsp` becomes useful much earlier and keeps foreground requests fast, but its fully loaded
 dependency/JDK index is not always smaller than JetBrains' persisted model. JetBrains also provides
