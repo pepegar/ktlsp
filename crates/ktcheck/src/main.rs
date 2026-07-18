@@ -16,6 +16,7 @@ use ktcore::symbol::IndexedSymbol;
 use ktcore::text::LineIndex;
 use ktlsp::artifacts::{self, Repos};
 use ktlsp::classpath;
+use ktlsp::coords;
 use ktlsp::deps;
 use ktlsp::java::JavaParser;
 use ktlsp::language::{self, SourceLanguage};
@@ -56,7 +57,7 @@ fn run(cli: CliArgs) -> anyhow::Result<i32> {
     };
 
     let files = discover_source_files(&roots)?;
-    let scans = scan_files(files);
+    let mut scans = scan_files(files);
     let durable = if cli.with_libs {
         load_durable_library_symbols_cached(&roots, &scans)
     } else {
@@ -65,7 +66,7 @@ fn run(cli: CliArgs) -> anyhow::Result<i32> {
     let (index, completeness) = if run_indexed_diagnostics {
         let completeness = completeness_from_scans(&scans, &durable, cli.closed_world);
         (
-            Some(Arc::new(build_index(&scans, durable))),
+            Some(Arc::new(build_index(&mut scans, durable))),
             Some(Arc::new(completeness)),
         )
     } else {
@@ -136,6 +137,10 @@ struct ScannedFile {
     package: String,
     symbols: Vec<IndexedSymbol>,
     usages: Vec<Usage>,
+    /// Counts captured at scan time: `build_index` drains `symbols`/`usages` into the index
+    /// (moving beats cloning 60k+ symbol structs), and the summary line reads these instead.
+    symbol_count: usize,
+    usage_count: usize,
     parser_diagnostics: Vec<Diagnostic>,
     clean: bool,
 }
@@ -381,6 +386,8 @@ fn scan_file(
         language,
         text,
         tree,
+        symbol_count: facts.symbols.len(),
+        usage_count: facts.usages.len(),
         package: facts.package,
         symbols: facts.symbols,
         usages: facts.usages,
@@ -492,8 +499,8 @@ fn analyze_scan(
         path: scan.path,
         text: scan.text,
         diagnostics,
-        symbol_count: scan.symbols.len(),
-        usage_count: scan.usages.len(),
+        symbol_count: scan.symbol_count,
+        usage_count: scan.usage_count,
         clean: scan.clean,
     }
 }
@@ -502,15 +509,15 @@ fn durable_indexes_complete_for_java_call_shape(completeness: &CompletenessFacts
     completeness.library_index_complete && completeness.jdk_index_complete
 }
 
-fn build_index(scans: &[ScannedFile], durable: DurableLoad) -> Index {
+fn build_index(scans: &mut [ScannedFile], durable: DurableLoad) -> Index {
     let mut index = Index::new();
     for file in durable.files {
         index.replace_file(&file.file, file.symbols, Tier::Durable);
     }
     for scan in scans {
         let key = scan.path.to_string_lossy().to_string();
-        index.replace_file(&key, scan.symbols.clone(), Tier::Volatile);
-        index.replace_file_refs(&key, scan.usages.clone());
+        index.replace_file(&key, std::mem::take(&mut scan.symbols), Tier::Volatile);
+        index.replace_file_refs(&key, std::mem::take(&mut scan.usages));
     }
     index
 }
@@ -845,6 +852,7 @@ fn load_durable_library_symbols(roots: &[PathBuf], scans: &[ScannedFile]) -> Dur
         if coords.is_empty() {
             coords = classpath::coordinates_from_classpath(root);
         }
+        prefetch_durable_downloads(&coords, &repos, &extract_root);
         let mut coord_queue: VecDeque<_> =
             coords.into_iter().map(|coord| (coord, 0usize)).collect();
         let mut seen_coords = BTreeSet::new();
@@ -939,6 +947,46 @@ fn push_local_jar_task(
 ) {
     if stubbed_jars.insert(jar.clone()) {
         tasks.push(DurableResolveTask::LocalJar(jar));
+    }
+}
+
+/// Download POMs and sources jars for the known depth-0 coordinates concurrently, before the
+/// sequential coordinate BFS needs them. The BFS (and its version-selector ordering) is
+/// unchanged: its per-coordinate `dependency_coordinates_with_remote_pom` / `coordinate_source`
+/// calls hit the warmed disk cache instead of serializing one network round trip per
+/// coordinate. Downloads are idempotent (destination check + `.part` rename + `.missing`
+/// markers), and the binary-jar fallback for source-less coordinates stays lazy inside the BFS.
+fn prefetch_durable_downloads(coords: &[coords::Coordinate], repos: &Repos, extract_root: &Path) {
+    if coords.len() < 2 {
+        for coord in coords {
+            let _ = artifacts::dependency_coordinates_with_remote_pom(repos, coord);
+            let _ = deps::coordinate_source(coord, repos, extract_root);
+        }
+        return;
+    }
+    let queue = Arc::new(parking_lot::Mutex::new(VecDeque::from(coords.to_vec())));
+    let repos = Arc::new(repos.clone());
+    let extract_root = Arc::new(extract_root.to_path_buf());
+    let workers = worker_count(coords.len());
+    let mut handles = Vec::new();
+    for _ in 0..workers {
+        let queue = Arc::clone(&queue);
+        let repos = Arc::clone(&repos);
+        let extract_root = Arc::clone(&extract_root);
+        handles.push(std::thread::spawn(move || loop {
+            let coord = {
+                let mut guard = queue.lock();
+                guard.pop_front()
+            };
+            let Some(coord) = coord else {
+                break;
+            };
+            let _ = artifacts::dependency_coordinates_with_remote_pom(&repos, &coord);
+            let _ = deps::coordinate_source(&coord, &repos, &extract_root);
+        }));
+    }
+    for handle in handles {
+        let _ = handle.join();
     }
 }
 
@@ -1411,13 +1459,13 @@ mod tests {
         )
         .unwrap();
 
-        let scans = scan_files(vec![file.clone()]);
+        let mut scans = scan_files(vec![file.clone()]);
         assert_eq!(scans.len(), 1);
         assert_eq!(scans[0].language, SourceLanguage::Java);
 
         let durable = DurableLoad::default();
         let completeness = completeness_from_scans(&scans, &durable, false);
-        let index = build_index(&scans, durable);
+        let index = build_index(&mut scans, durable);
         let analyses = analyze_scans(
             scans,
             Some(Arc::new(index)),
@@ -1434,14 +1482,14 @@ mod tests {
             "incomplete durable indexes should suppress Java unresolved imports: {messages:?}"
         );
 
-        let scans = scan_files(vec![file.clone()]);
+        let mut scans = scan_files(vec![file.clone()]);
         let durable = DurableLoad {
             library_index_complete: true,
             jdk_index_complete: true,
             ..DurableLoad::default()
         };
         let completeness = completeness_from_scans(&scans, &durable, false);
-        let index = build_index(&scans, durable);
+        let index = build_index(&mut scans, durable);
         let analyses = analyze_scans(
             scans,
             Some(Arc::new(index)),

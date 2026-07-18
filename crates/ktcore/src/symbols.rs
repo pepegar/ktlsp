@@ -28,7 +28,7 @@ pub struct SymbolSummary {
 impl SymbolSummary {
     pub fn from_entry(entry: &Entry) -> Self {
         SymbolSummary {
-            file: entry.path.clone(),
+            file: entry.path.to_string(),
             name: entry.sym.name.clone(),
             kind: entry.sym.kind,
             package: entry.sym.package.clone(),

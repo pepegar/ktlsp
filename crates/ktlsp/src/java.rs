@@ -85,16 +85,22 @@ pub fn extract_usages(tree: &Tree, src: &str) -> Vec<Usage> {
     // once; typical files avoid the long sequence of small Vec reallocations.
     let mut out = Vec::with_capacity(src.len() / 48);
     let mut cursor = tree.walk();
-    collect_usages(&mut cursor, src, &mut out);
+    let mut interner = ktcore::indexer::UsageInterner::default();
+    collect_usages(&mut cursor, src, &mut out, &mut interner);
     out
 }
 
-fn collect_usages(cursor: &mut tree_sitter::TreeCursor, src: &str, out: &mut Vec<Usage>) {
+fn collect_usages<'a>(
+    cursor: &mut tree_sitter::TreeCursor,
+    src: &'a str,
+    out: &mut Vec<Usage>,
+    interner: &mut ktcore::indexer::UsageInterner<'a>,
+) {
     let mut stack = vec![cursor.node()];
     while let Some(node) = stack.pop() {
         if is_identifier(node) {
             out.push(Usage {
-                name: node_text(node, src).to_string(),
+                name: interner.intern(node_text(node, src)),
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
             });
@@ -1536,7 +1542,7 @@ fn goto_definition_with_imports(
         }
         if is_visible(&package, &imports, sym) {
             candidates.push(Def {
-                file: entry.path.clone(),
+                file: entry.path.to_string(),
                 start_byte: sym.start_byte,
                 end_byte: sym.end_byte,
             });
@@ -1695,7 +1701,7 @@ fn type_defs_for_receiver(index: &Index, ty: &ReceiverType) -> Vec<Def> {
                 .is_none_or(|pkg| entry.sym.package == *pkg)
         })
         .map(|entry| Def {
-            file: entry.path.clone(),
+            file: entry.path.to_string(),
             start_byte: entry.sym.start_byte,
             end_byte: entry.sym.end_byte,
         })
@@ -2188,7 +2194,7 @@ fn receiver_member_defs(
     let mut defs = members
         .iter()
         .map(|entry| Def {
-            file: entry.path.clone(),
+            file: entry.path.to_string(),
             start_byte: entry.sym.start_byte,
             end_byte: entry.sym.end_byte,
         })
@@ -2642,7 +2648,7 @@ fn qualified_member_defs(
         let members = narrow_java_entries_by_field_access_arity(src, parent, members);
         for member in members {
             defs.push(Def {
-                file: member.path.clone(),
+                file: member.path.to_string(),
                 start_byte: member.sym.start_byte,
                 end_byte: member.sym.end_byte,
             });
@@ -3062,7 +3068,7 @@ public class App {
 }
 "#;
         let u = usages(src);
-        let names: Vec<&str> = u.iter().map(|x| x.name.as_str()).collect();
+        let names: Vec<&str> = u.iter().map(|x| x.name.as_ref()).collect();
         assert!(
             names.contains(&"App"),
             "type identifier App should be a usage"

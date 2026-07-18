@@ -6,9 +6,9 @@
 //! whole-file replace/remove. The tier split makes "a keystroke can't disturb library symbols"
 //! structural, and marks exactly the set that the persistent symbol cache serializes.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::fxhash::FxHashMap;
 use crate::symbol::{IndexedSymbol, SymbolKind};
 use crate::types::TypeRef;
 
@@ -25,15 +25,18 @@ pub enum Tier {
 #[derive(Clone, Debug)]
 pub struct Entry {
     /// Canonical file key (a path or URI string — the caller picks one identity scheme).
-    pub path: String,
+    pub path: Arc<str>,
     pub tier: Tier,
     pub sym: Arc<IndexedSymbol>,
 }
 
 /// An identifier *usage* produced by the reverse-reference pass (carries its own name for removal).
+///
+/// `name` is interned per file at extraction: a project shares most identifier spellings across
+/// thousands of usages, so an `Arc<str>` turns per-usage string clones into refcount bumps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Usage {
-    pub name: String,
+    pub name: Arc<str>,
     pub start_byte: usize,
     pub end_byte: usize,
 }
@@ -46,30 +49,39 @@ pub struct RefEntry {
     pub end_byte: usize,
 }
 
+/// Push an entry into a name->entries bucket, cloning the key only when the bucket is new.
+fn push_entry(map: &mut FxHashMap<String, Vec<Entry>>, key: &str, entry: Entry) {
+    if let Some(entries) = map.get_mut(key) {
+        entries.push(entry);
+    } else {
+        map.insert(key.to_string(), vec![entry]);
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Index {
     /// Source of truth: each file's tier + symbols (for whole-file replace/remove).
-    files: HashMap<String, (Tier, Vec<Arc<IndexedSymbol>>)>,
+    files: FxHashMap<String, (Tier, Vec<Arc<IndexedSymbol>>)>,
     /// Derived lookup: simple name -> entries (both tiers merged).
-    by_name: HashMap<String, Vec<Entry>>,
+    by_name: FxHashMap<String, Vec<Entry>>,
     /// Derived lookup for member completion: container type simple-name -> member entries (the
     /// hot path for `receiver.` completion, so it gets a dedicated maintained map). Keyed off
     /// `sym.container`; top-level symbols (no container) are not recorded here.
-    members_by_container: HashMap<String, Vec<Entry>>,
+    members_by_container: FxHashMap<String, Vec<Entry>>,
     /// Derived lookup for member completion: extension-receiver type simple-name -> extension
     /// entries (`fun T.f` / `val T.p`). Keyed off `sym.ext_receiver`.
-    ext_by_receiver: HashMap<String, Vec<Entry>>,
+    ext_by_receiver: FxHashMap<String, Vec<Entry>>,
     /// Reverse index source of truth: each file's identifier usages (project files only).
-    ref_files: HashMap<String, Vec<Usage>>,
+    ref_files: FxHashMap<String, Vec<Usage>>,
     /// Derived reverse lookup: simple name -> usage sites.
-    refs_by_name: HashMap<String, Vec<RefEntry>>,
+    refs_by_name: FxHashMap<Arc<str>, Vec<RefEntry>>,
 }
 
 #[derive(Clone, Default)]
 pub struct InferenceIndexSnapshot {
-    by_name: HashMap<String, Vec<Entry>>,
-    members_by_container: HashMap<String, Vec<Entry>>,
-    ext_by_receiver: HashMap<String, Vec<Entry>>,
+    by_name: FxHashMap<String, Vec<Entry>>,
+    members_by_container: FxHashMap<String, Vec<Entry>>,
+    ext_by_receiver: FxHashMap<String, Vec<Entry>>,
 }
 
 pub trait InferenceIndex {
@@ -122,29 +134,21 @@ impl Index {
     pub fn replace_file(&mut self, path: &str, symbols: Vec<IndexedSymbol>, tier: Tier) {
         self.remove_symbols(path);
         let symbols: Vec<_> = symbols.into_iter().map(Arc::new).collect();
+        let shared_path: Arc<str> = Arc::from(path);
         for sym in &symbols {
             let entry = Entry {
-                path: path.to_string(),
+                path: Arc::clone(&shared_path),
                 tier,
                 sym: Arc::clone(sym),
             };
-            self.by_name
-                .entry(sym.name.clone())
-                .or_default()
-                .push(entry.clone());
+            push_entry(&mut self.by_name, &sym.name, entry.clone());
             // Member-by-container map: only symbols that ARE members (Some container).
             if let Some(container) = &sym.container {
-                self.members_by_container
-                    .entry(container.clone())
-                    .or_default()
-                    .push(entry.clone());
+                push_entry(&mut self.members_by_container, container, entry.clone());
             }
             // Extension-by-receiver map: only extension functions/properties (Some ext_receiver).
             if let Some(recv) = &sym.ext_receiver {
-                self.ext_by_receiver
-                    .entry(recv.clone())
-                    .or_default()
-                    .push(entry);
+                push_entry(&mut self.ext_by_receiver, recv, entry);
             }
         }
         self.files.insert(path.to_string(), (tier, symbols));
@@ -160,10 +164,10 @@ impl Index {
                 start_byte: u.start_byte,
                 end_byte: u.end_byte,
             };
-            if let Some(entries) = self.refs_by_name.get_mut(&u.name) {
+            if let Some(entries) = self.refs_by_name.get_mut(u.name.as_ref()) {
                 entries.push(entry);
             } else {
-                self.refs_by_name.insert(u.name.clone(), vec![entry]);
+                self.refs_by_name.insert(Arc::clone(&u.name), vec![entry]);
             }
         }
         self.ref_files.insert(path.to_string(), usages);
@@ -191,9 +195,9 @@ impl Index {
 
     /// Remove every entry contributed by `path` from one bucket of a name->entries map, pruning
     /// the now-empty bucket.
-    fn drop_from(map: &mut HashMap<String, Vec<Entry>>, key: &str, path: &str) {
+    fn drop_from(map: &mut FxHashMap<String, Vec<Entry>>, key: &str, path: &str) {
         if let Some(entries) = map.get_mut(key) {
-            entries.retain(|e| e.path != path);
+            entries.retain(|e| e.path.as_ref() != path);
             if entries.is_empty() {
                 map.remove(key);
             }
@@ -203,10 +207,10 @@ impl Index {
     fn remove_refs(&mut self, path: &str) {
         if let Some(old) = self.ref_files.remove(path) {
             for u in old {
-                if let Some(entries) = self.refs_by_name.get_mut(&u.name) {
+                if let Some(entries) = self.refs_by_name.get_mut(u.name.as_ref()) {
                     entries.retain(|e| e.path.as_ref() != path);
                     if entries.is_empty() {
-                        self.refs_by_name.remove(&u.name);
+                        self.refs_by_name.remove(u.name.as_ref());
                     }
                 }
             }
@@ -223,9 +227,10 @@ impl Index {
     pub fn all_entries(&self) -> Vec<Entry> {
         let mut out = Vec::new();
         for (path, (tier, symbols)) in &self.files {
+            let shared_path: Arc<str> = Arc::from(path.as_str());
             for sym in symbols {
                 out.push(Entry {
-                    path: path.clone(),
+                    path: Arc::clone(&shared_path),
                     tier: *tier,
                     sym: Arc::clone(sym),
                 });
@@ -246,10 +251,11 @@ impl Index {
         let Some((tier, symbols)) = self.files.get(path) else {
             return Vec::new();
         };
+        let shared_path: Arc<str> = Arc::from(path);
         let mut out: Vec<Entry> = symbols
             .iter()
             .map(|sym| Entry {
-                path: path.to_string(),
+                path: Arc::clone(&shared_path),
                 tier: *tier,
                 sym: Arc::clone(sym),
             })
@@ -545,7 +551,7 @@ mod tests {
         idx.replace_file_refs(
             "a.kt",
             vec![Usage {
-                name: "before".to_string(),
+                name: Arc::from("before"),
                 start_byte: 10,
                 end_byte: 16,
             }],
@@ -557,7 +563,7 @@ mod tests {
         idx.replace_file_refs(
             "a.kt",
             vec![Usage {
-                name: "after".to_string(),
+                name: Arc::from("after"),
                 start_byte: 20,
                 end_byte: 25,
             }],

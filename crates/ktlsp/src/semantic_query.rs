@@ -787,7 +787,7 @@ fn expand_same_file_function_overloads(
 ) -> Vec<Entry> {
     let Some(seed) = entries
         .iter()
-        .find(|entry| entry.path == file && entry.sym.kind == SymbolKind::Function)
+        .find(|entry| entry.path.as_ref() == file && entry.sym.kind == SymbolKind::Function)
     else {
         return entries;
     };
@@ -795,7 +795,7 @@ fn expand_same_file_function_overloads(
         .lookup_by_name(symbol)
         .iter()
         .filter(|entry| {
-            entry.path == file
+            entry.path.as_ref() == file
                 && entry.sym.kind == SymbolKind::Function
                 && entry.sym.container == seed.sym.container
         })

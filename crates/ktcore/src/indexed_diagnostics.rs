@@ -43,90 +43,203 @@ pub fn compute_with_ctx(
     // JDK. Until both worlds are complete, neither absence nor an exhaustive overload set can be
     // proved, so the per-node completeness checks below can only reject diagnostic candidates.
     if facts.library_index_complete && facts.jdk_index_complete {
-        collect_missing_references(
+        // One pre-order walk serves both checks. The ancestor chain rides down the recursion so
+        // per-identifier classification never redescends the tree; per-call suppression
+        // reproduces the standalone call-shape walk's early exit. Diagnostics are emitted in the
+        // same order as the historical two-pass version: all missing references, then all call
+        // shapes.
+        let mut missing = Vec::new();
+        let mut shapes = Vec::new();
+        let mut ancestors = Vec::new();
+        collect_diagnostics(
             index,
             file,
-            tree,
             src,
             tree.root_node(),
             facts,
             ctx,
-            &mut out,
+            &mut ancestors,
+            false,
+            &mut missing,
+            &mut shapes,
         );
-        collect_call_shape_mismatches(
-            index,
-            file,
-            tree,
-            src,
-            tree.root_node(),
-            facts,
-            ctx,
-            &mut out,
-        );
+        out.append(&mut missing);
+        out.append(&mut shapes);
     }
     out
 }
 
-fn collect_missing_references(
+#[allow(clippy::too_many_arguments)]
+fn collect_diagnostics<'t>(
     index: &Index,
     file: &str,
-    tree: &Tree,
     src: &str,
-    node: Node,
+    node: Node<'t>,
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
-    out: &mut Vec<Diagnostic>,
+    ancestors: &mut Vec<Node<'t>>,
+    suppress_shapes: bool,
+    missing: &mut Vec<Diagnostic>,
+    shapes: &mut Vec<Diagnostic>,
 ) {
     if node.kind() == "identifier" {
-        if resolve::reference_status_with_ctx(index, file, tree, src, node, facts, ctx)
+        if resolve::reference_status_node(index, file, src, node, ancestors, facts, ctx)
             .is_definitely_absent()
         {
             let name = node_text(node, src);
-            out.push(Diagnostic {
+            missing.push(Diagnostic {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 severity: Severity::Error,
                 code: Some(DiagnosticCode::UnresolvedReference),
                 message: format!("Unresolved reference: {name}"),
             });
-            return;
         }
     }
-
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_missing_references(index, file, tree, src, child, facts, ctx, out);
-    }
-}
-
-fn collect_call_shape_mismatches(
-    index: &Index,
-    file: &str,
-    tree: &Tree,
-    src: &str,
-    node: Node,
-    facts: &CompletenessFacts,
-    ctx: &infer::FileCtx,
-    out: &mut Vec<Diagnostic>,
-) {
-    if node.kind() == "call_expression" {
-        if let Some(query) = call_shape_query(index, file, tree, src, node, facts, ctx) {
-            out.push(Diagnostic {
+    let mut child_suppress = suppress_shapes;
+    if node.kind() == "call_expression" && !suppress_shapes {
+        if let Some(query) = call_shape_query(index, file, src, node, ancestors, facts, ctx) {
+            shapes.push(Diagnostic {
                 start_byte: node.start_byte(),
                 end_byte: node.end_byte(),
                 severity: Severity::Error,
                 code: Some(DiagnosticCode::CallShapeMismatch),
                 message: query.diagnostic_message(),
             });
-            return;
+            // The standalone call-shape walk did not descend into a mismatched call, so nested
+            // call expressions are never queried.
+            child_suppress = true;
         }
     }
 
+    ancestors.push(node);
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_call_shape_mismatches(index, file, tree, src, child, facts, ctx, out);
+        collect_diagnostics(
+            index,
+            file,
+            src,
+            child,
+            facts,
+            ctx,
+            ancestors,
+            child_suppress,
+            missing,
+            shapes,
+        );
+    }
+    ancestors.pop();
+}
+
+fn call_shape_query(
+    index: &Index,
+    file: &str,
+    src: &str,
+    call: Node,
+    ancestors: &[Node],
+    facts: &CompletenessFacts,
+    ctx: &infer::FileCtx,
+) -> Option<CallShapeQuery> {
+    if call.kind() != "call_expression" {
+        return None;
+    }
+    let (normalized, normalized_ancestors) =
+        infer::outer_trailing_lambda_call_with_ancestors(call, ancestors);
+    if normalized != call || uses_named_arguments(normalized) {
+        return None;
+    }
+    let (callee, callee_ancestors) = infer::callable_callee_with_path(normalized, normalized_ancestors)?;
+    match callee.kind() {
+        "identifier" => top_level_call_shape_query(
+            index,
+            file,
+            src,
+            normalized,
+            callee,
+            &callee_ancestors,
+            facts,
+            ctx,
+        ),
+        "navigation_expression" => {
+            member_call_shape_query(index, file, src, normalized, callee, facts, ctx)
+        }
+        _ => None,
     }
 }
+
+fn top_level_call_shape_query(
+    index: &Index,
+    file: &str,
+    src: &str,
+    call: Node,
+    ident: Node,
+    ident_ancestors: &[Node],
+    facts: &CompletenessFacts,
+    ctx: &infer::FileCtx,
+) -> Option<CallShapeQuery> {
+    let symbol = node_text(ident, src).to_string();
+    if symbol.is_empty()
+        || !resolve::top_level_call_completeness_reasons_with_ctx(file, &symbol, facts, ctx)
+            .is_empty()
+    {
+        return None;
+    }
+    if visible_durable_top_level_function(index, &symbol, ctx) {
+        return None;
+    }
+    let defs = resolve::goto_node_with_ctx(index, file, src, ident, ident_ancestors, ctx);
+    let mut entries = defs
+        .into_iter()
+        .filter_map(|def| {
+            hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte)
+        })
+        .collect::<Vec<_>>();
+    entries = expand_visible_function_overloads(index, src, file, &symbol, entries, ctx);
+    call_shape_from_entries(index, src, call, symbol, entries, ctx)
+}
+
+fn member_call_shape_query(
+    index: &Index,
+    file: &str,
+    src: &str,
+    call: Node,
+    callee: Node,
+    facts: &CompletenessFacts,
+    ctx: &infer::FileCtx,
+) -> Option<CallShapeQuery> {
+    let recv = callee.named_child(0)?;
+    let ident = callee.named_child(1)?;
+    if ident.kind() != "identifier"
+        || !resolve::member_call_completeness_reasons_in(
+            index,
+            file,
+            src,
+            node_text(ident, src),
+            Some(callee),
+            facts,
+            ctx,
+        )
+        .is_empty()
+    {
+        return None;
+    }
+    let symbol = node_text(ident, src).to_string();
+    if symbol.is_empty() {
+        return None;
+    }
+    let recv_ty = infer::infer(index, recv, src, &ctx);
+    if receiver_world_is_library_or_jdk(index, &recv_ty) {
+        return None;
+    }
+    let entries = member_call_entries(
+        index,
+        &recv_ty,
+        &symbol,
+        &Visibility::new(&ctx.package, &ctx.imports),
+    );
+    call_shape_from_entries(index, src, call, symbol, entries, ctx)
+}
+
 struct CallShapeQuery {
     symbol: String,
     arg_count: usize,
@@ -152,100 +265,6 @@ impl CallShapeQuery {
     }
 }
 
-fn call_shape_query(
-    index: &Index,
-    file: &str,
-    tree: &Tree,
-    src: &str,
-    call: Node,
-    facts: &CompletenessFacts,
-    ctx: &infer::FileCtx,
-) -> Option<CallShapeQuery> {
-    if call.kind() != "call_expression" {
-        return None;
-    }
-    let normalized = outer_trailing_lambda_call(call);
-    if normalized != call || uses_named_arguments(normalized) {
-        return None;
-    }
-    let callee = callable_callee(normalized)?;
-    match callee.kind() {
-        "identifier" => {
-            top_level_call_shape_query(index, file, tree, src, normalized, callee, facts, ctx)
-        }
-        "navigation_expression" => {
-            member_call_shape_query(index, file, tree, src, normalized, callee, facts, ctx)
-        }
-        _ => None,
-    }
-}
-
-fn top_level_call_shape_query(
-    index: &Index,
-    file: &str,
-    tree: &Tree,
-    src: &str,
-    call: Node,
-    ident: Node,
-    facts: &CompletenessFacts,
-    ctx: &infer::FileCtx,
-) -> Option<CallShapeQuery> {
-    let symbol = node_text(ident, src).to_string();
-    if symbol.is_empty()
-        || !resolve::top_level_call_completeness_reasons_with_ctx(file, &symbol, facts, ctx)
-            .is_empty()
-    {
-        return None;
-    }
-    if visible_durable_top_level_function(index, &symbol, ctx) {
-        return None;
-    }
-    let defs = resolve::goto_with_ctx(index, file, src, tree, ident.start_byte(), ctx);
-    let mut entries = defs
-        .into_iter()
-        .filter_map(|def| {
-            hierarchy::entry_for_name_range(index, &def.file, def.start_byte, def.end_byte)
-        })
-        .collect::<Vec<_>>();
-    entries = expand_visible_function_overloads(index, src, file, &symbol, entries, ctx);
-    call_shape_from_entries(index, src, call, symbol, entries, ctx)
-}
-
-fn member_call_shape_query(
-    index: &Index,
-    file: &str,
-    _tree: &Tree,
-    src: &str,
-    call: Node,
-    callee: Node,
-    facts: &CompletenessFacts,
-    ctx: &infer::FileCtx,
-) -> Option<CallShapeQuery> {
-    let recv = callee.named_child(0)?;
-    let ident = callee.named_child(1)?;
-    if ident.kind() != "identifier"
-        || !resolve::member_call_completeness_reasons_with_ctx(index, file, src, ident, facts, ctx)
-            .is_empty()
-    {
-        return None;
-    }
-    let symbol = node_text(ident, src).to_string();
-    if symbol.is_empty() {
-        return None;
-    }
-    let recv_ty = infer::infer(index, recv, src, &ctx);
-    if receiver_world_is_library_or_jdk(index, &recv_ty) {
-        return None;
-    }
-    let entries = member_call_entries(
-        index,
-        &recv_ty,
-        &symbol,
-        &Visibility::new(&ctx.package, &ctx.imports),
-    );
-    call_shape_from_entries(index, src, call, symbol, entries, ctx)
-}
-
 fn call_shape_from_entries(
     index: &Index,
     src: &str,
@@ -266,7 +285,7 @@ fn call_shape_from_entries(
         return None;
     }
     let arg_count = value_arg_count(call);
-    let uses_trailing_lambda = has_trailing_lambda(call);
+    let uses_trailing_lambda = infer::has_trailing_lambda(call);
     if entries
         .iter()
         .any(|entry| call_accepts_arg_count(index, entry, arg_count, uses_trailing_lambda, ctx))
@@ -520,7 +539,7 @@ fn expand_visible_function_overloads(
     }
     let Some(seed) = entries
         .iter()
-        .find(|entry| entry.path == file && entry.sym.kind == SymbolKind::Function)
+        .find(|entry| entry.path.as_ref() == file && entry.sym.kind == SymbolKind::Function)
     else {
         expanded.sort_by(entry_sort_key);
         expanded.dedup_by(entry_identity_eq);
@@ -531,7 +550,7 @@ fn expand_visible_function_overloads(
             .lookup_by_name(symbol)
             .iter()
             .filter(|entry| {
-                entry.path == file
+                entry.path.as_ref() == file
                     && entry.sym.kind == SymbolKind::Function
                     && entry.sym.container == seed.sym.container
             })
@@ -732,15 +751,10 @@ fn value_arg_count(call: Node) -> usize {
             }
         }
     }
-    if has_trailing_lambda(call) {
+    if infer::has_trailing_lambda(call) {
         n += 1;
     }
     n
-}
-
-fn has_trailing_lambda(call: Node) -> bool {
-    child_of_kind(call, "annotated_lambda").is_some()
-        || child_of_kind(call, "lambda_literal").is_some()
 }
 
 fn call_accepts_arg_count(
@@ -758,31 +772,6 @@ fn call_accepts_arg_count(
     } as usize;
     let max = entry.sym.arity.expect("guarded above") as usize;
     (min..=max).contains(&arg_count)
-}
-
-fn outer_trailing_lambda_call(mut call: Node) -> Node {
-    while let Some(parent) = call.parent() {
-        if parent.kind() == "call_expression"
-            && parent.named_child(0) == Some(call)
-            && has_trailing_lambda(parent)
-        {
-            call = parent;
-        } else {
-            break;
-        }
-    }
-    call
-}
-
-fn callable_callee(mut call: Node) -> Option<Node> {
-    loop {
-        let callee = call.named_child(0)?;
-        if callee.kind() == "call_expression" {
-            call = callee;
-        } else {
-            return Some(callee);
-        }
-    }
 }
 
 fn uses_named_arguments(call: Node) -> bool {

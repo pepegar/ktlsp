@@ -38,7 +38,7 @@ pub fn item_from_entry(entry: &Entry) -> HierarchyItem {
         name: entry.sym.name.clone(),
         kind: entry.sym.kind,
         package: entry.sym.package.clone(),
-        file: entry.path.clone(),
+        file: entry.path.to_string(),
         start_byte: entry.sym.start_byte,
         end_byte: entry.sym.end_byte,
     }
@@ -61,7 +61,7 @@ pub fn type_implementations(index: &Index, target: &HierarchyItem) -> Vec<Def> {
                     .any(|supertype| supertype == &target.name)
         })
         .map(|entry| Def {
-            file: entry.path,
+            file: entry.path.to_string(),
             start_byte: entry.sym.start_byte,
             end_byte: entry.sym.end_byte,
         })
@@ -109,7 +109,7 @@ pub fn implementations(index: &Index, target: &Entry) -> Vec<Def> {
                     .filter(|member| member.sym.kind == target.sym.kind)
                     .filter(|member| member_signatures_match(target, member))
                     .map(|member| Def {
-                        file: member.path.clone(),
+                        file: member.path.to_string(),
                         start_byte: member.sym.start_byte,
                         end_byte: member.sym.end_byte,
                     }),
@@ -191,7 +191,7 @@ pub fn type_definition(index: &Index, tree: &Tree, text: &str, offset: usize) ->
         .into_iter()
         .filter(|entry| ty.package().map_or(true, |pkg| entry.sym.package == pkg))
         .map(|entry| Def {
-            file: entry.path.clone(),
+            file: entry.path.to_string(),
             start_byte: entry.sym.start_byte,
             end_byte: entry.sym.end_byte,
         })

@@ -6,6 +6,9 @@
 //! subtrees, because terse-but-valid Kotlin (e.g. several one-line classes) can collapse large
 //! spans into `ERROR` nodes and we must still recover the declarations inside.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
 use tree_sitter::Node;
 
 use crate::defaults::DEFAULT_IMPORT_PACKAGES;
@@ -110,14 +113,37 @@ pub fn extract_usages(tree: &tree_sitter::Tree, src: &str) -> Vec<Usage> {
     // conservatively at the upper end avoids repeated growth on identifier-dense files without
     // retaining a large mostly-empty allocation for generated or comment-heavy sources.
     let mut out = Vec::with_capacity(src.len() / 48);
-    collect_usages(tree.root_node(), src, &mut out);
+    let mut interner = UsageInterner::default();
+    collect_usages(tree.root_node(), src, &mut out, &mut interner);
     out
 }
 
-fn collect_usages(node: Node, src: &str, out: &mut Vec<Usage>) {
+/// Per-file identifier interner: one allocation per distinct spelling, refcount bumps for every
+/// repeat. A file repeats most identifier spellings (declarations + usages), so this removes the
+/// majority of per-usage string copies.
+#[derive(Default)]
+pub struct UsageInterner<'a>(HashMap<&'a str, Arc<str>>);
+
+impl<'a> UsageInterner<'a> {
+    pub fn intern(&mut self, name: &'a str) -> Arc<str> {
+        if let Some(hit) = self.0.get(name) {
+            return Arc::clone(hit);
+        }
+        let shared: Arc<str> = Arc::from(name);
+        self.0.insert(name, Arc::clone(&shared));
+        shared
+    }
+}
+
+fn collect_usages<'a>(
+    node: Node,
+    src: &'a str,
+    out: &mut Vec<Usage>,
+    interner: &mut UsageInterner<'a>,
+) {
     if node.kind() == "identifier" {
         out.push(Usage {
-            name: node_text(node, src).to_string(),
+            name: interner.intern(node_text(node, src)),
             start_byte: node.start_byte(),
             end_byte: node.end_byte(),
         });
@@ -126,7 +152,7 @@ fn collect_usages(node: Node, src: &str, out: &mut Vec<Usage>) {
     // large anonymous-token surface while preserving source-order traversal.
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        collect_usages(child, src, out);
+        collect_usages(child, src, out, interner);
     }
 }
 
@@ -1244,7 +1270,7 @@ mod tests {
         let src = "package app\nclass Greeter { fun greet(name: String) = name }\n";
         let tree = KotlinParser::new().parse(src);
         let usages = extract_usages(&tree, src);
-        let names: Vec<_> = usages.iter().map(|usage| usage.name.as_str()).collect();
+        let names: Vec<_> = usages.iter().map(|usage| usage.name.as_ref()).collect();
         assert_eq!(names, ["app", "Greeter", "greet", "name", "String", "name"]);
     }
 

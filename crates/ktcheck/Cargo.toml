@@ -15,6 +15,7 @@ anyhow.workspace = true
 bincode.workspace = true
 ktcore = { path = "../ktcore" }
 ktlsp = { path = "../ktlsp" }
+parking_lot.workspace = true
 serde.workspace = true
 sha2.workspace = true
 tree-sitter.workspace = true

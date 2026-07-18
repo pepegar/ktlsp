@@ -7,6 +7,7 @@
 pub mod coords;
 pub mod defaults;
 pub mod diagnostics;
+pub mod fxhash;
 pub mod hierarchy;
 pub mod hints;
 pub mod index;

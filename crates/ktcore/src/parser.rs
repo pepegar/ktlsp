@@ -89,6 +89,22 @@ pub fn node_text<'a>(node: Node, src: &'a str) -> &'a str {
     node.utf8_text(src.as_bytes()).unwrap_or("")
 }
 
+/// The node's ancestor chain, root-first (`last()` is the node's parent).
+///
+/// `Node::parent` redescends from the tree root on every call, so hot paths that need more than
+/// one ancestor should receive this slice from a caller that already has it (e.g. a recursive
+/// traversal) instead of chasing parents per query.
+pub(crate) fn ancestors_of<'t>(node: Node<'t>) -> Vec<Node<'t>> {
+    let mut out = Vec::new();
+    let mut cur = node.parent();
+    while let Some(parent) = cur {
+        out.push(parent);
+        cur = parent.parent();
+    }
+    out.reverse();
+    out
+}
+
 pub fn identifier_at(tree: &Tree, offset: usize) -> Option<Node<'_>> {
     let root = tree.root_node();
     for off in [offset, offset.saturating_sub(1)] {

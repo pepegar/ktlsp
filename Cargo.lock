@@ -656,6 +656,7 @@ dependencies = [
  "bincode",
  "ktcore",
  "ktlsp",
+ "parking_lot",
  "pprof",
  "serde",
  "sha2",

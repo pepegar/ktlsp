@@ -354,7 +354,7 @@ impl Workspace {
         if candidates.len() == 1 {
             let entry = &candidates[0];
             return Some(vec![Def {
-                file: entry.path.clone(),
+                file: entry.path.to_string(),
                 start_byte: entry.sym.start_byte,
                 end_byte: entry.sym.end_byte,
             }]);

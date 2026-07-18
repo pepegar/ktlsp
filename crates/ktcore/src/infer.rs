@@ -15,6 +15,8 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
+use crate::fxhash::FxHashMap;
+
 use tree_sitter::{Node, Tree};
 
 use crate::index::{Entry, InferenceIndex};
@@ -37,7 +39,12 @@ const SUPERTYPE_CAP: usize = 32;
 pub struct FileCtx {
     pub package: String,
     pub imports: Vec<Import>,
-    inference_cache: RefCell<HashMap<(usize, usize, u16), Type>>,
+    inference_cache: RefCell<FxHashMap<(usize, usize, u16), Type>>,
+    /// Per-node implicit-receiver contributions, keyed by the boundary node's position + kind +
+    /// query depth. Receiver contributions are a pure function of the boundary node within one
+    /// file's analysis, so computing them once per node — rather than once per identifier under
+    /// that node — is what makes per-identifier receiver queries cheap.
+    receiver_cache: RefCell<FxHashMap<(usize, usize, u16, usize), Option<Type>>>,
 }
 
 impl FileCtx {
@@ -45,7 +52,8 @@ impl FileCtx {
         FileCtx {
             package,
             imports,
-            inference_cache: RefCell::new(HashMap::new()),
+            inference_cache: RefCell::new(FxHashMap::default()),
+            receiver_cache: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -718,7 +726,8 @@ fn lambda_receiver_type(
     let mut cur = this_expr.parent();
     while let Some(n) = cur {
         if n.kind() == "lambda_literal" {
-            return lambda_receiver_for_this(index, n, src, ctx, depth, child_infer);
+            let ancestors = crate::parser::ancestors_of(n);
+            return lambda_receiver_for_this(index, n, &ancestors, src, ctx, depth, child_infer);
         }
         cur = n.parent();
     }
@@ -737,33 +746,100 @@ pub fn implicit_receiver_types(
     ctx: &FileCtx,
     depth: usize,
 ) -> Vec<Type> {
+    let ancestors = crate::parser::ancestors_of(node);
+    implicit_receiver_types_with_ancestors(index, &ancestors, src, ctx, depth)
+}
+
+/// Ancestor-slice variant of [`implicit_receiver_types`]: `ancestors` is the query node's
+/// ancestor chain, root-first (its `last()` is the node's parent). Per-boundary contributions
+/// are memoized in [`FileCtx`], so repeated queries for identifiers under the same lambda,
+/// function, or class pay one slice walk instead of full receiver recomputation.
+pub(crate) fn implicit_receiver_types_with_ancestors(
+    index: &dyn InferenceIndex,
+    ancestors: &[Node],
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Vec<Type> {
     let mut out = Vec::new();
     let mut child_infer = LocalChildInfer;
-    let mut cur = node.parent();
-    while let Some(n) = cur {
-        match n.kind() {
+    for (i, n) in ancestors.iter().enumerate().rev() {
+        let ty = match n.kind() {
             "lambda_literal" => {
-                if let Some(ty) =
-                    lambda_receiver_for_this(index, n, src, ctx, depth, &mut child_infer)
-                {
-                    out.push(ty);
-                }
+                cached_receiver_contribution(index, *n, &ancestors[..i], src, ctx, depth, &mut child_infer)
             }
-            "function_declaration" => {
-                if let Some(receiver) = extension_function_receiver_ref(n, src) {
-                    out.push(resolve_type_ref(index, &receiver, ctx, depth + 1));
-                }
-            }
+            "function_declaration" => cached_fn_receiver_contribution(index, *n, src, ctx, depth),
             "class_declaration" | "object_declaration" => {
-                if let Some(name) = name_field(n).map(|nn| node_text(nn, src)) {
-                    out.push(resolve_type_name(index, name, ctx, false));
-                }
+                cached_class_receiver_contribution(index, *n, src, ctx)
             }
-            _ => {}
+            _ => None,
+        };
+        if let Some(ty) = ty {
+            out.push(ty);
         }
-        cur = n.parent();
     }
     out
+}
+
+fn receiver_cache_lookup(ctx: &FileCtx, node: Node, depth: usize) -> Option<Option<Type>> {
+    ctx.receiver_cache
+        .borrow()
+        .get(&(node.start_byte(), node.end_byte(), node.kind_id(), depth))
+        .cloned()
+}
+
+fn receiver_cache_store(ctx: &FileCtx, node: Node, depth: usize, ty: Option<Type>) -> Option<Type> {
+    ctx.receiver_cache.borrow_mut().insert(
+        (node.start_byte(), node.end_byte(), node.kind_id(), depth),
+        ty.clone(),
+    );
+    ty
+}
+
+fn cached_receiver_contribution(
+    index: &dyn InferenceIndex,
+    lambda: Node,
+    lambda_ancestors: &[Node],
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+    child_infer: &mut impl ChildInfer,
+) -> Option<Type> {
+    if let Some(hit) = receiver_cache_lookup(ctx, lambda, depth) {
+        return hit;
+    }
+    let ty = lambda_receiver_for_this(index, lambda, lambda_ancestors, src, ctx, depth, child_infer);
+    receiver_cache_store(ctx, lambda, depth, ty)
+}
+
+fn cached_fn_receiver_contribution(
+    index: &dyn InferenceIndex,
+    declaration: Node,
+    src: &str,
+    ctx: &FileCtx,
+    depth: usize,
+) -> Option<Type> {
+    if let Some(hit) = receiver_cache_lookup(ctx, declaration, depth) {
+        return hit;
+    }
+    let ty = extension_function_receiver_ref(declaration, src)
+        .map(|receiver| resolve_type_ref(index, &receiver, ctx, depth + 1));
+    receiver_cache_store(ctx, declaration, depth, ty)
+}
+
+fn cached_class_receiver_contribution(
+    index: &dyn InferenceIndex,
+    declaration: Node,
+    src: &str,
+    ctx: &FileCtx,
+) -> Option<Type> {
+    if let Some(hit) = receiver_cache_lookup(ctx, declaration, 0) {
+        return hit;
+    }
+    let ty = name_field(declaration)
+        .map(|name_node| node_text(name_node, src))
+        .map(|name| resolve_type_name(index, name, ctx, false));
+    receiver_cache_store(ctx, declaration, 0, ty)
 }
 
 /// Return the receiver written before an enclosing function's name (`fun Route.setup()`). The
@@ -876,56 +952,85 @@ fn lambda_receiver_or_element(
 /// type that `this` refers to inside the lambda body.
 fn lambda_receiver_for_this(
     index: &dyn InferenceIndex,
-    lambda: Node,
+    _lambda: Node,
+    lambda_ancestors: &[Node],
     src: &str,
     ctx: &FileCtx,
     depth: usize,
     child_infer: &mut impl ChildInfer,
 ) -> Option<Type> {
-    let call = lambda_enclosing_call(lambda)?;
-    let callee = callable_callee(call)?;
+    let call = lambda_enclosing_call(lambda_ancestors)?;
+    let call_ancestors = &lambda_ancestors[..lambda_ancestors.len() - 2];
+    let (call, call_ancestors) = outer_trailing_lambda_call_with_ancestors(call, call_ancestors);
+    let (callee, callee_ancestors) = callable_callee_with_path(call, call_ancestors)?;
     if let Some(recv_ty) =
         hardcoded_receiver_lambda_type(index, callee, src, ctx, depth, child_infer)
     {
         return Some(recv_ty);
     }
-    generic_lambda_receiver_type(index, call, callee, src, ctx, depth, child_infer)
+    generic_lambda_receiver_type(
+        index,
+        call,
+        callee,
+        &callee_ancestors,
+        src,
+        ctx,
+        depth,
+        child_infer,
+    )
 }
 
-fn lambda_enclosing_call(lambda: Node) -> Option<Node> {
-    let call = lambda.parent()?.parent()?; // lambda_literal -> annotated_lambda -> call_expression
+/// The call expression a lambda literal trails: `lambda_literal -> annotated_lambda ->
+/// call_expression`, taken from the ancestor slice (`last()` is the lambda's parent).
+fn lambda_enclosing_call<'t>(lambda_ancestors: &[Node<'t>]) -> Option<Node<'t>> {
+    let call = *lambda_ancestors.get(lambda_ancestors.len().checked_sub(2)?)?;
     if call.kind() != "call_expression" {
         return None;
     }
-    Some(outer_trailing_lambda_call(call))
+    Some(call)
 }
 
-fn outer_trailing_lambda_call(mut call: Node) -> Node {
-    while let Some(parent) = call.parent() {
+/// Slice variant of the trailing-lambda climb: walks `call`'s ancestors while they are outer
+/// calls whose first child is the current call and which take a trailing lambda. Returns the
+/// outermost call together with its remaining ancestor slice.
+pub(crate) fn outer_trailing_lambda_call_with_ancestors<'a, 't>(
+    mut call: Node<'t>,
+    mut ancestors: &'a [Node<'t>],
+) -> (Node<'t>, &'a [Node<'t>]) {
+    while let Some((&parent, rest)) = ancestors.split_last() {
         if parent.kind() == "call_expression"
             && parent.named_child(0) == Some(call)
             && has_trailing_lambda(parent)
         {
             call = parent;
+            ancestors = rest;
         } else {
             break;
         }
     }
-    call
+    (call, ancestors)
 }
 
-fn callable_callee(mut call: Node) -> Option<Node> {
+/// Descend nested `foo()()` callee chains to the innermost callee, recording the callee's
+/// ancestor chain (`call_ancestors` plus each call descended through) for receiver queries.
+pub(crate) fn callable_callee_with_path<'t>(
+    call: Node<'t>,
+    call_ancestors: &[Node<'t>],
+) -> Option<(Node<'t>, Vec<Node<'t>>)> {
+    let mut ancestors = call_ancestors.to_vec();
+    let mut current = call;
     loop {
-        let callee = call.named_child(0)?;
+        ancestors.push(current);
+        let callee = current.named_child(0)?;
         if callee.kind() == "call_expression" {
-            call = callee;
+            current = callee;
         } else {
-            return Some(callee);
+            return Some((callee, ancestors));
         }
     }
 }
 
-fn has_trailing_lambda(call: Node) -> bool {
+pub(crate) fn has_trailing_lambda(call: Node) -> bool {
     child_of_kind(call, "annotated_lambda").is_some()
         || child_of_kind(call, "lambda_literal").is_some()
 }
@@ -956,6 +1061,7 @@ fn generic_lambda_receiver_type(
     index: &dyn InferenceIndex,
     call: Node,
     callee: Node,
+    callee_ancestors: &[Node],
     src: &str,
     ctx: &FileCtx,
     depth: usize,
@@ -967,7 +1073,9 @@ fn generic_lambda_receiver_type(
             // A bare callable inside a receiver lambda may itself be a member/extension on an
             // enclosing implicit receiver (`post { ok { ... } }`). Follow the same innermost-first
             // precedence as goto before considering ordinary visible top-level functions.
-            for implicit_receiver in implicit_receiver_types(index, callee, src, ctx, depth + 1) {
+            for implicit_receiver in
+                implicit_receiver_types_with_ancestors(index, callee_ancestors, src, ctx, depth + 1)
+            {
                 let entries = member_call_entries(index, &implicit_receiver, name, ctx);
                 if let Some(receiver) = select_trailing_lambda_receiver_type(
                     index,

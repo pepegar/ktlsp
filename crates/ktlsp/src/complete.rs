@@ -318,7 +318,7 @@ where
 {
     let mut out = Vec::new();
     for entry in index.entries_with_prefix(prefix, true) {
-        if entry.path == file {
+        if entry.path.as_ref() == file {
             continue;
         }
         if !config.include_contained && entry.sym.container.is_some() {

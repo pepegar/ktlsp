@@ -118,7 +118,13 @@ pub enum UseKind {
 }
 
 pub fn use_kind(usage: Node) -> UseKind {
-    if let Some(parent) = usage.parent() {
+    use_kind_in(usage, usage.parent())
+}
+
+/// [`use_kind`] with the parent supplied by the caller (e.g. from an ancestor slice), avoiding
+/// a root-redescending `Node::parent` call per query.
+pub(crate) fn use_kind_in(usage: Node, parent: Option<Node>) -> UseKind {
+    if let Some(parent) = parent {
         match parent.kind() {
             "infix_expression" => return UseKind::Call,
             "navigation_expression" => {
@@ -162,41 +168,66 @@ pub fn reference_status_with_ctx(
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> ResolutionStatus<()> {
+    let _ = tree;
+    let ancestors = crate::parser::ancestors_of(usage);
+    reference_status_node(index, file, src, usage, &ancestors, facts, ctx)
+}
+
+/// [`reference_status_with_ctx`] with the usage node's ancestor chain supplied root-first by
+/// the caller. Batch traversals that already visit every node pass the chain down so
+/// classification never redescends the tree.
+pub(crate) fn reference_status_node(
+    index: &Index,
+    file: &str,
+    src: &str,
+    usage: Node,
+    ancestors: &[Node],
+    facts: &CompletenessFacts,
+    ctx: &infer::FileCtx,
+) -> ResolutionStatus<()> {
     if usage.kind() != "identifier" {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleName]);
     }
-    if is_non_reference_identifier(usage, src) {
+    let parent = ancestors.last().copied();
+    if is_non_reference_identifier_in(usage, parent, src) {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
     }
-    if is_declaration_identifier(usage) || has_ancestor_kind(usage, &["import", "package_header"]) {
+    if is_declaration_identifier_in(usage, parent)
+        || has_ancestor_kind_a(ancestors, &["import", "package_header"])
+    {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
     }
-    if !goto_with_ctx(index, file, src, tree, usage.start_byte(), ctx).is_empty() {
+    if !goto_node_with_ctx(index, file, src, usage, ancestors, ctx).is_empty() {
         return ResolutionStatus::Found(());
     }
     if node_text(usage, src) == "it" {
-        if has_ancestor_kind(usage, &["lambda_literal"]) {
+        if has_ancestor_kind_a(ancestors, &["lambda_literal"]) {
             return ResolutionStatus::Found(());
         }
         if infer::infer(index, usage, src, ctx).name().is_some() {
             return ResolutionStatus::Found(());
         }
     }
-    match use_kind(usage) {
-        UseKind::Type => simple_type_name_status_with_ctx(index, file, src, usage, facts, ctx),
+    let uk = use_kind_in(usage, parent);
+    match uk {
+        UseKind::Type => {
+            simple_type_name_status_with_ctx(index, file, src, usage, parent, ancestors, facts, ctx)
+        }
         UseKind::Call | UseKind::Value => {
-            if is_navigation_receiver(usage) {
+            if is_navigation_receiver_in(usage, parent) {
                 return ResolutionStatus::Unknown(vec![IncompletenessReason::NotReferencePosition]);
             }
             if !is_simple_identifier(usage) {
                 return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleName]);
             }
-            if !infer::implicit_receiver_types(index, usage, src, ctx, 0).is_empty() {
+            if !infer::implicit_receiver_types_with_ancestors(index, ancestors, src, ctx, 0)
+                .is_empty()
+            {
                 return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
             }
-            simple_name_status(index, file, src, usage, use_kind(usage), facts, ctx)
+            simple_name_status_a(index, file, src, usage, ancestors, uk, facts, ctx)
         }
-        UseKind::MemberSelector => member_name_status(index, file, src, usage, facts, ctx),
+        UseKind::MemberSelector => member_name_status_a(index, file, src, usage, parent, facts, ctx),
     }
 }
 
@@ -218,14 +249,16 @@ pub fn simple_type_name_status(
     usage: Node,
     facts: &CompletenessFacts,
 ) -> ResolutionStatus<()> {
-    if use_kind(usage) != UseKind::Type {
+    let parent = usage.parent();
+    if use_kind_in(usage, parent) != UseKind::Type {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotTypePosition]);
     }
-    if !is_simple_user_type_identifier(usage, src) {
+    if !is_simple_user_type_identifier_in(usage, parent, src) {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleTypeName]);
     }
     let ctx = infer::FileCtx::from_tree(tree, src);
-    simple_type_name_status_with_ctx(index, file, src, usage, facts, &ctx)
+    let ancestors = crate::parser::ancestors_of(usage);
+    simple_type_name_status_with_ctx(index, file, src, usage, parent, &ancestors, facts, &ctx)
 }
 
 fn simple_type_name_status_with_ctx(
@@ -233,20 +266,22 @@ fn simple_type_name_status_with_ctx(
     file: &str,
     src: &str,
     usage: Node,
+    parent: Option<Node>,
+    ancestors: &[Node],
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> ResolutionStatus<()> {
-    if use_kind(usage) != UseKind::Type {
+    if use_kind_in(usage, parent) != UseKind::Type {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotTypePosition]);
     }
-    if !is_simple_user_type_identifier(usage, src) {
+    if !is_simple_user_type_identifier_in(usage, parent, src) {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::NotSimpleTypeName]);
     }
-    simple_name_status(index, file, src, usage, UseKind::Type, facts, ctx)
+    simple_name_status_a(index, file, src, usage, ancestors, UseKind::Type, facts, ctx)
 }
 
-fn is_simple_user_type_identifier(usage: Node, src: &str) -> bool {
-    let Some(parent) = usage.parent() else {
+fn is_simple_user_type_identifier_in(usage: Node, parent: Option<Node>, src: &str) -> bool {
+    let Some(parent) = parent else {
         return false;
     };
     if parent.kind() != "user_type" {
@@ -260,14 +295,14 @@ fn is_simple_identifier(usage: Node) -> bool {
     usage.kind() == "identifier"
 }
 
-fn is_navigation_receiver(usage: Node) -> bool {
-    usage.parent().is_some_and(|parent| {
+fn is_navigation_receiver_in(usage: Node, parent: Option<Node>) -> bool {
+    parent.is_some_and(|parent| {
         parent.kind() == "navigation_expression" && parent.named_child(0) == Some(usage)
     })
 }
 
-fn is_declaration_identifier(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+fn is_declaration_identifier_in(node: Node<'_>, parent: Option<Node<'_>>) -> bool {
+    let Some(parent) = parent else {
         return false;
     };
     match parent.kind() {
@@ -286,8 +321,8 @@ fn is_declaration_identifier(node: Node<'_>) -> bool {
     }
 }
 
-fn is_non_reference_identifier(node: Node<'_>, src: &str) -> bool {
-    if is_named_argument_label(node) {
+fn is_non_reference_identifier_in(node: Node<'_>, parent: Option<Node<'_>>, src: &str) -> bool {
+    if is_named_argument_label_in(node, parent) {
         return true;
     }
     matches!(
@@ -296,8 +331,8 @@ fn is_non_reference_identifier(node: Node<'_>, src: &str) -> bool {
     )
 }
 
-fn is_named_argument_label(node: Node<'_>) -> bool {
-    let Some(parent) = node.parent() else {
+fn is_named_argument_label_in(node: Node<'_>, parent: Option<Node<'_>>) -> bool {
+    let Some(parent) = parent else {
         return false;
     };
     parent.kind() == "value_argument"
@@ -305,28 +340,22 @@ fn is_named_argument_label(node: Node<'_>) -> bool {
         && parent.named_child(0) == Some(node)
 }
 
-fn has_ancestor_kind(node: Node<'_>, kinds: &[&str]) -> bool {
-    let mut current = node.parent();
-    while let Some(parent) = current {
-        if kinds.contains(&parent.kind()) {
-            return true;
-        }
-        current = parent.parent();
-    }
-    false
+fn has_ancestor_kind_a(ancestors: &[Node<'_>], kinds: &[&str]) -> bool {
+    ancestors.iter().any(|n| kinds.contains(&n.kind()))
 }
 
-fn simple_name_status(
+fn simple_name_status_a(
     index: &Index,
     file: &str,
     src: &str,
     usage: Node,
+    ancestors: &[Node],
     uk: UseKind,
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> ResolutionStatus<()> {
     let name = node_text(usage, src);
-    if local_decl(usage, name, uk, src).is_some() {
+    if local_decl_a(usage, ancestors, name, uk, src).is_some() {
         return ResolutionStatus::Found(());
     }
     if has_visible_cross_file(index, name, uk, &ctx.imports, &ctx.package) {
@@ -347,20 +376,21 @@ fn simple_name_status(
     }
 }
 
-fn member_name_status(
+fn member_name_status_a(
     index: &Index,
     file: &str,
     src: &str,
     usage: Node,
+    parent: Option<Node>,
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> ResolutionStatus<()> {
     let name = node_text(usage, src);
-    if member_exists(index, usage, name, src, ctx) {
+    if member_exists_in(index, usage, parent, name, src, ctx) {
         return ResolutionStatus::Found(());
     }
 
-    let Some(nav) = usage.parent() else {
+    let Some(nav) = parent else {
         return ResolutionStatus::Unknown(vec![IncompletenessReason::UnknownReceiverType]);
     };
     let Some(recv) = nav.named_child(0) else {
@@ -516,7 +546,7 @@ fn hierarchy_package_reasons(
             package_world_reasons(
                 &pkg,
                 Some(*entry),
-                &entry.path,
+                entry.path.as_ref(),
                 root_pkg,
                 facts,
                 &mut reasons,
@@ -636,8 +666,29 @@ pub fn member_call_completeness_reasons_with_ctx(
     facts: &CompletenessFacts,
     ctx: &infer::FileCtx,
 ) -> Vec<IncompletenessReason> {
-    let name = node_text(usage, src);
-    let Some(nav) = usage.parent() else {
+    member_call_completeness_reasons_in(
+        index,
+        file,
+        src,
+        node_text(usage, src),
+        usage.parent(),
+        facts,
+        ctx,
+    )
+}
+
+/// [`member_call_completeness_reasons_with_ctx`] with the member name and its
+/// navigation-expression parent supplied by the caller.
+pub(crate) fn member_call_completeness_reasons_in(
+    index: &Index,
+    file: &str,
+    src: &str,
+    name: &str,
+    nav: Option<Node>,
+    facts: &CompletenessFacts,
+    ctx: &infer::FileCtx,
+) -> Vec<IncompletenessReason> {
+    let Some(nav) = nav else {
         return vec![IncompletenessReason::UnknownReceiverType];
     };
     let Some(recv) = nav.named_child(0) else {
@@ -803,21 +854,36 @@ pub fn goto_with_ctx(
         Some(n) => n,
         None => return Vec::new(),
     };
+    let ancestors = crate::parser::ancestors_of(ident);
+    goto_node_with_ctx(index, file, src, ident, &ancestors, ctx)
+}
+
+/// [`goto_with_ctx`] with the identifier node and its ancestor chain (root-first) supplied by
+/// the caller, skipping both the `identifier_at` root descent and per-helper parent lookups.
+pub(crate) fn goto_node_with_ctx(
+    index: &Index,
+    file: &str,
+    src: &str,
+    ident: Node,
+    ancestors: &[Node],
+    ctx: &infer::FileCtx,
+) -> Vec<Def> {
     let name = node_text(ident, src);
     if name.is_empty() {
         return Vec::new();
     }
-    let uk = use_kind(ident);
+    let parent = ancestors.last().copied();
+    let uk = use_kind_in(ident, parent);
 
     // Import declarations are neither value nor type positions. Resolve the imported target (or
     // alias) directly by its qualified path.
-    if let Some(defs) = resolve_import_target(index, ident, src) {
+    if let Some(defs) = resolve_import_target_a(index, ident, ancestors, src) {
         return defs;
     }
 
     // Fully-qualified top-level names (`pkg.Type`, `pkg.func()`) bypass imports. Handle them before
     // the member path so a package-qualified selector is not mistaken for `receiver.member`.
-    if let Some(defs) = resolve_qualified(index, ident, name, uk, src) {
+    if let Some(defs) = resolve_qualified_a(index, ident, ancestors, name, uk, src) {
         if !defs.is_empty() {
             return defs;
         }
@@ -825,20 +891,21 @@ pub fn goto_with_ctx(
 
     // Member access: infer the receiver's type and filter members by it (S6), else best-effort.
     if uk == UseKind::MemberSelector {
-        return resolve_member_with_ctx(index, ident, name, src, tree, ctx);
+        return resolve_member_with_ctx(index, ident, parent, name, src, ctx);
     }
-    if let Some(def) = definition_self(ident, file) {
+    if let Some(def) = definition_self_in(ident, parent, file) {
         return vec![def];
     }
-    if let Some(def) = resolve_local(ident, name, uk, src, file) {
+    if let Some(def) = resolve_local_a(ident, ancestors, name, uk, src, file) {
         return vec![def];
     }
-    if let Some(defs) = resolve_implicit_receiver_member_with_ctx(index, ident, name, src, ctx) {
+    if let Some(defs) = resolve_implicit_receiver_member_with_ctx_a(index, ancestors, name, src, ctx)
+    {
         if !defs.is_empty() {
             return defs;
         }
     }
-    if let Some(defs) = resolve_nested_type(index, src, ident, ctx) {
+    if let Some(defs) = resolve_nested_type_in(index, src, ident, parent, ctx) {
         if !defs.is_empty() {
             return defs;
         }
@@ -847,8 +914,8 @@ pub fn goto_with_ctx(
 }
 
 /// If the cursor is on the defining identifier of a declaration, return its own location.
-fn definition_self(usage: Node, file: &str) -> Option<Def> {
-    let parent = usage.parent()?;
+fn definition_self_in(usage: Node, parent: Option<Node>, file: &str) -> Option<Def> {
+    let parent = parent?;
     let is_self = match parent.kind() {
         "class_declaration" | "object_declaration" | "function_declaration" => {
             name_field(parent) == Some(usage)
@@ -876,18 +943,25 @@ fn def_here(file: &str, node: Node) -> Def {
 // Local resolution
 // ---------------------------------------------------------------------------------------------
 
-fn resolve_local(usage: Node, name: &str, uk: UseKind, src: &str, file: &str) -> Option<Def> {
-    local_decl(usage, name, uk, src).map(|(node, _kind)| def_here(file, node))
+fn resolve_local_a(
+    usage: Node,
+    ancestors: &[Node],
+    name: &str,
+    uk: UseKind,
+    src: &str,
+    file: &str,
+) -> Option<Def> {
+    local_decl_a(usage, ancestors, name, uk, src).map(|(node, _kind)| def_here(file, node))
 }
 
-fn resolve_implicit_receiver_member_with_ctx(
+fn resolve_implicit_receiver_member_with_ctx_a(
     index: &Index,
-    usage: Node,
+    ancestors: &[Node],
     name: &str,
     src: &str,
     ctx: &infer::FileCtx,
 ) -> Option<Vec<Def>> {
-    let receivers = infer::implicit_receiver_types(index, usage, src, &ctx, 0);
+    let receivers = infer::implicit_receiver_types_with_ancestors(index, ancestors, src, &ctx, 0);
     for recv_ty in receivers {
         let Some(ty_name) = recv_ty.name() else {
             continue;
@@ -909,6 +983,9 @@ fn resolve_implicit_receiver_member_with_ctx(
 
 /// Walk ancestor scopes from `usage` and return the nearest declaration's name node + kind.
 /// `pub(crate)` so inference can resolve an identifier to its local/param declaration.
+///
+/// One-shot callers use this direct parent walk (no allocation); batch traversals that already
+/// hold the ancestor chain use [`local_decl_a`] instead.
 pub(crate) fn local_decl<'t>(
     usage: Node<'t>,
     name: &str,
@@ -925,20 +1002,37 @@ pub(crate) fn local_decl<'t>(
     None
 }
 
+/// [`local_decl`] over a caller-supplied ancestor chain (root-first): the walk order —
+/// innermost scope first — is exactly the parent-chain order of the node-based variant.
+pub(crate) fn local_decl_a<'t>(
+    usage: Node<'t>,
+    ancestors: &[Node<'t>],
+    name: &str,
+    uk: UseKind,
+    src: &str,
+) -> Option<(Node<'t>, SymbolKind)> {
+    for scope in ancestors.iter().rev() {
+        if let Some(hit) = decl_in_scope(*scope, name, usage, uk, src) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------------------------
 // Member resolution (S6): type-directed where the receiver's type is inferable, else unique-only.
 // ---------------------------------------------------------------------------------------------
 
 fn resolve_member_with_ctx(
     index: &Index,
-    selector: Node,
+    _selector: Node,
+    parent: Option<Node>,
     name: &str,
     src: &str,
-    _tree: &Tree,
     ctx: &infer::FileCtx,
 ) -> Vec<Def> {
     // `selector` is the `.member` identifier; its parent is the navigation_expression.
-    if let Some(nav) = selector.parent() {
+    if let Some(nav) = parent {
         if nav.kind() == "navigation_expression" {
             if let Some(receiver) = nav.named_child(0) {
                 // Infer the receiver's type (package-qualified) and resolve the member on it —
@@ -981,14 +1075,15 @@ pub fn member_defs_for_type(
     )
 }
 
-fn member_exists(
+fn member_exists_in(
     index: &Index,
-    selector: Node,
+    _selector: Node,
+    parent: Option<Node>,
     name: &str,
     src: &str,
     ctx: &infer::FileCtx,
 ) -> bool {
-    if let Some(nav) = selector.parent() {
+    if let Some(nav) = parent {
         if nav.kind() == "navigation_expression" {
             if let Some(receiver) = nav.named_child(0) {
                 let ty = infer::infer(index, receiver, src, ctx);
@@ -1156,6 +1251,7 @@ fn extension_is_visible(e: &Entry, imports: &[Import], current_pkg: &str) -> boo
 }
 
 /// The name of the class/object enclosing `node`. `pub(crate)` so inference can type `this`.
+/// Direct parent walk: one-shot callers avoid the ancestor-Vec allocation of the batch path.
 pub(crate) fn enclosing_type_name(node: Node, src: &str) -> Option<String> {
     let mut cur = node.parent();
     while let Some(n) = cur {
@@ -1166,6 +1262,7 @@ pub(crate) fn enclosing_type_name(node: Node, src: &str) -> Option<String> {
     }
     None
 }
+
 
 fn decl_in_scope<'t>(
     scope: Node<'t>,
@@ -1381,7 +1478,7 @@ fn collect_var_names<'t>(
 
 fn to_def(e: &Entry) -> Def {
     Def {
-        file: e.path.clone(),
+        file: e.path.to_string(),
         start_byte: e.sym.start_byte,
         end_byte: e.sym.end_byte,
     }
@@ -1464,8 +1561,8 @@ fn is_specific_main_source_set(source_set: &str) -> bool {
     source_set.ends_with("Main") && source_set != "Main" && source_set != "commonMain"
 }
 
-fn resolve_import_target(index: &Index, usage: Node, src: &str) -> Option<Vec<Def>> {
-    let import = ancestor_of_kind(usage, "import")?;
+fn resolve_import_target_a(index: &Index, usage: Node, ancestors: &[Node], src: &str) -> Option<Vec<Def>> {
+    let import = ancestor_of_kind_a(ancestors, "import")?;
     let qid = child_of_kind(import, "qualified_identifier")?;
     let parts = direct_identifier_parts(qid, src);
     if parts.is_empty() {
@@ -1473,7 +1570,7 @@ fn resolve_import_target(index: &Index, usage: Node, src: &str) -> Option<Vec<De
     }
 
     let on_imported_name = parts.last().is_some_and(|(node, _)| *node == usage);
-    let on_alias = usage.parent() == Some(import);
+    let on_alias = ancestors.last().copied() == Some(import);
     if !on_imported_name && !on_alias {
         return Some(Vec::new());
     }
@@ -1481,14 +1578,15 @@ fn resolve_import_target(index: &Index, usage: Node, src: &str) -> Option<Vec<De
     Some(resolve_absolute_path(index, &part_names(&parts), |_| true))
 }
 
-fn resolve_qualified(
+fn resolve_qualified_a(
     index: &Index,
     usage: Node,
+    ancestors: &[Node],
     name: &str,
     uk: UseKind,
     src: &str,
 ) -> Option<Vec<Def>> {
-    let (parts, qkind) = qualified_path_and_kind(usage, uk, src)?;
+    let (parts, qkind) = qualified_path_and_kind_a(usage, ancestors, uk, src)?;
     if !parts.last().is_some_and(|part| part == name) {
         return Some(Vec::new());
     }
@@ -1497,13 +1595,14 @@ fn resolve_qualified(
     }))
 }
 
-fn resolve_nested_type(
+fn resolve_nested_type_in(
     index: &Index,
     src: &str,
     usage: Node,
+    parent: Option<Node>,
     ctx: &infer::FileCtx,
 ) -> Option<Vec<Def>> {
-    let parent = usage.parent()?;
+    let parent = parent?;
     if parent.kind() != "user_type" {
         return None;
     }
@@ -1543,8 +1642,13 @@ fn resolve_nested_type(
     None
 }
 
-fn qualified_path_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(Vec<String>, UseKind)> {
-    let parent = usage.parent()?;
+fn qualified_path_and_kind_a(
+    usage: Node,
+    ancestors: &[Node],
+    uk: UseKind,
+    src: &str,
+) -> Option<(Vec<String>, UseKind)> {
+    let parent = ancestors.last().copied()?;
     if parent.kind() == "user_type" {
         let parts = direct_identifier_parts(parent, src);
         if parts.len() > 1 && parts.last().is_some_and(|(node, _)| *node == usage) {
@@ -1558,7 +1662,10 @@ fn qualified_path_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(Vec<S
             if local_decl(*first_node, first_name, UseKind::Value, src).is_some() {
                 return None;
             }
-            let qkind = match parent.parent().map(|p| p.kind()) {
+            let qkind = match ancestors
+                .get(ancestors.len().wrapping_sub(2))
+                .map(|p| p.kind())
+            {
                 Some("call_expression") => UseKind::Call,
                 _ => {
                     if uk == UseKind::MemberSelector {
@@ -1574,14 +1681,8 @@ fn qualified_path_and_kind(usage: Node, uk: UseKind, src: &str) -> Option<(Vec<S
     None
 }
 
-fn ancestor_of_kind<'t>(mut node: Node<'t>, kind: &str) -> Option<Node<'t>> {
-    while let Some(parent) = node.parent() {
-        if parent.kind() == kind {
-            return Some(parent);
-        }
-        node = parent;
-    }
-    None
+fn ancestor_of_kind_a<'t>(ancestors: &[Node<'t>], kind: &str) -> Option<Node<'t>> {
+    ancestors.iter().rev().find(|n| n.kind() == kind).copied()
 }
 
 fn direct_identifier_parts<'t>(node: Node<'t>, src: &str) -> Vec<(Node<'t>, String)> {
