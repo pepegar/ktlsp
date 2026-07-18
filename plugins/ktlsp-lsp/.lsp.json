@@ -1,0 +1,11 @@
+{
+  "ktlsp": {
+    "command": "ktlsp",
+    "extensionToLanguage": {
+      ".kt": "kotlin",
+      ".kts": "kotlin",
+      ".java": "java"
+    },
+    "startupTimeout": 120000
+  }
+}

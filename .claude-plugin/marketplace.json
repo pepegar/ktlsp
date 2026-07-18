@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "ktlsp",
+  "description": "Claude Code integrations for the ktlsp Kotlin and Java language server",
+  "owner": {
+    "name": "Pepe Garcia"
+  },
+  "plugins": [
+    {
+      "name": "ktlsp-lsp",
+      "source": "./plugins/ktlsp-lsp",
+      "description": "Fast Kotlin and Java code intelligence in Claude Code, powered by ktlsp",
+      "category": "development",
+      "tags": [
+        "lsp",
+        "kotlin",
+        "java",
+        "code-intelligence"
+      ],
+      "homepage": "https://github.com/pepegar/ktlsp#claude-code",
+      "repository": "https://github.com/pepegar/ktlsp"
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "ktlsp-lsp",
+  "displayName": "ktlsp",
+  "version": "0.1.0",
+  "description": "Fast Kotlin and Java code intelligence in Claude Code, powered by ktlsp",
+  "author": {
+    "name": "Pepe Garcia",
+    "url": "https://github.com/pepegar"
+  },
+  "homepage": "https://github.com/pepegar/ktlsp#claude-code",
+  "repository": "https://github.com/pepegar/ktlsp",
+  "license": "MIT",
+  "keywords": [
+    "lsp",
+    "kotlin",
+    "java",
+    "code-intelligence"
+  ],
+  "lspServers": "./.lsp.json"
+}

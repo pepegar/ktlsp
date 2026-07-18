@@ -62,6 +62,31 @@ vim.lsp.start({
 
 Logs are written to standard error. Set `RUST_LOG=ktlsp=debug` for debug logging.
 
+### Claude Code
+
+The repository is also a Claude Code plugin marketplace. The `ktlsp-lsp` plugin connects Claude
+Code's built-in LSP tools to `ktlsp` for Kotlin, Kotlin Script, and Java files.
+
+Install `ktlsp` first using one of the methods above and verify the binary is on the `PATH` used to
+start Claude Code:
+
+```sh
+command -v ktlsp
+```
+
+Then add the marketplace and install the plugin from Claude Code:
+
+```text
+/plugin marketplace add pepegar/ktlsp
+/plugin install ktlsp-lsp@ktlsp
+/reload-plugins
+```
+
+Claude Code LSP plugins configure a connection to an installed language server; they do not install
+the server binary itself. If another Kotlin or Java LSP plugin is enabled, disable it to avoid an
+extension conflict. See the [plugin README](plugins/ktlsp-lsp/README.md) for CLI installation,
+troubleshooting, local validation, and community-marketplace publishing notes.
+
 ## Configuration
 
 `ktlsp` reads Gradle version catalogs and resolves source archives from local Gradle and Maven
