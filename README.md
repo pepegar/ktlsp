@@ -62,6 +62,37 @@ vim.lsp.start({
 
 Logs are written to standard error. Set `RUST_LOG=ktlsp=debug` for debug logging.
 
+### Zed
+
+Zed's Java and Kotlin support comes from extensions that bundle their own language servers
+(Eclipse JDTLS and JetBrains' Kotlin LSP or the community `kotlin-language-server`). To use
+`ktlsp` instead, install the extensions for file-type association and syntax highlighting, then
+override the language server binary each one launches with the [`lsp`
+setting](https://zed.dev/docs/configuring-languages#configuring-language-servers) in
+`settings.json`:
+
+```json
+{
+  "lsp": {
+    "jdtls": {
+      "binary": {
+        "path": "ktlsp"
+      }
+    },
+    "kotlin-lsp": {
+      "binary": {
+        "path": "ktlsp"
+      }
+    }
+  }
+}
+```
+
+`jdtls` is the adapter name used by Zed's Java extension; `kotlin-lsp` is the default adapter used
+by Zed's Kotlin extension (use `kotlin-language-server` instead if you've switched to the
+community server). Overriding `binary.path` replaces the extension's managed server binary with
+`ktlsp` while keeping the extension installed for tree-sitter and language detection.
+
 ### Claude Code
 
 The repository is also a Claude Code plugin marketplace. The `ktlsp-lsp` plugin connects Claude
