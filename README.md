@@ -78,6 +78,29 @@ Useful environment variables:
 Formatting is opt-in through `initializationOptions.formatting` and delegates to an external
 formatter such as `ktfmt`.
 
+## Benchmarks
+
+A July 2026 protocol-level comparison used Pinterest ktlint (multi-module JVM) and Square Okio
+(Kotlin Multiplatform), with one cold run and medians of three warm process restarts.
+
+| Workload | Metric | ktlsp | JetBrains Kotlin LSP |
+| --- | --- | ---: | ---: |
+| ktlint, cold | First verified cross-file definition | **0.51 s** | 11.12 s |
+| ktlint, warm | First verified cross-file definition | **0.51 s** | 1.98 s |
+| ktlint, warm | Completion latency | **0.8 ms** | 182.2 ms |
+| ktlint, warm | References latency | **5.9 ms** | 58.3 ms |
+| ktlint, warm | Rename edit computation | **5.4 ms** | 2,903.6 ms |
+| ktlint, warm | Post-index/import RSS | 1,390.9 MiB | **1,173.9 MiB** |
+| Okio KMP, cold | First verified cross-file definition | **0.51 s** | No result within 60 s |
+
+`ktlsp` becomes useful much earlier and keeps foreground requests fast, but its fully loaded
+dependency/JDK index is not always smaller than JetBrains' persisted model. JetBrains also provides
+deeper compiler-backed diagnostics, quick fixes, formatting, and project import, so latency is not
+a semantic-equivalence score.
+
+See [BENCHMARK.md](BENCHMARK.md) for exact revisions, host details, cold/warm cache rules, feature
+results, memory methodology, reproduction steps, and limitations.
+
 ## Development
 
 The workspace contains the shared semantic engine (`ktcore`), language server (`ktlsp`), and
