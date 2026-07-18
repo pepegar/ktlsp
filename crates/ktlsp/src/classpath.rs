@@ -35,12 +35,17 @@ pub struct ModuleClasspath {
     pub project_dir: PathBuf,
     /// Classpath entries (jars and class dirs), in declared order.
     pub entries: Vec<PathBuf>,
+    /// Dependencies the lenient dump could not resolve (`selector: problem`). Empty on a fully
+    /// resolved run; reported so silent under-indexing is observable.
+    #[serde(default)]
+    pub unresolved: Vec<String>,
 }
 
 /// Parse the init script's line protocol:
-///   PROJECT\t<gradle path>\t<absolute projectDir>
-///   CP\t<absolute entry>            (repeated)
-///   END\t<gradle path>
+///   PROJECT	<gradle path>	<absolute projectDir>
+///   CP	<absolute entry>            (repeated)
+///   UNRESOLVED	<selector>	<problem> (lenient-resolution drops, repeated)
+///   END	<gradle path>
 /// Lines outside a PROJECT/END block (gradle chatter) are ignored. A block missing its END is still
 /// returned (best-effort), since the entries are already complete by then.
 pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
@@ -60,6 +65,7 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
                         module,
                         project_dir: PathBuf::from(dir),
                         entries: Vec::new(),
+                        unresolved: Vec::new(),
                     });
                 }
             }
@@ -68,6 +74,12 @@ pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
                     if !path.is_empty() {
                         cur.entries.push(PathBuf::from(path));
                     }
+                }
+            }
+            Some("UNRESOLVED") => {
+                if let (Some(cur), Some(selector)) = (current.as_mut(), parts.next()) {
+                    let problem = parts.next().unwrap_or("");
+                    cur.unresolved.push(format!("{selector}: {problem}"));
                 }
             }
             Some("END") => {
@@ -144,7 +156,8 @@ pub fn resolve(root: &Path) -> anyhow::Result<Vec<ModuleClasspath>> {
             }
         }
     }
-    let modules = run_dump(root, "ktlspDumpClasspath")?;
+    let modules = dump_with_fallback(root, "ktlspDumpClasspath")?;
+    log_unresolved(&modules);
     write_cache_entry(
         &cache,
         &CacheEntry {
@@ -174,7 +187,8 @@ pub fn resolve_module(root: &Path, module: &str) -> anyhow::Result<ModuleClasspa
         }
     }
     let task = format!("{}:ktlspDumpClasspath", module.trim_end_matches(':'));
-    let modules = run_dump(root, &task)?;
+    let modules = dump_with_fallback(root, &task)?;
+    log_unresolved(&modules);
     let found = modules
         .iter()
         .find(|m| m.module == module)
@@ -212,9 +226,44 @@ fn module_cache_path(root: &Path, module: &str) -> PathBuf {
         .join(format!("mod-{hash:016x}.json"))
 }
 
+/// Offline-first dump: with a populated Gradle cache the result is a pure function of local
+/// state, immune to repository flakiness. An empty or failed offline dump means the cache isn't
+/// populated (fresh machine) — fall back to the online run for completeness.
+fn dump_with_fallback(root: &Path, task: &str) -> anyhow::Result<Vec<ModuleClasspath>> {
+    match run_dump(root, task, true) {
+        Ok(modules) if modules.iter().any(|m| !m.entries.is_empty()) => Ok(modules),
+        Ok(_) => {
+            tracing::info!("offline classpath dump resolved no entries; retrying online");
+            run_dump(root, task, false)
+        }
+        Err(offline_err) => {
+            tracing::info!("offline classpath dump failed ({offline_err:#}); retrying online");
+            run_dump(root, task, false)
+        }
+    }
+}
+
+fn log_unresolved(modules: &[ModuleClasspath]) {
+    let total: usize = modules.iter().map(|m| m.unresolved.len()).sum();
+    if total == 0 {
+        return;
+    }
+    let sample: Vec<String> = modules
+        .iter()
+        .flat_map(|m| m.unresolved.iter().take(2).map(move |u| format!("{}: {u}", m.module)))
+        .take(6)
+        .collect();
+    tracing::warn!(
+        "classpath dump left {total} dependencies unresolved; their symbols stay missing until a Gradle build populates the cache: {}",
+        sample.join("; ")
+    );
+}
+
 /// Run the init script via the project's gradle wrapper and parse the dump. Inherits the parent's
 /// environment (so repo-specific flags like SKIP_* are honored when ktlsp is launched with them).
-fn run_dump(root: &Path, task: &str) -> anyhow::Result<Vec<ModuleClasspath>> {
+/// `offline` passes `--offline`: resolution then depends only on the local Gradle cache, which is
+/// stable across runs — online runs drop entries nondeterministically under repository flakiness.
+fn run_dump(root: &Path, task: &str, offline: bool) -> anyhow::Result<Vec<ModuleClasspath>> {
     let gradle = crate::deps::gradle_root(root)
         .ok_or_else(|| anyhow::anyhow!("{} is not a Gradle project", root.display()))?;
     // Absolute wrapper path: with current_dir(root) set, a relative program path resolves against
@@ -233,14 +282,18 @@ fn run_dump(root: &Path, task: &str) -> anyhow::Result<Vec<ModuleClasspath>> {
     std::fs::write(&script, INIT_SCRIPT)?;
     let _guard = TempFile(&script);
 
-    let output = Command::new(&gradlew)
+    let mut command = Command::new(&gradlew);
+    command
         .current_dir(&gradle)
         .arg("-I")
         .arg(&script)
         .arg(task)
         .arg("-q")
-        .arg("--console=plain")
-        .output()?;
+        .arg("--console=plain");
+    if offline {
+        command.arg("--offline");
+    }
+    let output = command.output()?;
     if !output.status.success() {
         anyhow::bail!(
             "gradle classpath dump failed ({}):\n{}",
@@ -514,6 +567,27 @@ END\t:lib\n";
     }
 
     #[test]
+    fn parse_unresolved_lines_are_attributed() {
+        let dump = "PROJECT\t:lib\t/abs/lib\nCP\t/jars/a.jar\nUNRESOLVED\tcom.acme:lib:1.0\tCould not resolve\nEND\t:lib\n";
+        let m = parse_dump(dump);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].entries, vec![PathBuf::from("/jars/a.jar")]);
+        assert_eq!(
+            m[0].unresolved,
+            vec!["com.acme:lib:1.0: Could not resolve".to_string()]
+        );
+    }
+
+    #[test]
+    fn cache_entry_without_unresolved_field_deserializes() {
+        // Cache entries written before the unresolved report existed must keep loading.
+        let json = r#"{"mtimes":{},"modules":[{"module":":lib","project_dir":"/abs/lib","entries":["/jars/a.jar"]}]}"#;
+        let entry: CacheEntry = serde_json::from_str(json).unwrap();
+        assert_eq!(entry.modules[0].module, ":lib");
+        assert!(entry.modules[0].unresolved.is_empty());
+    }
+
+    #[test]
     fn parse_block_without_end_is_flushed() {
         let dump = "PROJECT\t:lib\t/abs/lib\nCP\t/jars/a.jar\n";
         let m = parse_dump(dump);
@@ -612,6 +686,7 @@ dependencies {
                 module: ":app".to_string(),
                 project_dir: PathBuf::from("/project/app"),
                 entries: vec![PathBuf::from("/jars/app.jar")],
+                unresolved: Vec::new(),
             }],
         };
 

@@ -1803,8 +1803,10 @@ fn resolve_cross_file(index: &Index, name: &str, uk: UseKind, ctx: &infer::FileC
         return hits;
     }
 
-    // Wildcard-imported packages, plus Kotlin's implicit default imports (kotlin.*, java.lang.*,
-    // …) so stdlib symbols like `listOf` resolve without an explicit import.
+    // Wildcard-imported packages in declaration order, then Kotlin's implicit default imports in
+    // their documented precedence (kotlin.* before java.lang.*): the first package binding the
+    // name wins, so resolution never depends on index insertion order (which shifts when library
+    // shards land at different times).
     let star_pkgs: Vec<String> = ctx
         .imports
         .iter()
@@ -1812,8 +1814,10 @@ fn resolve_cross_file(index: &Index, name: &str, uk: UseKind, ctx: &infer::FileC
         .map(|i| i.package())
         .chain(DEFAULT_IMPORT_PACKAGES.iter().map(|s| s.to_string()))
         .collect();
-    if let Some(hits) = pick(&candidates, |e| star_pkgs.contains(&e.sym.package)) {
-        return hits;
+    for pkg in &star_pkgs {
+        if let Some(hits) = pick(&candidates, |e| &e.sym.package == pkg) {
+            return hits;
+        }
     }
 
     // Not visible from here (different package, not imported): no guess.

@@ -10,15 +10,26 @@
 //   END\t<gradle path>
 //
 // `isLenient = true` so an unresolved dependency in one module doesn't abort the whole dump.
+// Each block is buffered and printed with a single `println`: Gradle runs these tasks in parallel
+// and per-line printing interleaves the protocol blocks, scrambling ktlsp's per-module
+// attribution (observed: ~3.6k interleave anomalies in one GoodNotes dump). One synchronized
+// PrintStream call per module keeps the block atomic.
+// UNRESOLVED lines report what the lenient view dropped, so silent under-indexing is observable.
 allprojects {
     tasks.register("ktlspDumpClasspath") {
         doLast {
             val cfg = configurations.findByName("compileClasspath") ?: return@doLast
-            println("PROJECT\t${project.path}\t${project.projectDir.absolutePath}")
+            val out = StringBuilder()
+            out.append("PROJECT\t${project.path}\t${project.projectDir.absolutePath}\n")
             cfg.incoming.artifactView { isLenient = true }.files.files.forEach {
-                println("CP\t${it.absolutePath}")
+                out.append("CP\t${it.absolutePath}\n")
             }
-            println("END\t${project.path}")
+            cfg.resolvedConfiguration.lenientConfiguration.unresolvedModuleDependencies.forEach {
+                val problem = it.problem.message?.replace('\n', ' ')?.replace('\t', ' ')
+                out.append("UNRESOLVED\t${it.selector}\t$problem\n")
+            }
+            out.append("END\t${project.path}")
+            println(out.toString())
         }
     }
 }

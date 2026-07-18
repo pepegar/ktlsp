@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 
-use anyhow::Context;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -71,12 +70,23 @@ pub fn sources_jar(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<PathB
         }
     }
     if repos.allow_download {
+        let mut transient = Vec::new();
         for candidate in &candidates {
-            if let Some(p) = download_sources(repos, candidate)? {
-                if has_indexable_sources(&p) {
-                    return Ok(Some(p));
+            match download_sources(repos, candidate) {
+                Ok(Some(p)) => {
+                    if has_indexable_sources(&p) {
+                        return Ok(Some(p));
+                    }
                 }
+                Ok(None) => {}
+                // A transient failure on one candidate must not skip the fallback candidates,
+                // but if none of them yield sources the run reports the transient error rather
+                // than a calm "no sources" that would be indistinguishable from a 404.
+                Err(e) => transient.push(e),
             }
+        }
+        if let Some(error) = transient.into_iter().next() {
+            return Err(error);
         }
     }
     Ok(None)
@@ -585,10 +595,11 @@ fn download_sources(repos: &Repos, c: &Coordinate) -> anyhow::Result<Option<Path
         let url = c.sources_url(&base);
         match http_download(&url, &dest) {
             Ok(()) => return Ok(Some(dest)),
-            Err(e) => errors.push(format!("{url}: {e}")),
+            Err(DownloadFailure::Definitive(e)) => errors.push(format!("{url}: {e}")),
+            Err(failure @ DownloadFailure::Transient(_)) => return Err(failure.into_error()),
         }
     }
-    // 404 / network error: no sources available — skip gracefully, don't fail indexing.
+    // Every repository definitively answered 4xx: no sources available — memoize the absence.
     tracing::debug!("no sources jar for {}: {}", c.label(), errors.join("; "));
     remember_no_sources(&marker);
     Ok(None)
@@ -652,11 +663,12 @@ fn download_artifact(
     let url = artifact_url(repos, c, name);
     match http_download(&url, dest) {
         Ok(()) => Ok(Some(dest.to_path_buf())),
-        Err(e) => {
+        Err(DownloadFailure::Definitive(e)) => {
             tracing::debug!("no artifact {name} for {}: {e}", c.label());
             remember_no_sources(&marker);
             Ok(None)
         }
+        Err(failure @ DownloadFailure::Transient(_)) => Err(failure.into_error()),
     }
 }
 
@@ -690,8 +702,56 @@ fn remember_no_sources(marker: &Path) {
     let _ = fs::write(marker, b"missing\n");
 }
 
-/// Blocking HTTPS GET to a file (ureq + rustls). Follows redirects; errors on non-2xx.
-fn http_download(url: &str, dest: &Path) -> anyhow::Result<()> {
+/// Classification of a failed artifact GET. Only a 4xx proves the artifact is absent; everything
+/// else (5xx, timeout, connection reset) is a moment in time. Memoizing a transient failure with a
+/// `.missing` marker would shrink the dependency closure for the whole cache lifetime, so the two
+/// kinds take different paths: definitive failures may be memoized, transient ones surface as
+/// errors and are retried on the next run.
+enum DownloadFailure {
+    Definitive(anyhow::Error),
+    Transient(anyhow::Error),
+}
+
+impl DownloadFailure {
+    fn into_error(self) -> anyhow::Error {
+        match self {
+            DownloadFailure::Definitive(e) | DownloadFailure::Transient(e) => e,
+        }
+    }
+}
+
+fn classify_http_failure(url: &str, err: ureq::Error) -> DownloadFailure {
+    match err {
+        ureq::Error::StatusCode(code) if (400..500).contains(&code) => {
+            DownloadFailure::Definitive(anyhow::anyhow!("HTTP {code} for {url}"))
+        }
+        other => DownloadFailure::Transient(anyhow::anyhow!("GET {url}: {other}")),
+    }
+}
+
+/// Blocking HTTPS GET to a file (ureq + rustls). Follows redirects. Transient failures get
+/// bounded retries with backoff; a 4xx fails immediately as definitive.
+fn http_download(url: &str, dest: &Path) -> Result<(), DownloadFailure> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut backoff = Duration::from_millis(150);
+    let mut attempt = 1;
+    loop {
+        match http_download_once(url, dest) {
+            Ok(()) => return Ok(()),
+            Err(failure @ DownloadFailure::Definitive(_)) => return Err(failure),
+            Err(DownloadFailure::Transient(_)) if attempt < MAX_ATTEMPTS => {
+                attempt += 1;
+                std::thread::sleep(backoff);
+                backoff *= 4;
+            }
+            Err(failure) => return Err(failure),
+        }
+    }
+}
+
+/// Blocking HTTPS GET to a file (ureq + rustls), single attempt. Streams to a temp file, then
+/// renames — avoids leaving a half-written jar on interruption.
+fn http_download_once(url: &str, dest: &Path) -> Result<(), DownloadFailure> {
     let agent = ureq::Agent::new_with_config(
         ureq::Agent::config_builder()
             .timeout_global(Some(source_download_timeout()))
@@ -700,21 +760,26 @@ fn http_download(url: &str, dest: &Path) -> anyhow::Result<()> {
     let mut resp = agent
         .get(url)
         .call()
-        .with_context(|| format!("GET {url}"))?;
-    anyhow::ensure!(
-        resp.status().is_success(),
-        "HTTP {} for {url}",
-        resp.status()
-    );
-    if let Some(parent) = dest.parent() {
-        fs::create_dir_all(parent)?;
+        .map_err(|error| classify_http_failure(url, error))?;
+    let status = resp.status().as_u16();
+    if !(200..300).contains(&status) {
+        return Err(if (400..500).contains(&status) {
+            DownloadFailure::Definitive(anyhow::anyhow!("HTTP {status} for {url}"))
+        } else {
+            DownloadFailure::Transient(anyhow::anyhow!("HTTP {status} for {url}"))
+        });
     }
-    // Stream to a temp file, then rename — avoids leaving a half-written jar on interruption.
+    // Local filesystem failures are treated as transient: retrying is harmless, and they must
+    // never be memoized as "artifact missing".
+    let local = |error: anyhow::Error| DownloadFailure::Transient(error);
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent).map_err(|e| local(e.into()))?;
+    }
     let tmp = dest.with_extension("jar.part");
-    let mut out = fs::File::create(&tmp)?;
-    io::copy(&mut resp.body_mut().as_reader(), &mut out)?;
+    let mut out = fs::File::create(&tmp).map_err(|e| local(e.into()))?;
+    io::copy(&mut resp.body_mut().as_reader(), &mut out).map_err(|e| local(e.into()))?;
     drop(out);
-    fs::rename(&tmp, dest)?;
+    fs::rename(&tmp, dest).map_err(|e| local(e.into()))?;
     Ok(())
 }
 
@@ -1117,6 +1182,22 @@ mod tests {
     use super::*;
     use std::io::Write;
     use zip::write::SimpleFileOptions;
+
+    #[test]
+    fn http_failures_classify_definitive_vs_transient() {
+        assert!(matches!(
+            classify_http_failure("http://x", ureq::Error::StatusCode(404)),
+            DownloadFailure::Definitive(_)
+        ));
+        assert!(matches!(
+            classify_http_failure("http://x", ureq::Error::StatusCode(500)),
+            DownloadFailure::Transient(_)
+        ));
+        assert!(matches!(
+            classify_http_failure("http://x", ureq::Error::HostNotFound),
+            DownloadFailure::Transient(_)
+        ));
+    }
 
     #[test]
     fn finds_sources_in_gradle_cache_layout() {
@@ -1546,6 +1627,28 @@ mod tests {
     }
 
     #[test]
+    fn transient_download_failure_is_an_error_not_a_memoized_absence() {
+        // An unreachable host is a moment in time, not proof that sources are missing: the call
+        // must fail, and no `.missing` marker may be written, so the next run retries.
+        let tmp =
+            std::env::temp_dir().join(format!("ktlsp_art_transient_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let c = Coordinate::parse("com.example:absent:1.0").unwrap();
+        let repos = Repos {
+            gradle_cache: tmp.join(".gradle/caches"),
+            m2: tmp.join(".m2/repository"),
+            central_base: "http://127.0.0.1:0/unused".to_string(),
+            download_dir: tmp.join("dl"),
+            allow_download: true,
+        };
+
+        assert!(sources_jar(&repos, &c).is_err());
+        assert!(!no_sources_marker(&repos.download_dir, &c).is_file());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
     fn no_sources_marker_is_respected_but_local_cache_still_wins() {
         let tmp =
             std::env::temp_dir().join(format!("ktlsp_art_no_sources_test_{}", std::process::id()));
@@ -1561,6 +1664,8 @@ mod tests {
 
         let marker = no_sources_marker(&repos.download_dir, &c);
         remember_no_sources(&marker);
+        let jvm = Coordinate::parse("com.example:absent-jvm:1.0").unwrap();
+        remember_no_sources(&no_sources_marker(&repos.download_dir, &jvm));
         assert_eq!(sources_jar(&repos, &c).unwrap(), None);
 
         let dir = tmp

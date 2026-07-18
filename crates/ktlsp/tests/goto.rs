@@ -894,3 +894,14 @@ fn goto_data_class_property() {
          //- Main.kt\npackage app\nfun f(u: User) {\n    u./*^*/email\n}\n",
     );
 }
+
+#[test]
+fn default_import_precedence_beats_index_insertion_order() {
+    // java.lang.String inserted before kotlin.String (as happens when JDK shards land early):
+    // implicit-import precedence (kotlin.* before java.lang.*) must still win.
+    check(
+        "//- java/lang/String.java\npackage java.lang;\npublic class String {}\n\
+         //- kotlin/String.kt\npackage kotlin\nclass /*def*/String\n\
+         //- Main.kt\npackage app\nfun f(s: /*^*/String) {}\n",
+    );
+}
