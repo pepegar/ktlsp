@@ -70,7 +70,7 @@ mod tests {
             name: "List".into(),
             nullable: false,
             args: vec![TypeRef::simple("T")],
-            package_candidates: Vec::new(),
+            package_candidates: std::sync::Arc::new(Vec::new()),
             container_candidates: Vec::new(),
         };
         let actual = Type::Class {

@@ -61,7 +61,9 @@ impl Default for JavaParser {
 /// Extract top-level & member declarations (skips method/constructor bodies, so locals don't leak).
 pub fn extract_symbols(tree: &Tree, src: &str) -> Vec<IndexedSymbol> {
     let package = package_of(tree, src);
-    let mut out = Vec::new();
+    // Same sizing heuristic as `extract_usages`, scaled for declaration density: dense files grow
+    // once instead of walking the doubling sequence that dominates cold-index profiles.
+    let mut out = Vec::with_capacity(src.len() / 128);
     let mut stack = vec![(tree.root_node(), None::<String>)];
     while let Some((node, container)) = stack.pop() {
         walk_declaration_container(

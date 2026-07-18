@@ -46,6 +46,7 @@ bincode.workspace = true
 sha2.workspace = true
 salsa.workspace = true
 zstd.workspace = true
+parking_lot.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 pprof = { version = "0.15", default-features = false, features = ["flamegraph"] }

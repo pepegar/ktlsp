@@ -7,9 +7,10 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use parking_lot::Mutex;
 use tower_lsp_server::jsonrpc::Result;
 use tower_lsp_server::ls_types::request::{
     GotoImplementationParams, GotoImplementationResponse, GotoTypeDefinitionParams,
@@ -73,7 +74,7 @@ impl Backend {
     /// task discards itself if a newer edit lands during the debounce window.
     fn schedule_diagnostics(&self, key: String) {
         let version = {
-            let mut versions = self.doc_versions.lock().unwrap();
+            let mut versions = self.doc_versions.lock();
             let n = versions.entry(key.clone()).or_insert(0);
             *n += 1;
             *n
@@ -84,7 +85,7 @@ impl Backend {
         tokio::spawn(async move {
             tokio::time::sleep(DIAGNOSTIC_DEBOUNCE).await;
             // Superseded by a newer edit? Discard.
-            if versions.lock().unwrap().get(&key).copied() != Some(version) {
+            if versions.lock().get(&key).copied() != Some(version) {
                 return;
             }
             publish_diagnostics(&ws, &client, &key).await;
@@ -96,7 +97,7 @@ impl Backend {
             return;
         }
         let ws = self.ws.clone();
-        let root = self.root.lock().unwrap().clone();
+        let root = self.root.lock().clone();
         let trace_key = key.clone();
         tokio::spawn(async move {
             let start = Instant::now();
@@ -146,7 +147,7 @@ impl Backend {
                 .map(|batch| batch.symbols.len())
                 .sum::<usize>();
             if files > 0 {
-                let mut guard = ws.lock().unwrap();
+                let mut guard = ws.lock();
                 for batch in batches {
                     guard
                         .index
@@ -216,49 +217,86 @@ fn dependency_index_threads() -> usize {
         })
 }
 
-fn spawn_jdk_index_worker(
-    src_zip: std::path::PathBuf,
-    extract_root: std::path::PathBuf,
+/// Spawn one worker per JDK shard. Sharding the ~15k-file `src.zip` across the dependency pool
+/// removes the single-thread tail that previously dominated cold library indexing.
+/// Spawn one worker per JDK shard. Sharding the ~15k-file `src.zip` across the dependency pool
+/// removes the single-thread tail that previously dominated cold library indexing. Returns the
+/// number of workers actually spawned: a shortfall means entries whose index maps to an
+/// unspawned shard are skipped this run (never cached), rather than hanging the scheduler.
+fn spawn_jdk_shard_workers(
+    plan: crate::deps::JdkParsePlan,
+    shards: usize,
+    tx: std::sync::mpsc::Sender<DependencyResult>,
+) -> usize {
+    let mut spawned = 0;
+    for shard in 0..shards {
+        let plan = plan.clone();
+        let tx = tx.clone();
+        let ok = std::thread::Builder::new()
+            .name(format!("ktlsp-jdk-index-{shard}"))
+            .stack_size(32 * 1024 * 1024)
+            .spawn(move || {
+                use crate::deps;
+                use crate::java::JavaParser;
+                use crate::parser::KotlinParser;
+
+                let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut kotlin = KotlinParser::new();
+                    let mut java = JavaParser::new();
+                    deps::parse_jdk_shard(&plan, shard, shards, &mut kotlin, &mut java)
+                }));
+                let result = match resolved {
+                    Ok(batches) => DependencyResult {
+                        coord: None,
+                        label: format!("JDK sources (shard {shard}/{shards})"),
+                        batches,
+                        discovered: Vec::new(),
+                        failed: false,
+                        skipped: false,
+                        missing_source: false,
+                        jdk: true,
+                        local_jar: false,
+                    },
+                    Err(_) => DependencyResult {
+                        coord: None,
+                        label: format!("JDK sources (shard {shard}/{shards})"),
+                        batches: Vec::new(),
+                        discovered: Vec::new(),
+                        failed: true,
+                        skipped: false,
+                        missing_source: false,
+                        jdk: true,
+                        local_jar: false,
+                    },
+                };
+                let _ = tx.send(result);
+            })
+            .is_ok();
+        spawned += ok as usize;
+    }
+    spawned
+}
+
+/// Cached-JDK fast path: no parsing, so a single result carries the whole symcache load.
+fn spawn_jdk_cached_worker(
+    batches: Vec<crate::deps::FileSymbols>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
         .name("ktlsp-jdk-index".to_string())
         .stack_size(32 * 1024 * 1024)
         .spawn(move || {
-            use crate::deps;
-            use crate::java::JavaParser;
-            use crate::parser::KotlinParser;
-
-            let resolved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let mut kotlin = KotlinParser::new();
-                let mut java = JavaParser::new();
-                deps::resolve_jdk_sources(&src_zip, &extract_root, &mut kotlin, &mut java)
-            }));
-            let result = match resolved {
-                Ok(batches) => DependencyResult {
-                    coord: None,
-                    label: "JDK sources".to_string(),
-                    batches,
-                    discovered: Vec::new(),
-                    failed: false,
-                    skipped: false,
-                    missing_source: false,
-                    jdk: true,
-                    local_jar: false,
-                },
-                Err(_) => DependencyResult {
-                    coord: None,
-                    label: "JDK sources".to_string(),
-                    batches: Vec::new(),
-                    discovered: Vec::new(),
-                    failed: true,
-                    skipped: false,
-                    missing_source: false,
-                    jdk: true,
-                    local_jar: false,
-                },
-            };
-            let _ = tx.send(result);
+            let _ = tx.send(DependencyResult {
+                coord: None,
+                label: "JDK sources".to_string(),
+                batches,
+                discovered: Vec::new(),
+                failed: false,
+                skipped: false,
+                missing_source: false,
+                jdk: true,
+                local_jar: false,
+            });
         });
 }
 
@@ -318,7 +356,7 @@ fn spawn_coordinate_index_worker(
     coord: crate::coords::Coordinate,
     repos: crate::artifacts::Repos,
     extract_root: std::path::PathBuf,
-    indexed_sources: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
+    indexed_sources: std::sync::Arc<parking_lot::Mutex<std::collections::BTreeSet<String>>>,
     tx: std::sync::mpsc::Sender<DependencyResult>,
 ) {
     let _ = std::thread::Builder::new()
@@ -337,7 +375,7 @@ fn spawn_coordinate_index_worker(
                 let skipped = source
                     .as_ref()
                     .map(|source| {
-                        let mut guard = indexed_sources.lock().unwrap();
+                        let mut guard = indexed_sources.lock();
                         !guard.insert(source.identity())
                     })
                     .unwrap_or(false);
@@ -417,19 +455,49 @@ fn index_dependencies(
     let mut stats = DepStats::default();
     const MAX_DEPENDENCY_COORDINATES: usize = 1024;
     let max_workers = dependency_index_threads();
-    let indexed_sources = std::sync::Arc::new(std::sync::Mutex::new(BTreeSet::new()));
+    let indexed_sources = std::sync::Arc::new(parking_lot::Mutex::new(BTreeSet::new()));
     let (tx, rx) = std::sync::mpsc::channel::<DependencyResult>();
     let mut active = 0usize;
     let mut completed = 0usize;
     let mut suppressed = BTreeSet::new();
 
+    // JDK sources: shard the ~15k-file src.zip across the dependency pool instead of one thread
+    // holding a worker slot for the whole run (the cold-index tail in flamegraphs).
+    let mut jdk_shards_pending = 0usize;
+    let mut jdk_shard_failed = false;
+    let mut jdk_parse_plan: Option<deps::JdkParsePlan> = None;
+    let mut jdk_batches: Vec<deps::FileSymbols> = Vec::new();
     if let Some(src_zip) = jdk_src {
-        if let Some(tx) = progress {
-            let total = 1 + queue.len();
-            let _ = tx.send((1, total, "JDK sources".to_string()));
+        match deps::plan_jdk_index(&src_zip, &extract_root) {
+            Some(deps::JdkIndexPlan::Cached(batches)) => {
+                if let Some(tx) = progress {
+                    let total = 1 + queue.len();
+                    let _ = tx.send((1, total, "JDK sources".to_string()));
+                }
+                spawn_jdk_cached_worker(batches, tx.clone());
+                active += 1;
+            }
+            Some(deps::JdkIndexPlan::Parse(plan)) => {
+                let shards = max_workers;
+                if let Some(tx) = progress {
+                    let total = shards + queue.len();
+                    let _ = tx.send((1, total, "JDK sources".to_string()));
+                }
+                let spawned = spawn_jdk_shard_workers(plan.clone(), shards, tx.clone());
+                if spawned < shards {
+                    tracing::warn!(
+                        "spawned {spawned}/{shards} JDK index workers; some entries will be skipped this run"
+                    );
+                    jdk_shard_failed = true;
+                }
+                if spawned > 0 {
+                    jdk_shards_pending = spawned;
+                    jdk_parse_plan = Some(plan);
+                    active += spawned;
+                }
+            }
+            None => {}
         }
-        spawn_jdk_index_worker(src_zip, extract_root.clone(), tx.clone());
-        active += 1;
     }
 
     while active > 0 || !local_jars.is_empty() || !queue.is_empty() {
@@ -462,7 +530,7 @@ fn index_dependencies(
                     stats.shadowed += 1;
                     suppressed.insert(previous.clone());
                     if let Some(files) = indexed_files.remove(&previous) {
-                        let mut guard = ws.lock().unwrap();
+                        let mut guard = ws.lock();
                         for file in files {
                             guard.index.remove_file(&file.path);
                             stats.files = stats.files.saturating_sub(1);
@@ -502,6 +570,43 @@ fn index_dependencies(
         active = active.saturating_sub(1);
         completed += 1;
 
+        if result.jdk && jdk_parse_plan.is_some() {
+            // Parse-shard result: hold batches until every shard lands, then persist the symcache
+            // and insert in one pass — inserting progressively would force cloning ~300k symbols
+            // for the cache payload. JDK symbols still appear far earlier than the old
+            // single-thread flow, which only returned at the very end.
+            jdk_shards_pending = jdk_shards_pending.saturating_sub(1);
+            if result.failed {
+                tracing::warn!("indexing panicked for {}; skipping", result.label);
+                stats.failed += 1;
+                jdk_shard_failed = true;
+            } else {
+                jdk_batches.extend(result.batches);
+            }
+            if jdk_shards_pending == 0 {
+                if let Some(plan) = jdk_parse_plan.take() {
+                    if !jdk_shard_failed {
+                        deps::store_jdk_symcache(&plan, &jdk_batches);
+                    }
+                    for batch in jdk_batches.drain(..) {
+                        let mut guard = ws.lock();
+                        let symbol_count = batch.symbols.len();
+                        stats.symbols += symbol_count;
+                        stats.jdk_symbols += symbol_count;
+                        stats.jdk_files += 1;
+                        guard
+                            .index
+                            .replace_file(&batch.file, batch.symbols, Tier::Durable);
+                        stats.files += 1;
+                    }
+                    // One revision bump for the whole shard drain: readers recompute once after
+                    // the JDK lands instead of churning on ~15k intermediate revisions.
+                    ws.lock().bump_index_revision();
+                }
+            }
+            continue;
+        }
+
         if result.failed {
             if result.jdk {
                 tracing::warn!("indexing JDK sources panicked; skipping");
@@ -526,7 +631,7 @@ fn index_dependencies(
         }
         let mut files_for_coord = Vec::new();
         for batch in result.batches {
-            let mut guard = ws.lock().unwrap();
+            let mut guard = ws.lock();
             let symbol_count = batch.symbols.len();
             stats.symbols += symbol_count;
             if result.jdk {
@@ -587,7 +692,7 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
     };
 
     let scan_start = Instant::now();
-    let count = tokio::task::spawn_blocking(move || scan_ws.lock().unwrap().scan(&scan_root))
+    let count = tokio::task::spawn_blocking(move || scan_ws.lock().scan(&scan_root))
         .await
         .unwrap_or(0);
     crate::trace::span(
@@ -681,13 +786,13 @@ async fn index_workspace(client: Client, ws: Arc<Mutex<Workspace>>, root: PathBu
         stats.skipped
     );
     {
-        let mut guard = ws.lock().unwrap();
+        let mut guard = ws.lock();
         guard.set_library_index_complete(stats.failed == 0 && stats.missing_sources == 0);
         guard.set_jdk_index_complete(stats.jdk_files > 0);
     }
     // Open buffers may have received conservative diagnostics before dependency/JDK indexing
     // completed. Republish them now that the library completeness facts and durable symbols are in.
-    let open_keys = { ws.lock().unwrap().open_doc_keys() };
+    let open_keys = { ws.lock().open_doc_keys() };
     for key in open_keys {
         publish_diagnostics(&ws, &client, &key).await;
     }
@@ -904,7 +1009,7 @@ impl LanguageServer for Backend {
             })
             .map(PathBuf::from);
         if root.is_some() {
-            *self.root.lock().unwrap() = root;
+            *self.root.lock() = root;
         }
 
         // Whether the client supports snippet insertion (`name($0)`). Option chain; default false.
@@ -916,7 +1021,7 @@ impl LanguageServer for Backend {
             .and_then(|c| c.completion_item.as_ref())
             .and_then(|ci| ci.snippet_support)
             .unwrap_or(false);
-        *self.snippets_supported.lock().unwrap() = snippets;
+        *self.snippets_supported.lock() = snippets;
 
         // Whether the client supports server-initiated work-done progress (the indexing
         // spinner). Default false -> fall back to log messages.
@@ -926,12 +1031,12 @@ impl LanguageServer for Backend {
             .as_ref()
             .and_then(|w| w.work_done_progress)
             .unwrap_or(false);
-        *self.progress_supported.lock().unwrap() = progress;
+        *self.progress_supported.lock() = progress;
 
-        *self.diagnostic_scope.lock().unwrap() =
+        *self.diagnostic_scope.lock() =
             diagnostic_scope_from(&params.initialization_options);
         let formatter = formatter_from(&params.initialization_options);
-        *self.formatter.lock().unwrap() = formatter.clone();
+        *self.formatter.lock() = formatter.clone();
 
         Ok(InitializeResult {
             server_info: Some(ServerInfo {
@@ -1023,11 +1128,11 @@ impl LanguageServer for Backend {
 
         // Index the workspace once, off the request path. Early goto requests fall back to
         // local-scope resolution until the index warms up.
-        let root = self.root.lock().unwrap().clone();
+        let root = self.root.lock().clone();
         if let Some(root) = root {
             let ws = self.ws.clone();
             let client = self.client.clone();
-            let progress = *self.progress_supported.lock().unwrap();
+            let progress = *self.progress_supported.lock();
             tokio::spawn(async move {
                 index_workspace(client, ws, root, progress).await;
             });
@@ -1042,7 +1147,7 @@ impl LanguageServer for Backend {
         let doc = params.text_document;
         if let Some(key) = uri_to_key(&doc.uri) {
             let text = doc.text;
-            self.ws.lock().unwrap().open(key.clone(), text.clone());
+            self.ws.lock().open(key.clone(), text.clone());
             self.seed_jdk_imports_for_open_java(key.clone(), text);
             self.schedule_diagnostics(key);
         }
@@ -1052,7 +1157,7 @@ impl LanguageServer for Backend {
         // FULL sync: the last (only) change holds the entire new document.
         if let Some(key) = uri_to_key(&params.text_document.uri) {
             if let Some(change) = params.content_changes.into_iter().last() {
-                self.ws.lock().unwrap().change(&key, change.text);
+                self.ws.lock().change(&key, change.text);
                 self.schedule_diagnostics(key);
             }
         }
@@ -1060,8 +1165,8 @@ impl LanguageServer for Backend {
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         if let Some(key) = uri_to_key(&params.text_document.uri) {
-            self.ws.lock().unwrap().close(&key);
-            self.doc_versions.lock().unwrap().remove(&key);
+            self.ws.lock().close(&key);
+            self.doc_versions.lock().remove(&key);
             publish_diagnostics(&self.ws, &self.client, &key).await;
         }
     }
@@ -1099,9 +1204,9 @@ impl LanguageServer for Backend {
         &self,
         _params: WorkspaceDiagnosticParams,
     ) -> Result<WorkspaceDiagnosticReportResult> {
-        let scope = *self.diagnostic_scope.lock().unwrap();
+        let scope = *self.diagnostic_scope.lock();
         let keys = {
-            let ws = self.ws.lock().unwrap();
+            let ws = self.ws.lock();
             match scope {
                 DiagnosticScope::OpenFilesOnly => ws.open_doc_keys(),
                 DiagnosticScope::Workspace => ws.project_doc_keys(),
@@ -1140,7 +1245,7 @@ impl LanguageServer for Backend {
 
         // All work is synchronous; the lock is never held across an `.await`.
         let (mut locations, symbol, text, offset) = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1158,7 +1263,7 @@ impl LanguageServer for Backend {
         if locations.is_empty()
             && (key.ends_with(".java") || key.ends_with(".kt") || key.ends_with(".kts"))
         {
-            let root = { self.root.lock().unwrap().clone() };
+            let root = { self.root.lock().clone() };
             if let Some(root) = root {
                 let seed_start = Instant::now();
                 let seed_text = text.clone();
@@ -1184,7 +1289,7 @@ impl LanguageServer for Backend {
                     .map(|fqn| import_seed_locations(&batches, fqn))
                     .unwrap_or_default();
                 if files > 0 {
-                    if let Ok(mut ws) = self.ws.try_lock() {
+                    if let Some(mut ws) = self.ws.try_lock() {
                         for batch in batches {
                             ws.index
                                 .replace_file(&batch.file, batch.symbols, Tier::Durable);
@@ -1246,7 +1351,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let locations = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1271,7 +1376,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let locations = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1296,7 +1401,7 @@ impl LanguageServer for Backend {
         };
 
         let (locations, symbol) = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1333,7 +1438,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let help = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1353,7 +1458,7 @@ impl LanguageServer for Backend {
         let requested = params.context.only;
 
         let (actions, symbol, line, character) = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1397,11 +1502,11 @@ impl LanguageServer for Backend {
             Some(k) => k,
             None => return Ok(None),
         };
-        let Some(config) = self.formatter.lock().unwrap().clone() else {
+        let Some(config) = self.formatter.lock().clone() else {
             return Ok(None);
         };
         let text = {
-            let ws = self.ws.lock().unwrap();
+            let ws = self.ws.lock();
             match ws.doc_text(&key) {
                 Some(text) => text,
                 None => return Ok(None),
@@ -1420,7 +1525,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let edit = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1443,7 +1548,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let prepared = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1478,7 +1583,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let items = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1500,7 +1605,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let calls = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             ws.incoming_calls(&item)
                 .into_iter()
                 .filter_map(|call| to_lsp_incoming_call(&ws, call))
@@ -1517,7 +1622,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let calls = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             ws.outgoing_calls(&item)
                 .into_iter()
                 .filter_map(|call| to_lsp_outgoing_call(&ws, call))
@@ -1537,7 +1642,7 @@ impl LanguageServer for Backend {
             None => return Ok(None),
         };
         let items = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1559,7 +1664,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let items = {
-            let ws = self.ws.lock().unwrap();
+            let ws = self.ws.lock();
             ws.type_supertypes(&item)
                 .iter()
                 .filter_map(|item| to_type_hierarchy_item(&ws, item))
@@ -1576,7 +1681,7 @@ impl LanguageServer for Backend {
             return Ok(None);
         };
         let items = {
-            let ws = self.ws.lock().unwrap();
+            let ws = self.ws.lock();
             ws.type_subtypes(&item)
                 .iter()
                 .filter_map(|item| to_type_hierarchy_item(&ws, item))
@@ -1590,10 +1695,10 @@ impl LanguageServer for Backend {
             crate::commands::TRACE_PATH => Ok(crate::trace::log_path()
                 .map(|path| serde_json::Value::String(path.to_string_lossy().into_owned()))),
             crate::commands::REINDEX => {
-                let Some(root) = self.root.lock().unwrap().clone() else {
+                let Some(root) = self.root.lock().clone() else {
                     return Ok(Some(serde_json::json!({ "status": "no-root" })));
                 };
-                let count = self.ws.lock().unwrap().scan(&root);
+                let count = self.ws.lock().scan(&root);
                 Ok(Some(
                     serde_json::json!({ "status": "ok", "indexedFiles": count }),
                 ))
@@ -1608,7 +1713,7 @@ impl LanguageServer for Backend {
                     return Ok(Some(serde_json::json!({ "status": "invalid-uri" })));
                 };
                 let result = {
-                    let mut ws = self.ws.lock().unwrap();
+                    let mut ws = self.ws.lock();
                     let text = match ws.doc_text(&key) {
                         Some(t) => t,
                         None => {
@@ -1662,7 +1767,7 @@ impl LanguageServer for Backend {
         };
 
         let (mut hover, symbol, mut semantic, text, offset) = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1696,7 +1801,7 @@ impl LanguageServer for Backend {
         if hover.is_none()
             && (key.ends_with(".java") || key.ends_with(".kt") || key.ends_with(".kts"))
         {
-            let root = { self.root.lock().unwrap().clone() };
+            let root = { self.root.lock().clone() };
             if let Some(root) = root {
                 let seed_key = key.clone();
                 let seed_text = text.clone();
@@ -1706,7 +1811,7 @@ impl LanguageServer for Backend {
                 .await
                 .unwrap_or_else(|_| (None, Vec::new()));
                 if !batches.is_empty() {
-                    let mut ws = self.ws.lock().unwrap();
+                    let mut ws = self.ws.lock();
                     for batch in batches {
                         ws.index
                             .replace_file(&batch.file, batch.symbols, Tier::Durable);
@@ -1769,7 +1874,7 @@ impl LanguageServer for Backend {
         };
 
         let (highlights, symbol) = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1814,7 +1919,7 @@ impl LanguageServer for Backend {
         };
 
         let (symbols, text) = {
-            let ws = self.ws.lock().unwrap();
+            let ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1847,7 +1952,7 @@ impl LanguageServer for Backend {
     ) -> Result<Option<WorkspaceSymbolResponse>> {
         let start = std::time::Instant::now();
         let items = {
-            let ws = self.ws.lock().unwrap();
+            let ws = self.ws.lock();
             ws.workspace_symbols(&params.query)
                 .into_iter()
                 .filter_map(|s| to_symbol_information(&ws, s))
@@ -1875,7 +1980,7 @@ impl LanguageServer for Backend {
         };
 
         let ranges = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             ws.folding_ranges(&key)
                 .into_iter()
                 .map(to_lsp_folding_range)
@@ -1908,7 +2013,7 @@ impl LanguageServer for Backend {
         let positions = params.positions;
 
         let (ranges, first_symbol, first_line, first_character, requested) = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1965,7 +2070,7 @@ impl LanguageServer for Backend {
         };
 
         let data = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -1999,7 +2104,7 @@ impl LanguageServer for Backend {
         };
 
         let hints = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -2041,9 +2146,9 @@ impl LanguageServer for Backend {
         // Synchronous; the lock is never held across an `.await`. `doc_text` is read ONCE only to
         // build the `LineIndex` and compute the byte offset, then the offset is passed to
         // `ws.complete`, which internally accesses the cached tree exactly like `goto_definition`.
-        let snippets = *self.snippets_supported.lock().unwrap();
+        let snippets = *self.snippets_supported.lock();
         let (items, is_incomplete, symbol, semantic) = {
-            let mut ws = self.ws.lock().unwrap();
+            let mut ws = self.ws.lock();
             let text = match ws.doc_text(&key) {
                 Some(t) => t,
                 None => return Ok(None),
@@ -2773,7 +2878,7 @@ async fn publish_diagnostics(ws: &Arc<Mutex<Workspace>>, client: &Client, key: &
 
 fn lsp_diagnostics(ws: &Arc<Mutex<Workspace>>, key: &str) -> Vec<Diagnostic> {
     let (text, fast) = {
-        let mut ws = ws.lock().unwrap();
+        let mut ws = ws.lock();
         match ws.doc_text(key) {
             Some(text) => {
                 let fast = ws.diagnostics(key);

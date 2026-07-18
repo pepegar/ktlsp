@@ -23,6 +23,7 @@ bincode = "1"
 sha2 = "0.10"
 salsa = "0.28"
 zstd = "0.13"
+parking_lot = "0.12"
 
 [patch.crates-io]
 ls-types = { path = "vendor/ls-types" }

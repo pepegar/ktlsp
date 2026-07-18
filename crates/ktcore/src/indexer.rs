@@ -17,7 +17,9 @@ use crate::symbol::{IndexedSymbol, SymbolKind};
 use crate::types::TypeRef;
 
 pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Vec<IndexedSymbol> {
-    let mut out = Vec::new();
+    // Same conservative density heuristic as `extract_usages`, scaled for declarations: dense
+    // files grow once instead of walking the doubling reallocation sequence.
+    let mut out = Vec::with_capacity(src.len() / 128);
     let scope = TypeScope::new(package, imports_of(tree, src));
     walk(tree.root_node(), src, package, None, &scope, &mut out);
     out
@@ -27,15 +29,28 @@ pub fn extract_symbols(tree: &tree_sitter::Tree, src: &str, package: &str) -> Ve
 /// bound to the imports/package of the file declaring `f`, instead of incorrectly resolving `Bar`
 /// in whichever file later calls `f`.
 struct TypeScope {
-    package: String,
     imports: Vec<Import>,
+    /// `self.package` + wildcard-import packages + default-import packages, deduped. Invariant
+    /// for the whole file, so `type_ref` clones the `Arc` instead of rebuilding ~10 owned
+    /// strings per unresolved reference (a top allocation source in cold-index profiles).
+    package_candidates: std::sync::Arc<Vec<String>>,
 }
 
 impl TypeScope {
     fn new(package: &str, imports: Vec<Import>) -> Self {
+        let mut candidates = Vec::with_capacity(1 + DEFAULT_IMPORT_PACKAGES.len());
+        push_candidate(&mut candidates, package.to_string());
+        for imp in &imports {
+            if imp.wildcard {
+                push_candidate(&mut candidates, imp.package());
+            }
+        }
+        for pkg in DEFAULT_IMPORT_PACKAGES {
+            push_candidate(&mut candidates, (*pkg).to_string());
+        }
         TypeScope {
-            package: package.to_string(),
             imports,
+            package_candidates: std::sync::Arc::new(candidates),
         }
     }
 
@@ -47,7 +62,7 @@ impl TypeScope {
                     name: imp.simple_name().to_string(),
                     nullable,
                     args,
-                    package_candidates: vec![imp.package()],
+                    package_candidates: std::sync::Arc::new(vec![imp.package()]),
                     container_candidates: Vec::new(),
                 };
             }
@@ -59,27 +74,17 @@ impl TypeScope {
                     name: local_name.to_string(),
                     nullable,
                     args,
-                    package_candidates: vec![imp.package()],
+                    package_candidates: std::sync::Arc::new(vec![imp.package()]),
                     container_candidates: Vec::new(),
                 };
             }
         }
 
-        let mut package_candidates = Vec::new();
-        push_candidate(&mut package_candidates, self.package.clone());
-        for imp in &self.imports {
-            if imp.wildcard {
-                push_candidate(&mut package_candidates, imp.package());
-            }
-        }
-        for pkg in DEFAULT_IMPORT_PACKAGES {
-            push_candidate(&mut package_candidates, (*pkg).to_string());
-        }
         TypeRef {
             name: local_name.to_string(),
             nullable,
             args,
-            package_candidates,
+            package_candidates: std::sync::Arc::clone(&self.package_candidates),
             container_candidates: Vec::new(),
         }
     }
@@ -591,7 +596,7 @@ fn type_ref_from_user_type(ut: Node, src: &str, scope: Option<&TypeScope>) -> Op
                 name: (*name).to_string(),
                 nullable: false,
                 args,
-                package_candidates: vec![qualified_pkg],
+                package_candidates: std::sync::Arc::new(vec![qualified_pkg]),
                 container_candidates: container.into_iter().collect(),
             });
         }
@@ -611,7 +616,7 @@ fn type_ref_from_user_type(ut: Node, src: &str, scope: Option<&TypeScope>) -> Op
             name: (*name).to_string(),
             nullable: false,
             args,
-            package_candidates: Vec::new(),
+            package_candidates: std::sync::Arc::new(Vec::new()),
             container_candidates: container.into_iter().collect(),
         });
     }
@@ -621,7 +626,7 @@ fn type_ref_from_user_type(ut: Node, src: &str, scope: Option<&TypeScope>) -> Op
             name: (*name).to_string(),
             nullable: false,
             args,
-            package_candidates: Vec::new(),
+            package_candidates: std::sync::Arc::new(Vec::new()),
             container_candidates: Vec::new(),
         },
     })
@@ -879,7 +884,7 @@ fn push_data_class_synthetics(
         name: self_name.to_string(),
         nullable: false,
         args: Vec::new(),
-        package_candidates: vec![package.to_string()],
+        package_candidates: std::sync::Arc::new(vec![package.to_string()]),
         container_candidates: self_container.into_iter().collect(),
     };
     push_synthetic_member(

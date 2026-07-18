@@ -11,13 +11,32 @@ use anyhow::Context;
 /// malicious archive with an absurd number of entries.
 const MAX_SOURCE_FILES: usize = 50_000;
 
+/// Cap on the per-entry capacity hint taken from the archive's declared uncompressed size, so a
+/// forged header cannot trigger an absurd upfront allocation.
+const MAX_ENTRY_SIZE_HINT: u64 = 64 << 20;
+
+/// Open `jar` as a `ZipArchive` over its full in-memory bytes. Indexing touches every entry, so
+/// one upfront read beats the seek-per-entry storm a raw `File` produces (dominant cost in
+/// cold-index flamegraphs).
+fn open_archive(jar: &Path) -> anyhow::Result<zip::ZipArchive<io::Cursor<Vec<u8>>>> {
+    let bytes = fs::read(jar).with_context(|| format!("open jar {}", jar.display()))?;
+    zip::ZipArchive::new(io::Cursor::new(bytes)).with_context(|| format!("read jar {}", jar.display()))
+}
+
+/// Open an archive over bytes shared across shard workers — one allocation feeds every shard's
+/// own `ZipArchive` state (central-directory cursors are per-worker, the bytes are not copied).
+pub fn archive_shared(
+    bytes: std::sync::Arc<[u8]>,
+    jar: &Path,
+) -> anyhow::Result<zip::ZipArchive<io::Cursor<std::sync::Arc<[u8]>>>> {
+    zip::ZipArchive::new(io::Cursor::new(bytes)).with_context(|| format!("read jar {}", jar.display()))
+}
+
 /// Extract every `.kt`/`.java` entry from `jar` into `out_dir`, preserving the in-jar directory
 /// layout. Returns the extracted file paths. Safe against zip-slip: entries whose normalized path
 /// would escape `out_dir` (via `..`, absolute paths, or symlink relays) are skipped.
 pub fn extract_sources(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let file = fs::File::open(jar).with_context(|| format!("open jar {}", jar.display()))?;
-    let mut archive =
-        zip::ZipArchive::new(file).with_context(|| format!("read jar {}", jar.display()))?;
+    let mut archive = open_archive(jar)?;
 
     let mut extracted = Vec::new();
     for i in 0..archive.len() {
@@ -65,9 +84,7 @@ pub fn visit_sources(
     out_dir: &Path,
     mut visit: impl FnMut(&Path, &str),
 ) -> anyhow::Result<usize> {
-    let file = fs::File::open(jar).with_context(|| format!("open jar {}", jar.display()))?;
-    let mut archive =
-        zip::ZipArchive::new(file).with_context(|| format!("read jar {}", jar.display()))?;
+    let mut archive = open_archive(jar)?;
 
     let mut visited = 0;
     for i in 0..archive.len() {
@@ -93,7 +110,54 @@ pub fn visit_sources(
         if !path.starts_with(out_dir) {
             continue;
         }
-        let mut text = String::new();
+        let mut text = String::with_capacity(entry.size().min(MAX_ENTRY_SIZE_HINT) as usize);
+        if entry.read_to_string(&mut text).is_err() {
+            continue;
+        }
+        visit(&path, &text);
+        visited += 1;
+    }
+    Ok(visited)
+}
+
+/// Like [`visit_sources`], but visits only entries whose index satisfies `index % shards ==
+/// shard`, so several workers can index one large archive (the JDK `src.zip`) in parallel over
+/// shared, already-read bytes.
+pub fn visit_sources_shard(
+    bytes: std::sync::Arc<[u8]>,
+    jar: &Path,
+    out_dir: &Path,
+    shard: usize,
+    shards: usize,
+    mut visit: impl FnMut(&Path, &str),
+) -> anyhow::Result<usize> {
+    let mut archive = archive_shared(bytes, jar)?;
+
+    let mut visited = 0;
+    for i in (shard..archive.len()).step_by(shards) {
+        if visited >= MAX_SOURCE_FILES {
+            tracing::warn!(
+                "jar {} shard {shard} has more than {MAX_SOURCE_FILES} source files; truncating",
+                jar.display()
+            );
+            break;
+        }
+        let mut entry = archive.by_index(i)?;
+        let Some(rel) = entry.enclosed_name() else {
+            continue;
+        };
+        if !matches!(
+            rel.extension().and_then(|e| e.to_str()),
+            Some("kt") | Some("java")
+        ) {
+            continue;
+        }
+
+        let path = out_dir.join(&rel);
+        if !path.starts_with(out_dir) {
+            continue;
+        }
+        let mut text = String::with_capacity(entry.size().min(MAX_ENTRY_SIZE_HINT) as usize);
         if entry.read_to_string(&mut text).is_err() {
             continue;
         }
@@ -119,9 +183,7 @@ pub fn extract_source_file(jar: &Path, out_dir: &Path, path: &Path) -> anyhow::R
         }
         _ => return Ok(false),
     };
-    let file = fs::File::open(jar).with_context(|| format!("open jar {}", jar.display()))?;
-    let mut archive =
-        zip::ZipArchive::new(file).with_context(|| format!("read jar {}", jar.display()))?;
+    let mut archive = open_archive(jar)?;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         let Some(entry_rel) = entry.enclosed_name() else {
@@ -161,9 +223,7 @@ pub fn collect_sources(dir: &Path) -> Vec<PathBuf> {
 /// This is intentionally shallow: it gives ktlsp parseable class declarations for goto/import
 /// targets when a local Gradle jar has no source artifact. Members are not decompiled.
 pub fn extract_class_stubs(jar: &Path, out_dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
-    let file = fs::File::open(jar).with_context(|| format!("open jar {}", jar.display()))?;
-    let mut archive =
-        zip::ZipArchive::new(file).with_context(|| format!("read jar {}", jar.display()))?;
+    let mut archive = open_archive(jar)?;
     let mut classes = BTreeSet::new();
 
     for i in 0..archive.len() {
@@ -278,6 +338,41 @@ mod tests {
         assert!(files.iter().all(|p| p.starts_with(&out)));
         // nothing escaped to the parent
         assert!(!tmp.join("escape.kt").exists());
+
+        let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn shard_visits_partition_entries() {
+        let tmp = std::env::temp_dir().join(format!("ktlsp_jar_shard_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&tmp);
+        let jar = tmp.join("lib-sources.jar");
+        let out = tmp.join("out");
+        fs::create_dir_all(&tmp).unwrap();
+
+        let entries: Vec<(String, String)> = (0..7)
+            .map(|i| (format!("demo/F{i}.kt"), format!("package demo\nfun f{i}() {{}}\n")))
+            .collect();
+        let refs: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|(name, body)| (name.as_str(), body.as_str()))
+            .collect();
+        write_jar(&jar, &refs);
+
+        let bytes: std::sync::Arc<[u8]> = std::sync::Arc::from(fs::read(&jar).unwrap());
+        let mut seen = Vec::new();
+        for shard in 0..3 {
+            let mut shard_seen = Vec::new();
+            let visited = visit_sources_shard(bytes.clone(), &jar, &out, shard, 3, |path, _| {
+                shard_seen.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            })
+            .unwrap();
+            assert_eq!(visited, shard_seen.len());
+            seen.extend(shard_seen);
+        }
+        seen.sort();
+        let expected: Vec<String> = (0..7).map(|i| format!("F{i}.kt")).collect();
+        assert_eq!(seen, expected, "shards partition the entry set without overlap");
 
         let _ = fs::remove_dir_all(&tmp);
     }

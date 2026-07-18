@@ -12,6 +12,24 @@
 //!   contract (no members → show nothing). `Type` is runtime-only (never serialized).
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+
+/// `package_candidates` is shared, not owned per `TypeRef`: for a given declaration file the
+/// candidate list (package + wildcard imports + default imports) is identical across every
+/// unresolved reference, so `TypeScope` builds it once and clones the `Arc`. The serde shim
+/// keeps the bincode symcache wire format identical to the previous `Vec<String>` encoding.
+mod arc_candidates {
+    use super::Arc;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(value: &Arc<Vec<String>>, serializer: S) -> Result<S::Ok, S::Error> {
+        value.as_ref().serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Arc<Vec<String>>, D::Error> {
+        Vec::<String>::deserialize(deserializer).map(Arc::new)
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct TypeRef {
@@ -20,8 +38,8 @@ pub struct TypeRef {
     pub nullable: bool,
     #[serde(default)]
     pub args: Vec<TypeRef>,
-    #[serde(default)]
-    pub package_candidates: Vec<String>,
+    #[serde(default, with = "arc_candidates")]
+    pub package_candidates: Arc<Vec<String>>,
     #[serde(default)]
     pub container_candidates: Vec<String>,
 }
@@ -32,7 +50,7 @@ impl TypeRef {
             name: name.into(),
             nullable: false,
             args: Vec::new(),
-            package_candidates: Vec::new(),
+            package_candidates: Arc::new(Vec::new()),
             container_candidates: Vec::new(),
         }
     }

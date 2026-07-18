@@ -1471,33 +1471,103 @@ fn valid_zip(path: &Path) -> bool {
 /// Resolve the local JDK `src.zip` into indexed Java symbols. JDK sources are not Maven
 /// dependencies, but imported JDK types (`java.sql.Connection`, `java.time.Instant`, …) need the
 /// same durable index path as dependency source jars.
+///
+/// Pre-work for JDK source indexing, split out so the LSP server can shard parsing across its
+/// dependency worker pool: fingerprint, lazy-dir marker, symcache probe, and (on a miss) the zip
+/// bytes read once and shared across shard workers.
+pub enum JdkIndexPlan {
+    /// Symcache hit: no parsing needed.
+    Cached(Vec<FileSymbols>),
+    /// Symcache miss: parse via [`parse_jdk_shard`], then persist via [`store_jdk_symcache`].
+    Parse(JdkParsePlan),
+}
+
+#[derive(Clone)]
+pub struct JdkParsePlan {
+    fingerprint: String,
+    dest: PathBuf,
+    src_zip: PathBuf,
+    bytes: std::sync::Arc<[u8]>,
+}
+
+pub fn plan_jdk_index(src_zip: &Path, extract_root: &Path) -> Option<JdkIndexPlan> {
+    if !src_zip.is_file() {
+        return None;
+    }
+    let fingerprint = jar_fingerprint(src_zip).unwrap_or_else(|| "unknown".to_string());
+    let dest = extract_root.join("jdk").join(&fingerprint);
+
+    // The lazy-dir marker write is not race-safe; it must happen once, before shards spawn.
+    if !prepare_lazy_source_dir(src_zip, &dest) {
+        tracing::warn!(
+            "prepare lazy JDK source directory {} failed",
+            dest.display()
+        );
+        return None;
+    }
+
+    if let Some(cached) = symcache_load(&fingerprint, &dest) {
+        return Some(JdkIndexPlan::Cached(cached));
+    }
+
+    let bytes = fs::read(src_zip).ok()?;
+    Some(JdkIndexPlan::Parse(JdkParsePlan {
+        fingerprint,
+        dest,
+        src_zip: src_zip.to_path_buf(),
+        bytes: std::sync::Arc::from(bytes),
+    }))
+}
+
+/// Parse the `index % shards == shard` slice of the JDK source zip. Interleaving evens out entry
+/// sizes across shards better than contiguous ranges.
+pub fn parse_jdk_shard(
+    plan: &JdkParsePlan,
+    shard: usize,
+    shards: usize,
+    kotlin: &mut KotlinParser,
+    java: &mut JavaParser,
+) -> Vec<FileSymbols> {
+    let mut out = Vec::new();
+    if let Err(error) = jar::visit_sources_shard(
+        plan.bytes.clone(),
+        &plan.src_zip,
+        &plan.dest,
+        shard,
+        shards,
+        |path, text| {
+            if let Some(file) = parse_source_file(path, text, kotlin, java) {
+                out.push(file);
+            }
+        },
+    ) {
+        tracing::warn!("parse {} failed: {error}", plan.src_zip.display());
+    }
+    out
+}
+
+/// Persist the merged shard results. Call only when every shard succeeded, so a partial parse
+/// never poisons the cache.
+pub fn store_jdk_symcache(plan: &JdkParsePlan, batches: &[FileSymbols]) {
+    symcache_store(&plan.fingerprint, batches);
+}
+
+/// Single-threaded JDK source resolution (CLI one-shots, tests): plan, parse, store in one call.
 pub fn resolve_jdk_sources(
     src_zip: &Path,
     extract_root: &Path,
     kotlin: &mut KotlinParser,
     java: &mut JavaParser,
 ) -> Vec<FileSymbols> {
-    if !src_zip.is_file() {
-        return Vec::new();
+    match plan_jdk_index(src_zip, extract_root) {
+        Some(JdkIndexPlan::Cached(batches)) => batches,
+        Some(JdkIndexPlan::Parse(plan)) => {
+            let batches = parse_jdk_shard(&plan, 0, 1, kotlin, java);
+            store_jdk_symcache(&plan, &batches);
+            batches
+        }
+        None => Vec::new(),
     }
-    let fingerprint = jar_fingerprint(src_zip).unwrap_or_else(|| "unknown".to_string());
-    let dest = extract_root.join("jdk").join(&fingerprint);
-
-    if !prepare_lazy_source_dir(src_zip, &dest) {
-        tracing::warn!(
-            "prepare lazy JDK source directory {} failed",
-            dest.display()
-        );
-        return Vec::new();
-    }
-
-    if let Some(cached) = symcache_load(&fingerprint, &dest) {
-        return cached;
-    }
-
-    let symbols = parse_source_jar(src_zip, &dest, kotlin, java);
-    symcache_store(&fingerprint, &symbols);
-    symbols
 }
 
 /// Resolve a small set of explicitly imported JDK classes before the full JDK index is ready.

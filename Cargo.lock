@@ -684,6 +684,7 @@ dependencies = [
  "anyhow",
  "bincode",
  "ktcore",
+ "parking_lot",
  "pprof",
  "salsa",
  "serde",
