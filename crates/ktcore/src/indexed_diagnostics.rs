@@ -3,7 +3,7 @@
 //! Parser-only diagnostics live in [`crate::diagnostics`]. This module may look at the cross-file
 //! index, so every diagnostic here is gated by explicit completeness facts.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use tree_sitter::{Node, Tree};
 
@@ -14,7 +14,7 @@ use crate::infer;
 use crate::parser::{child_of_kind, node_text, Import};
 use crate::resolve::{self, CompletenessFacts};
 use crate::symbol::SymbolKind;
-use crate::types::Type;
+use crate::types::{Type, TypeRef};
 
 pub fn compute(
     index: &Index,
@@ -237,6 +237,16 @@ fn member_call_shape_query(
         &symbol,
         &Visibility::new(&ctx.package, &ctx.imports),
     );
+    // Bind the receiver's type arguments into the candidates' parameter types, so a member
+    // declared against a class-level type variable is checked against the actual receiver
+    // (`MyList<String>.add` checks `String`, not the bare `E`).
+    let entries = entries
+        .into_iter()
+        .map(|entry| match infer::receiver_type_bindings(index, &recv_ty, &entry) {
+            Some(bindings) if !bindings.is_empty() => substitute_entry_param_types(entry, &bindings),
+            _ => entry,
+        })
+        .collect::<Vec<_>>();
     call_shape_from_entries(index, src, call, symbol, entries, ctx)
 }
 
@@ -312,6 +322,55 @@ fn call_shape_from_entries(
         arg_count,
         argument_types: None,
     })
+}
+
+fn substitute_entry_param_types(entry: Entry, bindings: &HashMap<String, Type>) -> Entry {
+    let mut sym = (*entry.sym).clone();
+    sym.params = sym
+        .params
+        .iter()
+        .map(|p| substitute_type_ref(p, bindings))
+        .collect();
+    Entry {
+        sym: std::sync::Arc::new(sym),
+        path: entry.path,
+        tier: entry.tier,
+    }
+}
+
+fn substitute_type_ref(tr: &TypeRef, bindings: &HashMap<String, Type>) -> TypeRef {
+    if let Some(ty) = bindings.get(&tr.name) {
+        return type_to_type_ref(ty);
+    }
+    if tr.args.is_empty() {
+        return tr.clone();
+    }
+    let mut out = tr.clone();
+    out.args = tr
+        .args
+        .iter()
+        .map(|a| substitute_type_ref(a, bindings))
+        .collect();
+    out
+}
+
+fn type_to_type_ref(ty: &Type) -> TypeRef {
+    match ty {
+        Type::Class {
+            name,
+            package,
+            container,
+            nullable,
+            args,
+        } => TypeRef {
+            name: name.clone(),
+            nullable: *nullable,
+            args: args.iter().map(type_to_type_ref).collect(),
+            package_candidates: std::sync::Arc::new(package.iter().cloned().collect()),
+            container_candidates: container.iter().cloned().collect(),
+        },
+        Type::Unknown => TypeRef::default(),
+    }
 }
 
 fn member_call_entries(index: &Index, recv_ty: &Type, name: &str, vis: &Visibility) -> Vec<Entry> {
@@ -1161,6 +1220,164 @@ mod tests {
             diagnostics
                 .iter()
                 .all(|diag| diag.code != Some(DiagnosticCode::CallShapeMismatch)),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn generic_call_with_value_arguments_resolves_callee_and_type_arg() {
+        // `f<T>(args)` must parse as a call with type arguments, not a comparison chain, so the
+        // callee and type argument resolve instead of being falsely reported unresolved.
+        let src = r#"
+            class User
+            fun <T> wrap(x: T): T = x
+            fun main() {
+                val u = wrap<User>(User())
+            }
+        "#;
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let mut index = Index::new();
+        let pkg = package_of(&tree, src);
+        index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
+        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn member_call_with_explicit_type_argument_resolves_type_arg() {
+        let src = r#"
+            class User
+            class Json {
+                fun <T> decode(text: String): T = TODO()
+            }
+            val json = Json()
+            fun f(): User = json.decode<User>("")
+        "#;
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let mut index = Index::new();
+        let pkg = package_of(&tree, src);
+        index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
+        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        // `User` (the type argument) and `decode` (the callee) must not be flagged; `String`
+        // is unresolved only because this closed single-file index has no stdlib.
+        for diag in &diagnostics {
+            assert_ne!(diag.message, "Unresolved reference: User", "{diagnostics:?}");
+            assert_ne!(diag.message, "Unresolved reference: decode", "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn class_level_type_var_param_accepts_matching_argument_on_generic_receiver() {
+        // `MyList<String>.add("x")`: the class-level type variable E is bound to String from the
+        // receiver, so a matching argument is accepted (no false call-shape mismatch).
+        let src = r#"
+            class MyList<E> {
+                fun add(e: E) {}
+            }
+            class Dog
+            fun main() {
+                val l: MyList<Dog> = MyList()
+                l.add(Dog())
+            }
+        "#;
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let mut index = Index::new();
+        let pkg = package_of(&tree, src);
+        index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
+        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != Some(DiagnosticCode::CallShapeMismatch)),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn class_level_type_var_param_flags_mismatched_argument_on_generic_receiver() {
+        // The binding also keeps the true positive: `MyList<Dog>.add(Cat())` is rejected.
+        let src = r#"
+            class MyList<E> {
+                fun add(e: E) {}
+            }
+            class Dog
+            class Cat
+            fun main() {
+                val l: MyList<Dog> = MyList()
+                l.add(Cat())
+            }
+        "#;
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let mut index = Index::new();
+        let pkg = package_of(&tree, src);
+        index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
+        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].code, Some(DiagnosticCode::CallShapeMismatch));
+    }
+
+    #[test]
+    fn unbound_class_type_var_param_does_not_reject_arguments() {
+        // Multi-parameter generic receiver whose type variables cannot all be bound: a bare
+        // parameter name with no indexed type is treated as a type variable (accept anything)
+        // rather than a concrete type that rejects every argument.
+        let src = r#"
+            class PairBox<A, B> {
+                fun put(a: A, b: B) {}
+            }
+            class K
+            class V
+            fun main() {
+                val p: PairBox<K, V> = PairBox()
+                p.put(K(), V())
+            }
+        "#;
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let mut index = Index::new();
+        let pkg = package_of(&tree, src);
+        index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
+        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != Some(DiagnosticCode::CallShapeMismatch)),
+            "{diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_lambda_receiver_resolves_without_explicit_type_argument() {
+        // `flow { emit(x) }` with no explicit `<T>`: the receiver is `FlowCollector<Unknown>`
+        // (T unbound but the head class is known), so the member resolves instead of being
+        // falsely reported absent.
+        let src = r#"
+            interface Collector<T> {
+                fun emit(value: T)
+            }
+            fun <T> flow(block: Collector<T>.() -> Unit) {}
+            class User
+            fun main() {
+                flow {
+                    emit(User())
+                }
+            }
+        "#;
+        let mut parser = KotlinParser::new();
+        let tree = parser.parse(src);
+        let mut index = Index::new();
+        let pkg = package_of(&tree, src);
+        index.replace_file("Main.kt", extract_symbols(&tree, src, &pkg), Tier::Volatile);
+        let diagnostics = compute(&index, "Main.kt", src, &tree, &CompletenessFacts::complete());
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != Some(DiagnosticCode::UnresolvedReference)
+                    || diag.message != "Unresolved reference: emit"),
             "{diagnostics:?}"
         );
     }

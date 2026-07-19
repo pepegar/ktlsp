@@ -13,8 +13,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tree-sitter = "0.24"
 tree-sitter-java = "0.23"
-# Fork fixes automatic semicolon insertion before a bare primary constructor on the next line.
-tree-sitter-kotlin-ng = { git = "https://github.com/pepegar/tree-sitter-kotlin", rev = "24061eabc8320d4d0bcaa2d528804db0412caeb3" }
+# Fork fixes automatic semicolon insertion before a bare primary constructor on the next line,
+# parses generic calls with value arguments as calls (not comparison chains), and supports
+# context parameters (KEEP-0259).
+tree-sitter-kotlin-ng = { git = "https://github.com/pepegar/tree-sitter-kotlin", rev = "10f5277602bc3af132bfe21997b775d0ac0a58bf" }
 ureq = { version = "3", features = ["rustls"] }
 walkdir = "2"
 zip = { version = "2.3", default-features = false, features = ["deflate"] }

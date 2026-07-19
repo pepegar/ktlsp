@@ -1592,7 +1592,7 @@ dependencies = [
 [[package]]
 name = "tree-sitter-kotlin-ng"
 version = "1.1.0"
-source = "git+https://github.com/pepegar/tree-sitter-kotlin?rev=24061eabc8320d4d0bcaa2d528804db0412caeb3#24061eabc8320d4d0bcaa2d528804db0412caeb3"
+source = "git+https://github.com/pepegar/tree-sitter-kotlin?rev=10f5277602bc3af132bfe21997b775d0ac0a58bf#10f5277602bc3af132bfe21997b775d0ac0a58bf"
 dependencies = [
  "cc",
  "tree-sitter-language",

@@ -1628,12 +1628,18 @@ fn select_trailing_lambda_receiver_type(
 ) -> Option<Type> {
     let arg_count = value_arg_count(call);
     let arg_types = synth_arg_types(index, call, src, ctx, depth, child_infer);
+    if std::env::var("KTDBG").is_ok() {
+        eprintln!("DBG select: arg_count={} arg_types={:?}", arg_count, arg_types);
+    }
     let mut group: Vec<(&Entry, TypeRef)> = entries
         .into_iter()
         .filter_map(|entry| {
             trailing_lambda_receiver_ref(index, entry, ctx).map(|receiver| (entry, receiver))
         })
         .collect();
+    if std::env::var("KTDBG").is_ok() {
+        eprintln!("DBG group: {}", group.len());
+    }
     if group.is_empty() {
         return None;
     }
@@ -1704,7 +1710,12 @@ fn resolve_trailing_lambda_receiver_candidate(
                 .or_insert_with(|| actual_recv.clone());
         }
     }
-    if type_ref_has_unbound_type_param(receiver_ref, &tset, &subst) {
+    // Only reject when the receiver HEAD is itself an unbound type parameter (the class to look
+    // up is unknown). Unbound type-parameter ARGUMENTS resolve to `Unknown` (sound — never a
+    // wrong guess) and the head class still drives member lookup, so a `flow { emit(x) }` builder
+    // without explicit type arguments resolves its receiver as `FlowCollector<Unknown>` and
+    // `emit` is found instead of being falsely reported absent.
+    if tset.contains(receiver_ref.name.as_str()) && !subst.contains_key(&receiver_ref.name) {
         return None;
     }
     Some(resolve_with_subst(
@@ -1717,17 +1728,6 @@ fn resolve_trailing_lambda_receiver_candidate(
     ))
 }
 
-fn type_ref_has_unbound_type_param(
-    type_ref: &TypeRef,
-    type_params: &HashSet<String>,
-    substitutions: &HashMap<String, Type>,
-) -> bool {
-    (type_params.contains(&type_ref.name) && !substitutions.contains_key(&type_ref.name))
-        || type_ref
-            .args
-            .iter()
-            .any(|arg| type_ref_has_unbound_type_param(arg, type_params, substitutions))
-}
 
 /// The receiver contributed by an entry's trailing lambda. Direct receiver-function parameters
 /// are stored on the function itself. Alias-backed parameters are expanded lazily because their
@@ -2118,6 +2118,17 @@ fn extension_is_visible(e: &Entry, ctx: &FileCtx) -> bool {
 /// Gradual: an `Unknown` argument or param, or a param that is one of the candidate's own type
 /// variables, never eliminates the candidate; a known subtype is consistent. Only the positional value
 /// args are checked (a trailing lambda / extra args beyond the param list are ignored).
+
+/// Whether `name` is declared as a type parameter of some indexed type/function. Used to tell
+/// an unbound class-level type variable (accept any argument) from a genuinely missing type
+/// name (compare normally).
+fn is_class_level_type_variable(index: &dyn InferenceIndex, name: &str) -> bool {
+    index
+        .lookup_by_name(name)
+        .iter()
+        .any(|e| e.sym.type_params.iter().any(|tp| tp == name))
+}
+
 fn args_consistent(
     index: &dyn InferenceIndex,
     params: &[TypeRef],
@@ -2130,6 +2141,14 @@ fn args_consistent(
     for (p, a) in params.iter().zip(args) {
         if tvars.contains(p.name.as_str()) {
             continue; // a type-variable parameter accepts anything
+        }
+        if p.args.is_empty() && is_class_level_type_variable(index, &p.name) {
+            // A class-level type variable we could not bind (the `E` of `MutableList<E>.add`,
+            // unbound when the receiver's type arguments are unknown). Treating it as a
+            // concrete type would reject every argument — accept. Genuinely missing type
+            // names (e.g. stdlib types in a partial index) are NOT skipped, so overload
+            // disambiguation on `pick(Int)` vs `pick(String)` still works.
+            continue;
         }
         let pt = resolve_type_ref(index, p, ctx, depth + 1);
         if !consistent(index, a, &pt) {
@@ -2186,7 +2205,7 @@ fn is_subtype(index: &dyn InferenceIndex, name: &str, pkg: Option<&str>, target:
 /// `List<Foo>.first(): T` -> Foo. Deliberately conservative: requiring a single argument and an
 /// unresolvable name means it can never pick the wrong argument of a `Map<K, V>` (two args ->
 /// skipped -> Unknown -> silent omission), preserving the no-wrong-completion contract.
-fn receiver_type_bindings(
+pub(crate) fn receiver_type_bindings(
     index: &dyn InferenceIndex,
     recv_ty: &Type,
     entry: &Entry,
