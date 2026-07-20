@@ -24,11 +24,12 @@ not yet compiler-complete.
 
 ## Install
 
-Download a binary from [GitHub Releases](https://github.com/pepegar/ktlsp/releases), or install
-from source:
+Download an archive containing both `ktlsp` and `ktcheck` from [GitHub
+Releases](https://github.com/pepegar/ktlsp/releases), or install from source:
 
 ```sh
 cargo install --git https://github.com/pepegar/ktlsp ktlsp
+cargo install --git https://github.com/pepegar/ktlsp ktcheck
 ```
 
 With Nix:
@@ -38,6 +39,17 @@ nix run github:pepegar/ktlsp
 ```
 
 Building requires a Rust toolchain and a C compiler for the tree-sitter grammars.
+
+Release and source installs can update either executable in place:
+
+```sh
+ktlsp update
+ktcheck update
+```
+
+These commands install the latest stable GitHub release for the current platform. If you installed
+with Nix or another package manager, update through that package manager instead because its
+installed executable may not be writable.
 
 ## Editor setup
 

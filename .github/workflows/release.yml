@@ -22,8 +22,13 @@ jobs:
         id: version
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/ktlsp/Cargo.toml | head -n 1)
+          ktcheck_version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/ktcheck/Cargo.toml | head -n 1)
           if [ -z "$version" ]; then
             echo "Failed to read version from crates/ktlsp/Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "$ktcheck_version" != "$version" ]; then
+            echo "ktcheck version ($ktcheck_version) does not match ktlsp version ($version)" >&2
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -65,8 +70,8 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build release binary
-        run: cargo build --locked --release --bin ktlsp --target ${{ matrix.target }}
+      - name: Build release binaries
+        run: cargo build --locked --release -p ktlsp --bin ktlsp -p ktcheck --bin ktcheck --target ${{ matrix.target }}
 
       - name: Package Unix archive
         if: runner.os != 'Windows'
@@ -75,6 +80,7 @@ jobs:
           pkg_root="dist/ktlsp-${{ matrix.target }}"
           mkdir -p "$pkg_root"
           cp "target/${{ matrix.target }}/release/ktlsp" "$pkg_root/"
+          cp "target/${{ matrix.target }}/release/ktcheck" "$pkg_root/"
           cp README.md "$pkg_root/"
           tar -C dist -czf "dist/ktlsp-${{ matrix.target }}.tar.gz" "ktlsp-${{ matrix.target }}"
 
@@ -85,6 +91,7 @@ jobs:
           $pkgRoot = "dist/ktlsp-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $pkgRoot | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/ktlsp.exe" "$pkgRoot/ktlsp.exe"
+          Copy-Item "target/${{ matrix.target }}/release/ktcheck.exe" "$pkgRoot/ktcheck.exe"
           Copy-Item "README.md" "$pkgRoot/README.md"
           Compress-Archive -Path $pkgRoot -DestinationPath "dist/ktlsp-${{ matrix.target }}.zip" -Force
 
