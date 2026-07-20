@@ -28,6 +28,7 @@ pub mod sidecar;
 pub mod telemetry;
 pub mod trace;
 pub mod trust;
+pub mod update;
 pub mod workspace;
 
 pub use ktcore::{

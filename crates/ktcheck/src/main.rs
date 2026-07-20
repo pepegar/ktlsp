@@ -20,6 +20,7 @@ use ktlsp::coords;
 use ktlsp::deps;
 use ktlsp::java::JavaParser;
 use ktlsp::language::{self, SourceLanguage};
+use ktlsp::update::{self, Binary};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use walkdir::{DirEntry, WalkDir};
@@ -34,6 +35,10 @@ fn main() -> anyhow::Result<()> {
         eprintln!("ktcheck: {error}");
         eprintln!("try `ktcheck --help`");
         std::process::exit(2);
+    }
+    if cli.update {
+        update::run(Binary::Ktcheck, env!("CARGO_PKG_VERSION"))?;
+        return Ok(());
     }
 
     let profiler = FlamegraphProfiler::start(cli.flamegraph.clone())?;
@@ -173,6 +178,7 @@ enum DurableResolveKind {
 #[derive(Default)]
 struct CliArgs {
     help: bool,
+    update: bool,
     closed_world: bool,
     with_libs: bool,
     include_hints: bool,
@@ -248,6 +254,7 @@ fn print_help() {
     println!();
     println!("Usage:");
     println!("  ktcheck [--closed-world] [--flamegraph FILE.svg] [PATH ...]");
+    println!("  ktcheck update");
     println!();
     println!("Behavior:");
     println!("  - Checks .kt, .kts, and .java files under the provided paths");
@@ -259,6 +266,7 @@ fn print_help() {
     );
     println!("  - `--include-hints` prints parser hints such as unused imports");
     println!("  - `--flamegraph FILE.svg` writes a sampled CPU flamegraph for the full check run");
+    println!("  - `update` replaces ktcheck with the latest stable release for this platform");
     println!();
     println!("Environment:");
     println!("  KTCHECK_MAX_PARALLELISM   Maximum worker count");
@@ -267,6 +275,13 @@ fn print_help() {
 
 fn parse_args(args: Vec<String>) -> CliArgs {
     let mut cli = CliArgs::default();
+    if args.first().is_some_and(|arg| arg == "update") {
+        cli.update = true;
+        if args.len() > 1 {
+            cli.error = Some("update does not accept arguments".to_string());
+        }
+        return cli;
+    }
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -1369,6 +1384,21 @@ mod tests {
         assert_eq!(
             cli.error.as_deref(),
             Some("--flamegraph requires an output path")
+        );
+    }
+
+    #[test]
+    fn parse_args_recognizes_update_subcommand() {
+        let cli = parse_args(vec!["update".to_string()]);
+        assert!(cli.update);
+        assert!(cli.error.is_none());
+        assert!(cli.roots.is_empty());
+
+        let cli = parse_args(vec!["update".to_string(), "extra".to_string()]);
+        assert!(cli.update);
+        assert_eq!(
+            cli.error.as_deref(),
+            Some("update does not accept arguments")
         );
     }
 

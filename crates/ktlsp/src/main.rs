@@ -14,6 +14,7 @@ use tower_lsp_server::{LspService, Server};
 use tracing_subscriber::EnvFilter;
 
 use ktlsp::lsp::Backend;
+use ktlsp::update::{self, Binary};
 
 #[cfg(unix)]
 struct FlamegraphProfiler {
@@ -89,6 +90,15 @@ impl FlamegraphProfiler {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args == ["update"] {
+        update::run(Binary::Ktlsp, env!("CARGO_PKG_VERSION"))?;
+        return Ok(());
+    }
+    if let Some(arg) = args.first() {
+        anyhow::bail!("unknown ktlsp command or argument: {arg}");
+    }
+
     let profiler = FlamegraphProfiler::from_env()?;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
