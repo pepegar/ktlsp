@@ -48,6 +48,9 @@ pub struct ModuleClasspath {
 ///   END	<gradle path>
 /// Lines outside a PROJECT/END block (gradle chatter) are ignored. A block missing its END is still
 /// returned (best-effort), since the entries are already complete by then.
+///
+/// `UNRESOLVED` lines are produced from `ResolutionResult` (a CC-compatible `Provider`) by
+/// iterating dependency edges for `UnresolvedDependencyResult` entries.
 pub fn parse_dump(output: &str) -> Vec<ModuleClasspath> {
     let mut out = Vec::new();
     let mut current: Option<ModuleClasspath> = None;

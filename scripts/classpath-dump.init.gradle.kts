@@ -7,6 +7,7 @@
 // Output (stdout), one record per module:
 //   PROJECT\t<gradle path>\t<absolute projectDir>
 //   CP\t<absolute jar/dir>          (repeated)
+//   UNRESOLVED\t<selector>\t<problem> (lenient-resolution drops, repeated)
 //   END\t<gradle path>
 //
 // `isLenient = true` so an unresolved dependency in one module doesn't abort the whole dump.
@@ -14,22 +15,54 @@
 // and per-line printing interleaves the protocol blocks, scrambling ktlsp's per-module
 // attribution (observed: ~3.6k interleave anomalies in one GoodNotes dump). One synchronized
 // PrintStream call per module keeps the block atomic.
+//
 // UNRESOLVED lines report what the lenient view dropped, so silent under-indexing is observable.
+// They are captured eagerly in `afterEvaluate` (configuration time) as strings so the task never
+// touches a `Configuration` object at execution time.
+//
+// Configuration-cache compatibility: all `Project` state (path, projectDir, the
+// `compileClasspath` FileCollection, and the pre-resolved unresolved-dep strings) is captured at
+// configuration time as CC-serializable values. The `doLast` action only reads those serialized
+// values — it never calls `Task.getProject()` or touches a `Configuration` object at execution
+// time. `afterEvaluate` defers the capture until after the project's build script has applied the
+// plugins that create `compileClasspath` (Kotlin, Java, etc.), since init scripts run before
+// project build scripts. Modules without a `compileClasspath` configuration skip task registration
+// entirely.
 allprojects {
-    tasks.register("ktlspDumpClasspath") {
-        doLast {
-            val cfg = configurations.findByName("compileClasspath") ?: return@doLast
-            val out = StringBuilder()
-            out.append("PROJECT\t${project.path}\t${project.projectDir.absolutePath}\n")
-            cfg.incoming.artifactView { isLenient = true }.files.files.forEach {
-                out.append("CP\t${it.absolutePath}\n")
+    val projectPath = project.path
+    val projectDirPath = project.projectDir.absolutePath
+
+    afterEvaluate {
+        val compileClasspath = configurations.findByName("compileClasspath")
+        if (compileClasspath != null) {
+            val classpathFiles = compileClasspath.incoming.artifactView {
+                isLenient = true
+            }.files
+
+            val unresolvedLines = try {
+                compileClasspath.resolvedConfiguration.lenientConfiguration
+                    .unresolvedModuleDependencies.map {
+                        val problem = it.problem.message?.replace('\n', ' ')?.replace('\t', ' ')
+                        "UNRESOLVED\t${it.selector}\t${problem}"
+                    }
+            } catch (e: Exception) {
+                emptyList()
             }
-            cfg.resolvedConfiguration.lenientConfiguration.unresolvedModuleDependencies.forEach {
-                val problem = it.problem.message?.replace('\n', ' ')?.replace('\t', ' ')
-                out.append("UNRESOLVED\t${it.selector}\t$problem\n")
+
+            tasks.register("ktlspDumpClasspath") {
+                doLast {
+                    val out = StringBuilder()
+                    out.append("PROJECT\t${projectPath}\t${projectDirPath}\n")
+                    classpathFiles.files.forEach {
+                        out.append("CP\t${it.absolutePath}\n")
+                    }
+                    unresolvedLines.forEach {
+                        out.append(it).append('\n')
+                    }
+                    out.append("END\t${projectPath}")
+                    println(out.toString())
+                }
             }
-            out.append("END\t${project.path}")
-            println(out.toString())
         }
     }
 }
